@@ -1,0 +1,17 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "com.github.roshan0907.layer-viewer",
+  "name": "Layer View",
+  "description": "Live exploded PCB layers, PCB editor colors and filled/capped via inspection",
+  "runtime": {"type": "python", "min_version": "3.10"},
+  "actions": [{
+    "identifier": "layer-viewer.open",
+    "name": "Layer View — Exploded PCB",
+    "description": "Follow the active PCB and unsaved edits in a read-only 3D stackup viewer",
+    "show-button": true,
+    "scopes": ["pcb"],
+    "entrypoint": "layer_viewer_entry.py",
+    "icons-light": ["resources/layers_24.png", "resources/layers_48.png"],
+    "icons-dark": ["resources/layers_24.png", "resources/layers_48.png"]
+  }]
+}

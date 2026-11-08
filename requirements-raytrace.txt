@@ -1,0 +1,2 @@
+# Optional live/export path tracer: CUDA/OptiX with scalar CPU fallback.
+mitsuba>=3.9,<4
