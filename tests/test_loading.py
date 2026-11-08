@@ -109,10 +109,10 @@ def test_edited_board_defers_inner_reads_and_reuses_them_after_surface_preview(c
     copper_geometry = geometry.copper_geometry
     meshed_layers = []
 
-    def tracked_copper(board, layer):
+    def tracked_copper(board, layer, **kwargs):
         meshed_layers.append(layer)
         assert layer == changed.tracks[0].layer
-        return copper_geometry(board, layer)
+        return copper_geometry(board, layer, **kwargs)
 
     monkeypatch.setattr(geometry, "copper_geometry", tracked_copper)
     monkeypatch.setattr(geometry, "dielectric_geometry", forbid_rebuild)
@@ -145,10 +145,10 @@ def test_cached_preview_with_stale_inner_signature_reuses_other_inner_layer(cach
     copper_geometry = geometry.copper_geometry
     meshed_layers = []
 
-    def tracked_copper(board, layer):
+    def tracked_copper(board, layer, **kwargs):
         meshed_layers.append(layer)
         assert layer == inner.id
-        return copper_geometry(board, layer)
+        return copper_geometry(board, layer, **kwargs)
 
     monkeypatch.setattr(geometry, "copper_geometry", tracked_copper)
     monkeypatch.setattr(geometry, "dielectric_geometry", forbid_rebuild)

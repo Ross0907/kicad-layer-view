@@ -27,7 +27,7 @@ def test_paste_retains_holes_both_faces_and_snapshot_cache(tmp_path, monkeypatch
     scene = build_scene(snapshot)
     for part in (p for p in scene.parts if p.kind == "paste"):
         assert part.area_mm2 == pytest.approx(11)
-        assert part.mesh.n_open_edges == 0
+        assert part.mesh.clean(tolerance=0.).n_open_edges == 0
         assert part.mesh.volume == pytest.approx(11 * PASTE_THICKNESS_MM)
         front = part.name == "F.Paste"
         cu = snapshot.stackup.copper[0 if front else -1]

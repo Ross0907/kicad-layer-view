@@ -35,9 +35,9 @@ def test_one_track_edit_rebuilds_only_its_copper_layer(monkeypatch):
     changed.tracks[0].end = (13., 2.)
     built_layers = []
     original = geometry.copper_geometry
-    def checked(snapshot, layer):
+    def checked(snapshot, layer, **kwargs):
         built_layers.append(layer)
-        return original(snapshot, layer)
+        return original(snapshot, layer, **kwargs)
     monkeypatch.setattr(geometry, "copper_geometry", checked)
     def unexpected(*args, **kwargs):
         raise AssertionError("Track edit rebuilt an unrelated physical part")

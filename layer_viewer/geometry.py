@@ -6,15 +6,17 @@ https://github.com/drewsum/KiPI. Mesh coordinates are mm, with KiCad Y flipped.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Optional, Tuple
 import hashlib
+import logging
+import os
 import json
 import math
 import numpy as np
 import pyvista as pv
 import shapely
-from shapely.geometry import LineString, Polygon, Point
+from shapely.geometry import LineString, Polygon, Point  # noqa: F401 - public re-exports
 from shapely.geometry.base import BaseGeometry
 from vtkmodules.util.numpy_support import numpy_to_vtk
 from vtkmodules.vtkCommonCore import vtkPoints
@@ -22,88 +24,80 @@ from .model import BoardSnapshot
 from .colors import copper_color, default_colors
 from .finishes import SILVER_COLOR, apply_surface_finish
 
+from .meshing import (  # noqa: F401 - re-exported public geometry API
+    CIRCLE_QUAD_SEGS, SMOOTH_WALL_COS, _circles, _track_shapes, _triangulate_geos, _weld,
+    board_outline, circle, coated_slab_arrays, copper_geometry, drilled_pad_holes,
+    iter_polygons, layer_inputs, mesh_copper_layer, pad_hole, poly_to_shapely, polygon_union,
+    polys_to_shapely, slab_arrays, triangulate,
+)
+
+
+def _set_normals(mesh, normals):
+    """Attach render normals; they are shading data only, never geometry."""
+    mesh.point_data["Normals"] = normals
+    mesh.GetPointData().SetActiveNormals("Normals")
+    mesh.set_active_scalars(None)
+
+
+def polydata(points, triangles, normals=None, cell_data=None):
+    """Wrap kernel arrays as a triangle PolyData with optional render normals."""
+    triangles = np.asarray(triangles, dtype=np.int64).reshape(-1, 3)
+    faces = np.column_stack([np.full(len(triangles), 3, dtype=np.int64), triangles]).ravel()
+    mesh = pv.PolyData(np.asarray(points, dtype=np.float64), faces)
+    for name, values in (cell_data or {}).items():
+        mesh.cell_data[name] = values
+    if normals is not None:
+        _set_normals(mesh, normals)
+    mesh.set_active_scalars(None)
+    return mesh
+
+
+def _remote_mesh(arrays):
+    if arrays is None:
+        return None
+    points, triangles, normals, coverage = arrays
+    return polydata(points, triangles, normals, {f"coat:{name}": values for name, values in coverage.items()})
+
+
+def slab_from_triangles(pts2: np.ndarray, tris: np.ndarray, z_bottom: float,
+                        thickness: float, smooth: bool = True) -> Tuple[pv.PolyData, np.ndarray]:
+    """Closed slab PolyData plus the source triangle of each face (see ``slab_arrays``)."""
+    points, triangles, normals, source = slab_arrays(pts2, tris, z_bottom, thickness, smooth)
+    return polydata(points, triangles, normals), source
+
+
+def coated_slab(geom: BaseGeometry, z_bottom: float, thickness: float,
+                coatings: dict, check_cancel=None) -> Optional[pv.PolyData]:
+    """One copper solid with exact resist coverage tags on its outward faces.
+
+    The coverage arrays are ray-material tags, never a viewport scalar palette.
+    """
+    if not coatings:
+        return slab(geom, z_bottom, thickness, smooth=False)
+    arrays = coated_slab_arrays(geom, z_bottom, thickness, coatings, check_cancel)
+    if arrays is None:
+        return None
+    points, triangles, normals, coverage = arrays
+    return polydata(points, triangles, normals, {f"coat:{name}": values for name, values in coverage.items()})
+
+
 # Default neutral metal; apply_surface_finish selects the same board finish
 # for every copper foil, independently of PCB editor/custom layer colors.
 NATURAL_COPPER_COLOR = SILVER_COLOR
 
 
-def iter_polygons(geometry):
-    if isinstance(geometry, Polygon):
-        if not geometry.is_empty:
-            yield geometry
-    else:
-        for part in getattr(geometry, "geoms", []):
-            yield from iter_polygons(part)
 
 
-def poly_to_shapely(poly):
-    if len(poly.outline) < 3:
-        return Polygon()
-    geom = Polygon(poly.outline, [hole for hole in poly.holes if len(hole) >= 3])
-    return geom if geom.is_valid else shapely.make_valid(geom)
 
 
-def polygon_union(geometries):
-    return shapely.union_all([p for geom in geometries for p in iter_polygons(geom)])
 
 
-def _triangulate_geos(geom: BaseGeometry) -> Tuple[np.ndarray, np.ndarray]:
-    """Constrained Delaunay triangulation of a (multi)polygon.
-
-    Returns ``(points[N,2], triangles[M,3])`` with shared vertices merged.
-    """
-    # GEOS can triangulate the complete polygon array in one call. Extract its
-    # coordinates directly, avoiding thousands of temporary triangle objects
-    # and a separate structured NumPy sort for each copper island/drill hole.
-    triangles = shapely.constrained_delaunay_triangles(list(iter_polygons(geom)))
-    coords, owners = shapely.get_coordinates(triangles, return_index=True)
-    if not len(coords):
-        return np.zeros((0, 2)), np.zeros((0, 3), dtype=np.int64)
-    coords = coords.reshape(-1, 4, 2)[:, :3, :].reshape(-1, 2)
-    owners = owners.reshape(-1, 4)[:, :3].ravel()
-    # Match the previous per-polygon lexicographic vertex order exactly. Include
-    # polygon ownership so islands touching at one point never become welded.
-    order = np.lexsort((coords[:, 1], coords[:, 0], owners))
-    sorted_coords, sorted_owners = coords[order], owners[order]
-    keep = np.ones(len(order), dtype=bool)
-    keep[1:] = ((sorted_owners[1:] != sorted_owners[:-1])
-                | np.any(sorted_coords[1:] != sorted_coords[:-1], axis=1))
-    inverse = np.empty(len(order), dtype=np.int64)
-    inverse[order] = np.cumsum(keep) - 1
-    return sorted_coords[keep], inverse.reshape(-1, 3)
 
 
-def triangulate(geom: BaseGeometry) -> Tuple[np.ndarray, np.ndarray]:
-    """Triangulate exact boundary vertices, avoiding costly Delaunay refinement.
 
-    Earcut handles holes using the same full-detail polygon rings. Every result
-    is checked against the polygon area; exceptional shapes use GEOS instead.
-    Vertices are welded exactly, without coordinate rounding or simplification.
-    """
-    import mapbox_earcut
-    vertices, indices, offset = [], [], 0
-    for polygon in iter_polygons(geom):
-        rings = [np.asarray(ring.coords, dtype=np.float64)[:-1]
-                 for ring in (polygon.exterior, *polygon.interiors)]
-        points = np.concatenate(rings)
-        ends = np.cumsum([len(ring) for ring in rings], dtype=np.uint32)
-        triangles = mapbox_earcut.triangulate_float64(points, ends).reshape(-1, 3)
-        points, inverse = np.unique(points, axis=0, return_inverse=True)
-        triangles = inverse[triangles]
-        a, b, c = points[triangles[:, 0]], points[triangles[:, 1]], points[triangles[:, 2]]
-        cross = (b[:, 0]-a[:, 0])*(c[:, 1]-a[:, 1]) - (b[:, 1]-a[:, 1])*(c[:, 0]-a[:, 0])
-        triangles = triangles[cross != 0]
-        if not math.isclose(float(np.abs(cross).sum()) / 2, polygon.area,
-                            rel_tol=1e-9, abs_tol=1e-9):
-            points, triangles = _triangulate_geos(polygon)
-        if not len(triangles):
-            continue
-        vertices.append(points)
-        indices.append(triangles + offset)
-        offset += len(points)
-    if not indices:
-        return np.zeros((0, 2)), np.zeros((0, 3), dtype=np.int64)
-    return np.concatenate(vertices), np.concatenate(indices)
+
+
+
 
 
 def sheet(geom: BaseGeometry, z: float) -> Optional[pv.PolyData]:
@@ -115,134 +109,27 @@ def sheet(geom: BaseGeometry, z: float) -> Optional[pv.PolyData]:
     return pv.PolyData(pts, faces)
 
 
-def slab_from_triangles(pts2: np.ndarray, tris: np.ndarray, z_bottom: float,
-                        thickness: float) -> Tuple[pv.PolyData, np.ndarray]:
-    """Closed slab from a 2D triangulation in KiCad coordinates (y is flipped here).
-
-    Bottom and top faces reuse the triangles; side walls are quads on the boundary
-    edges (edges used by exactly one triangle). Winding is made consistent so all
-    normals point outward, which keeps shading and volume correct.
-
-    Returns the mesh and, for each output face, the index of the source triangle, so
-    per-triangle data can be carried onto the slab. Points are the 2D points twice
-    (bottom copy then top copy), so per-point data maps with ``np.tile(data, 2)``.
-    """
-    # Mesh coordinates flip y, so make triangles counter-clockwise in (x, -y).
-    xy = np.column_stack([pts2[:, 0], -pts2[:, 1]])
-    a, b, c = xy[tris[:, 0]], xy[tris[:, 1]], xy[tris[:, 2]]
-    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (c[:, 0] - a[:, 0]) * (b[:, 1] - a[:, 1])
-    tris = tris.copy()
-    cw = cross < 0
-    tris[cw] = tris[cw][:, ::-1]
-    n = len(xy)
-    m = len(tris)
-    pts = np.vstack([np.column_stack([xy, np.full(n, z_bottom)]),
-                     np.column_stack([xy, np.full(n, z_bottom + thickness)])])
-    bottom = tris[:, ::-1]                       # faces down
-    top = tris + n                               # faces up
-    # Directed edges of CCW triangles; boundary edges have no reversed twin.
-    e = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]])
-    e_tri = np.tile(np.arange(m), 3)
-    key = e[:, 0].astype(np.int64) * n + e[:, 1]
-    rkey = e[:, 1].astype(np.int64) * n + e[:, 0]
-    # Sorting only the reverse keys avoids np.isin's duplicate elimination and
-    # combined sort, while retaining identical membership for repeated edges.
-    reverse = np.sort(rkey)
-    matches = reverse.searchsorted(key)
-    is_boundary = matches == len(reverse)
-    in_range = ~is_boundary
-    is_boundary[in_range] = reverse[matches[in_range]] != key[in_range]
-    boundary = e[is_boundary]
-    wall_tri = e_tri[is_boundary]
-    i, j = boundary[:, 0], boundary[:, 1]
-    # Outward wall for a CCW boundary edge i->j: (i, j, j+n) and (i, j+n, i+n).
-    walls = np.concatenate([np.column_stack([i, j, j + n]), np.column_stack([i, j + n, i + n])])
-    allf = np.concatenate([bottom, top, walls])
-    faces = np.column_stack([np.full(len(allf), 3), allf]).ravel()
-    source = np.concatenate([np.arange(m), np.arange(m), wall_tri, wall_tri])
-    return pv.PolyData(pts, faces), source
 
 
-def slab(geom: BaseGeometry, z_bottom: float, thickness: float) -> Optional[pv.PolyData]:
-    """Closed copper slab for a shapely (multi)polygon."""
+
+
+def slab(geom: BaseGeometry, z_bottom: float, thickness: float, *,
+         smooth: bool = True) -> Optional[pv.PolyData]:
+    """Closed slab for a shapely (multi)polygon; see ``slab_arrays`` for ``smooth``."""
     pts2, tris = triangulate(geom)
     if len(tris) == 0:
         return None
     if thickness <= 0:
         return sheet(geom, z_bottom)
-    return slab_from_triangles(pts2, tris, z_bottom, thickness)[0]
+    return slab_from_triangles(pts2, tris, z_bottom, thickness, smooth=smooth)[0]
 
 
-def coated_slab(geom: BaseGeometry, z_bottom: float, thickness: float,
-                coatings: dict[str, BaseGeometry], check_cancel=None) -> Optional[pv.PolyData]:
-    """One copper solid with exact resist coverage on its outward faces.
-
-    Partition the planar triangulation along mask apertures before extrusion,
-    welding the shared boundary so the partition never becomes an internal
-    wall or an overlapping cap. Opposite faces remain ordinary metal. Keeping
-    this on cells preserves full-detail edges without a sampled material map.
-    """
-    if not coatings:
-        return slab(geom, z_bottom, thickness)
-    names = tuple(coatings)
-    points, triangles, labels, offset = [], [], [], 0
-    for polygon in iter_polygons(geom):
-        if check_cancel is not None:
-            check_cancel()
-        regions = [(polygon, 0)]
-        for index, mask in enumerate(coatings.values()):
-            partition = []
-            for region, flags in regions:
-                if mask.covers(region):
-                    partition.append((region, flags | (1 << index)))
-                elif mask.disjoint(region):
-                    partition.append((region, flags))
-                else:
-                    partition.extend((part, flags | covered) for part, covered in
-                                     ((region.intersection(mask), 1 << index),
-                                      (region.difference(mask), 0)) if not part.is_empty)
-            regions = partition
-        local_points, local_triangles, local_labels, local_offset = [], [], [], 0
-        for region, flags in regions:
-            if check_cancel is not None:
-                check_cancel()
-            # Constrained triangulation preserves collinear vertices shared by
-            # the two partitions. Dropping one creates a T-junction and an
-            # artificial vertical wall when the triangles are extruded.
-            vertices, faces = (_triangulate_geos(region) if len(regions) > 1 else triangulate(region))
-            if not len(faces):
-                continue
-            local_points.append(vertices)
-            local_triangles.append(faces + local_offset)
-            local_labels.append(np.full(len(faces), flags, dtype=np.uint8))
-            local_offset += len(vertices)
-        if not local_triangles:
-            continue
-        # Weld within each original copper island only: separate islands that
-        # touch at one point must not become a non-manifold vertex.
-        vertices, inverse = np.unique(np.concatenate(local_points), axis=0, return_inverse=True)
-        points.append(vertices)
-        triangles.append(inverse[np.concatenate(local_triangles)] + offset)
-        labels.append(np.concatenate(local_labels))
-        offset += len(vertices)
-    if not triangles:
-        return None
-    faces, flags = np.concatenate(triangles), np.concatenate(labels)
-    mesh, _ = slab_from_triangles(np.concatenate(points), faces, z_bottom, thickness)
-    count = len(faces)
-    for index, name in enumerate(names):
-        values = np.zeros(mesh.n_cells, dtype=np.uint8)
-        start = count if name == "F.Mask" else 0
-        values[start:start + count] = (flags & (1 << index)) != 0
-        mesh.cell_data[f"coat:{name}"] = values
-    # These are ray-material tags, never a scalar palette for the viewport.
-    mesh.set_active_scalars(None)
-    return mesh
 
 
 # Keep the original full 64-side circle quality. Speedups come from batching and
 # reusing geometry, rather than reducing the visible detail.
-CIRCLE_QUAD_SEGS = 16
+# Worker threads for layer meshing; GEOS releases the GIL in its heavy calls.
+MAX_MESH_WORKERS = max(2, min(12, (os.cpu_count() or 4) - 1))
 PLATING_MM = .020  # IPC does not expose the manufacturing barrel plating thickness.
 CONTACT_INSET_MM = .001  # Render-only separation of touching dissimilar materials.
 MASK_THICKNESS_MM = .015
@@ -279,81 +166,36 @@ class SceneData:
     _mask_profiles: dict[str, BaseGeometry] = field(default_factory=dict, repr=False)
 
 
-def circle(position, radius):
-    return Point(position).buffer(radius, quad_segs=CIRCLE_QUAD_SEGS)
 
 
-def pad_hole(pad, expansion=0.0):
-    """Drill slot, rotated about the pad's actual drill origin."""
-    dx, dy = pad.drill_mm
-    if min(dx, dy) <= 0:
-        return Polygon()
-    radius = min(dx, dy) / 2
-    half = (max(dx, dy) - min(dx, dy)) / 2
-    angle = math.radians(pad.angle_deg or 0)
-    ux, uy = (math.cos(angle), -math.sin(angle)) if dx >= dy else (math.sin(angle), math.cos(angle))
-    x, y = pad.position
-    return LineString([(x-half*ux,y-half*uy), (x+half*ux,y+half*uy)]).buffer(radius+expansion, quad_segs=CIRCLE_QUAD_SEGS)
 
 
-def board_outline(snapshot):
-    return polygon_union(poly_to_shapely(p) for p in snapshot.outline)
 
 
-def copper_geometry(snapshot, layer_id):
-    """Union every same-layer conductor before meshing; subtract real drill holes.
-
-    Capped vias close only the two endpoint copper surfaces. Filled but uncapped
-    vias retain a copper opening, with a separate non-copper filler material.
-    """
-    from .extract import _arc_points
-    parts = []
-    for track in snapshot.tracks:
-        if track.layer == layer_id:
-            points = [track.start] + (_arc_points(track.start, track.mid, track.end) if track.mid else [track.end])
-            parts.append(LineString(points).buffer(track.width_mm/2, quad_segs=CIRCLE_QUAD_SEGS))
-    for pad in snapshot.pads:
-        parts.extend(poly_to_shapely(p) for p in pad.shapes.get(layer_id, []))
-    for zone in snapshot.zones:
-        parts.extend(poly_to_shapely(p) for p in zone.filled.get(layer_id, []))
-    holes = []
-    for via in snapshot.vias:
-        if layer_id not in via.layers:
-            continue
-        if via.copper_layers is None or layer_id in via.copper_layers:
-            parts.append(circle(via.position, via.diameters_mm.get(layer_id, via.diameter_mm)/2))
-        elif via.capped and layer_id in (via.layers[0], via.layers[-1]):
-            # Removing an unused annulus must not remove the bore's copper cap.
-            parts.append(circle(via.position, via.drill_mm/2))
-        if via.drill_mm > 0 and not (via.capped and layer_id in (via.layers[0], via.layers[-1])):
-            holes.append(circle(via.position, via.drill_mm/2))
-    # NPTH holes cut every layer, even when the pad has no copper definition.
-    holes.extend(pad_hole(pad) for pad in snapshot.pads if min(pad.drill_mm) > 0)
-    geom = polygon_union(parts)
-    if holes:
-        geom = geom.difference(polygon_union(holes))
-    outline = board_outline(snapshot)
-    if not outline.is_empty:
-        geom = geom.intersection(outline)
-    # Both boolean operations already return a unioned, valid polygonal result.
-    return geom
 
 
-def dielectric_geometry(snapshot, dielectric):
-    holes = []
-    for via in snapshot.vias:
-        if dielectric.above_layer in via.layers and dielectric.below_layer in via.layers and via.drill_mm > 0:
-            holes.append(circle(via.position, via.drill_mm/2 + PLATING_MM))
+
+
+
+
+
+
+def dielectric_geometry(snapshot, dielectric, *, outline=None):
+    vias = [via for via in snapshot.vias if dielectric.above_layer in via.layers
+            and dielectric.below_layer in via.layers and via.drill_mm > 0]
+    holes = _circles([via.position for via in vias], [via.drill_mm/2 + PLATING_MM for via in vias])
     holes.extend(pad_hole(pad, PLATING_MM if pad.pad_type == "pth" else 0)
                  for pad in snapshot.pads if min(pad.drill_mm) > 0)
-    return board_outline(snapshot).difference(polygon_union(holes))
+    if outline is None:
+        outline = board_outline(snapshot)
+    return outline.difference(polygon_union(holes))
 
 
 def mask_geometry(snapshot, front):
     explicit = getattr(snapshot, "mask_openings", None)
     if explicit is not None:
         openings = explicit.get("F.Mask" if front else "B.Mask", [])
-        return board_outline(snapshot).difference(polygon_union(poly_to_shapely(p) for p in openings))
+        return board_outline(snapshot).difference(polygon_union(polys_to_shapely(openings)))
     copper = snapshot.stackup.copper[0 if front else -1]
     openings = []
     for pad in snapshot.pads:
@@ -377,14 +219,18 @@ def _join_meshes(meshes):
         return None
     if len(meshes) == 1:
         return meshes[0]
-    points, faces, offset = [], [], 0
+    points, faces, normals, offset = [], [], [], 0
     for mesh in meshes:
         points.append(mesh.points)
         triangles = mesh.faces.reshape(-1, 4).copy()
         triangles[:, 1:] += offset
         faces.append(triangles)
+        normals.append(mesh.point_data.get("Normals"))
         offset += mesh.n_points
-    return pv.PolyData(np.vstack(points), np.vstack(faces).ravel())
+    joined = pv.PolyData(np.vstack(points), np.vstack(faces).ravel())
+    if all(value is not None for value in normals):
+        _set_normals(joined, np.vstack(normals).astype(np.float32))
+    return joined
 
 
 def _round_solid_template(rounds, slots=()):
@@ -713,7 +559,8 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
                 templates[cache_key] = slab(geom, 0., 1.)
             mesh = _place_template(templates[cache_key], z, thickness)
         else:
-            mesh = slab(geom, z, thickness)
+            # Thin foils/coatings: smoothing their few-micron walls is invisible.
+            mesh = slab(geom, z, thickness, smooth=False)
         if mesh is not None:
             scene.parts.append(ScenePart(key, name, kind, layer_id, slot, mesh,
                                          color, editor or color, geom.area))
@@ -780,13 +627,20 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
             shapely.prepare(mask_profiles[name])
             outer_coatings.setdefault(cu.id, {})[name] = mask_profiles[name]
     scene._mask_profiles = mask_profiles
+    shared = {}
+
+    def shared_outline():
+        if "outline" not in shared:
+            shared["outline"] = board_outline(snapshot)
+            shapely.prepare(shared["outline"])
+        return shared["outline"]
 
     def prepare_copper(cu):
         from .via_surfaces import split_cap_surfaces
         check_cancel = getattr(progress, "check_cancel", None)
         if check_cancel is not None:
             check_cancel()
-        geom = copper_geometry(snapshot, cu.id)
+        geom = copper_geometry(snapshot, cu.id, outline=shared["outline"], pad_holes=shared["pad_holes"])
         base, patch = split_cap_surfaces(snapshot, cu.id, geom)
         coatings = outer_coatings.get(cu.id, {})
         return (coated_slab(base, cu.z_bottom_mm, cu.thickness_mm, coatings, check_cancel), base.area,
@@ -794,15 +648,83 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
 
     # GEOS releases the GIL during polygon operations/triangulation. Each task
     # owns its geometry and VTK dataset; no rendering or Qt calls happen here.
-    # Keep only four tasks in flight so cancellation and peak memory are bounded.
+    # Tasks in flight are bounded so cancellation and peak memory stay bounded.
     copper = snapshot.stackup.copper
     dirty_copper = [index for index, cu in enumerate(copper)
                    if any(f"{kind}:{cu.id}" in requested and f"{kind}:{cu.id}" not in unchanged
                           for kind in ("copper", "via-patch"))]
-    workers = min(4, max(1, len(dirty_copper)))
-    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pcb-copper")
-    pending = {index: pool.submit(prepare_copper, copper[index]) for index in dirty_copper[:workers]}
-    remaining = iter(dirty_copper[workers:])
+    dielectric_jobs = {}
+    for i, dielectric in enumerate(snapshot.stackup.dielectrics):
+        if f"dielectric:{i}" in requested and f"dielectric:{i}" not in unchanged:
+            section = tuple(j for j, v in enumerate(snapshot.vias)
+                            if dielectric.above_layer in v.layers and dielectric.below_layer in v.layers
+                            and v.drill_mm > 0)
+            dielectric_jobs.setdefault(section, dielectric)
+    if dirty_copper or dielectric_jobs:
+        shared_outline()
+    if dirty_copper:
+        shared["pad_holes"] = drilled_pad_holes(snapshot)
+    workers = max(1, min(MAX_MESH_WORKERS, len(dirty_copper) + len(dielectric_jobs)))
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pcb-mesh")
+
+    def prepare_dielectric(dielectric):
+        check_cancel = getattr(progress, "check_cancel", None)
+        if check_cancel is not None:
+            check_cancel()
+        geom = dielectric_geometry(snapshot, dielectric, outline=shared["outline"])
+        return geom, (slab(geom, 0., 1.) if not geom.is_empty else None)
+
+    # Large multi-layer rebuilds mesh copper foils in worker processes, which
+    # scale with the CPU; edits of a few layers and small boards use threads.
+    from . import mesh_pool
+    remote = {}
+    if mesh_pool.should_use(snapshot, dirty_copper):
+        # Outer foils carry mask coverage and take longest; start them first.
+        for index in sorted(dirty_copper, key=lambda i: (i not in (0, len(copper) - 1), i)):
+            cu = copper[index]
+            tracks, polys, vias = layer_inputs(snapshot, cu.id)
+            future = mesh_pool.submit(mesh_copper_layer, {
+                "layer_id": cu.id, "tracks": tracks, "polys": polys, "vias": vias,
+                "outline": shared["outline"], "pad_holes": shared["pad_holes"],
+                "coatings": outer_coatings.get(cu.id, {}),
+                "z_bottom": cu.z_bottom_mm, "thickness": cu.thickness_mm})
+            if future is None:
+                break
+            remote[index] = future
+        if len(remote) != len(dirty_copper):
+            for future in remote.values():
+                future.cancel()
+            remote.clear()
+    local_copper = [index for index in dirty_copper if index not in remote]
+    in_flight = max(workers, 2)
+    pending = {index: pool.submit(prepare_copper, copper[index]) for index in local_copper[:in_flight]}
+    remaining = iter(local_copper[in_flight:])
+    dielectric_futures = {section: pool.submit(prepare_dielectric, dielectric)
+                          for section, dielectric in dielectric_jobs.items()}
+
+    def copper_result(index):
+        future = remote.pop(index, None)
+        if future is None:
+            result = pending.pop(index).result()
+            next_index = next(remaining, None)
+            if next_index is not None:
+                pending[next_index] = pool.submit(prepare_copper, copper[next_index])
+            return result
+        check_cancel = getattr(progress, "check_cancel", None)
+        while True:
+            try:
+                base, base_area, patch, patch_area = future.result(timeout=.1)
+                break
+            except FuturesTimeout:
+                if check_cancel is not None:
+                    check_cancel()
+            except Exception:  # noqa: BLE001 - a broken worker must never lose the board
+                logging.getLogger(__name__).warning("Mesh worker failed; meshing %s in-process",
+                                                    copper[index].name, exc_info=True)
+                mesh_pool.mark_broken()
+                return prepare_copper(copper[index])
+        return _remote_mesh(base), base_area, _remote_mesh(patch), patch_area
+
     try:
         for index, cu in enumerate(copper):
             from .via_surfaces import via_patch_color
@@ -811,10 +733,7 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
                                  via_patch_color(copper_color(snapshot, cu)))
             if not base_reused or not patch_reused:
                 report(f"Meshing {cu.name}")
-                mesh, area, patch_mesh, patch_area = pending.pop(index).result()
-                next_index = next(remaining, None)
-                if next_index is not None:
-                    pending[next_index] = pool.submit(prepare_copper, copper[next_index])
+                mesh, area, patch_mesh, patch_area = copper_result(index)
                 if mesh is not None and not base_reused:
                     scene.parts.append(ScenePart(f"copper:{cu.id}", cu.name, "copper", cu.id, 2 * cu.index,
                                                  mesh, copper_rgb, copper_color(snapshot, cu), area))
@@ -831,7 +750,10 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
                              fill_template(fill_key), cu.z_bottom_mm, cu.thickness_mm, fill_rgb)
             add_plugs(f"plug-copper:{cu.id}", f"Via plugging · {cu.name}", cu.id, 2*cu.index,
                       cu.z_bottom_mm, cu.thickness_mm)
+        dielectric_futures = {section: future.result() for section, future in dielectric_futures.items()}
     finally:
+        for future in remote.values():
+            future.cancel()
         pool.shutdown(wait=True, cancel_futures=True)
     for i, dielectric in enumerate(snapshot.stackup.dielectrics):
         cu_above = snapshot.stackup.layer(dielectric.above_layer)
@@ -849,7 +771,14 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
         dielectric_name = f"{dielectric.material or 'Dielectric'} {i+1}"
         if not reuse(f"dielectric:{i}", dielectric_name):
             if section_key not in dielectric_sections:
-                dielectric_sections[section_key] = dielectric_geometry(snapshot, dielectric)
+                if section_key in dielectric_futures:
+                    geom, template = dielectric_futures.pop(section_key)
+                    dielectric_sections[section_key] = geom
+                    if template is not None:
+                        templates[geom.wkb] = template
+                else:
+                    dielectric_sections[section_key] = dielectric_geometry(
+                        snapshot, dielectric, outline=shared_outline())
             add(f"dielectric:{i}", dielectric_name, "dielectric", None,
                 slot, dielectric_sections[section_key], z, thick, (.25,.36,.24))
         if not reuse(f"barrels:{i}"):
@@ -890,7 +819,7 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
                     # Printed ink is clipped to the board/mask, so it cannot
                     # cover exposed pads or float outside the board outline.
                     mask = mask_geometry(snapshot, front) if mask is None else mask
-                    geom = polygon_union(poly_to_shapely(poly) for poly in ink).intersection(mask)
+                    geom = polygon_union(polys_to_shapely(ink)).intersection(mask)
                     ink_z = (z + MASK_THICKNESS_MM + CONTACT_INSET_MM if front
                              else z - SILK_THICKNESS_MM - CONTACT_INSET_MM)
                     add(f"silk:{silk_name}", silk_name, "silk", None,
@@ -902,7 +831,7 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
                 artwork = snapshot.solder_paste.get(paste_name, [])
                 if artwork:
                     report(f"Meshing {paste_name}")
-                    geom = polygon_union(poly_to_shapely(poly) for poly in artwork).intersection(board_outline(snapshot))
+                    geom = polygon_union(polys_to_shapely(artwork)).intersection(shared_outline())
                     paste_z = (cu.z_top_mm + CONTACT_INSET_MM if front else
                                cu.z_bottom_mm - CONTACT_INSET_MM - PASTE_THICKNESS_MM)
                     add(f"paste:{paste_name}", paste_name, "paste", None, slot, geom,

@@ -87,7 +87,7 @@ def test_rotated_drill_slot_and_manifold_demo_meshes():
     assert len({part.key for part in scene.parts}) == len(scene.parts)
     for part in scene.parts:
         assert np.isfinite(part.mesh.points).all()
-        assert part.mesh.n_open_edges == 0, part.key
+        assert part.mesh.clean(tolerance=0.).n_open_edges == 0, part.key
         assert part.mesh.volume > 0, part.key
 
 
@@ -98,7 +98,7 @@ def test_batched_round_solids_preserve_bores_volume_and_budget():
     sides = 4 * CIRCLE_QUAD_SEGS
     expected = sides * np.sin(2 * np.pi / sides) / 2 * sum(
         outer**2 - inner**2 for x, y, inner, outer in rounds)
-    assert mesh.n_open_edges == 0
+    assert mesh.clean(tolerance=0.).n_open_edges == 0
     assert mesh.is_all_triangles
     assert area == pytest.approx(expected)
     assert mesh.volume == pytest.approx(expected, rel=1e-8)
@@ -117,7 +117,7 @@ def test_intersecting_round_solids_and_rotated_slots_are_unioned_once():
         circle((x, y), outside).difference(circle((x, y), inside)) if inside
         else circle((x, y), outside) for x, y, inside, outside in rounds
     ] + [outer.difference(inner)])
-    assert mesh.n_open_edges == 0
+    assert mesh.clean(tolerance=0.).n_open_edges == 0
     assert mesh.volume == pytest.approx(expected.area, rel=1e-6)
     assert area == pytest.approx(expected.area, rel=1e-7)
 
@@ -125,7 +125,7 @@ def test_intersecting_round_solids_and_rotated_slots_are_unioned_once():
 def test_coincident_fill_solids_have_no_duplicate_surfaces():
     single, single_area = _round_solid_template([(0., 0., 0., .2)])
     duplicate, duplicate_area = _round_solid_template([(0., 0., 0., .2)] * 2)
-    assert duplicate.n_open_edges == 0
+    assert duplicate.clean(tolerance=0.).n_open_edges == 0
     assert duplicate.volume == pytest.approx(single.volume)
     assert duplicate_area == pytest.approx(single_area)
     assert duplicate.n_cells <= single.n_cells
@@ -156,3 +156,27 @@ def test_explicit_native_mask_apertures_replace_legacy_guessing():
     snapshot.mask_openings["F.Mask"] = [aperture]
     assert not mask_geometry(snapshot, True).covers(Point(3, 3))
     assert mask_geometry(snapshot, False).covers(Point(3, 3))
+
+
+def test_tall_walls_shade_smoothly_and_thin_foils_stay_compact():
+    """Round holes get averaged wall normals; sharp corners keep their own facets."""
+    from shapely.geometry import box
+    from layer_viewer.geometry import slab
+    from layer_viewer.meshing import circle
+    shape = box(0, 0, 4, 4).difference(circle((2., 2.), .5))
+    smooth = slab(shape, 0., 1.6)
+    normals = np.asarray(smooth.point_data["Normals"])
+    walls = np.abs(normals[:, 2]) < 1e-6
+    points = np.asarray(smooth.points)
+    radial = points[walls, :2] - (2., -2.)
+    on_hole = np.isclose(np.hypot(*radial.T), .5)
+    # Hole walls face the bore axis (normals point into the hole, i.e. outward from the solid).
+    cosine = np.einsum("ij,ij->i", normals[walls][on_hole, :2], -radial[on_hole] / .5)
+    assert cosine.min() > .999
+    # Square corners are split: four distinct axis-aligned normals at each corner.
+    corner = np.all(np.isclose(points[:, :2], (0., 0.)), axis=1) & walls
+    assert len(np.unique(np.round(normals[corner], 6), axis=0)) == 2
+    assert smooth.clean(tolerance=0.).n_open_edges == 0
+    assert smooth.volume == pytest.approx(shape.area * 1.6, rel=1e-9)
+    thin = slab(shape, 0., .035, smooth=False)
+    assert "Normals" not in thin.point_data and thin.n_open_edges == 0

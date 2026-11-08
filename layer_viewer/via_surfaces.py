@@ -24,7 +24,7 @@ def split_cap_surfaces(snapshot, layer_id, copper_geometry):
     Only capped endpoints get a patch. Filled-but-uncapped bores, open vias,
     inner layers outside a blind/buried cap and board cutouts remain unchanged.
     """
-    from .geometry import CIRCLE_QUAD_SEGS
+    from .meshing import CIRCLE_QUAD_SEGS
     capped = [via for via in snapshot.vias if via.capped and via.layers
               and layer_id in (via.layers[0], via.layers[-1]) and via.drill_mm > 0]
     if not capped or copper_geometry.is_empty:
