@@ -481,6 +481,10 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._worker_finished)
         self.statusBar().showMessage("Loading board…")
         self.loading.show()
+        if source != "demo":
+            # Start mesh workers now so they are ready when the board has been read.
+            from . import mesh_pool
+            mesh_pool.warm_up()
         self.worker.start(QThread.LowPriority)
 
     def _worker_finished(self):
@@ -936,5 +940,7 @@ class MainWindow(QMainWindow):
             server.instance_lock.unlock()
         if self.render_dialog is not None:
             self.render_dialog.close()
+        from . import mesh_pool
+        mesh_pool.shutdown()
         self.viewport.plotter.close()
         super().closeEvent(event)
