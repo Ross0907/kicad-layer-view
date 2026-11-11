@@ -93,7 +93,10 @@ class RenderDialog(QDialog):
             lambda index: window.viewport.set_background(("kicad", "dark")[index]))
         form.addRow("Background", background)
         antialias = QComboBox()
-        antialias.addItems(["FXAA · high quality", "FXAA · standard", "Supersampling (SSAA)", "None"])
+        antialias.addItems(["FXAA · high quality", "FXAA · standard", "Supersampling (SSAA) · small boards", "None"])
+        antialias.setToolTip("Supersampling gives the cleanest thin lines but needs far more GPU memory. "
+                             "It applies only to boards under 3 million triangles; larger boards "
+                             "use high-quality FXAA automatically.")
         antialias.setCurrentIndex(["fxaa_hq", "fxaa", "ssaa", "none"].index(window.viewport.antialiasing))
         antialias.currentIndexChanged.connect(
             lambda index: window.viewport.set_antialiasing(["fxaa_hq", "fxaa", "ssaa", "none"][index]))

@@ -39,6 +39,8 @@ def arcball_rotation(previous, current, size):
 # KiCad's OpenGL viewer lights every material with three lights that each add
 # 0.084 ambient (render_3d_opengl.cpp, init_lights).
 KICAD_AMBIENT = 3 * .084
+# Largest scene that may be supersampled; beyond this, FXAA is used instead.
+SSAA_MAX_TRIANGLES = 3_000_000
 BACKGROUNDS = {
     # KiCad 3D viewer default gradient (board_adapter.cpp g_DefaultBackground*).
     "kicad": ((.40, .40, .50), (.80, .80, .90)),
@@ -166,6 +168,7 @@ class BoardViewport(QWidget):
         self.gap_mm = 0.0
         self.auto_frame = True
         self.antialiasing = "fxaa_hq"
+        self._applied_antialiasing = "fxaa_hq"
         self.led_enabled = False
         self.led_intensity = 20.
         self.led_color = None  # Model lens color, unless explicitly overridden.
@@ -277,6 +280,9 @@ class BoardViewport(QWidget):
             self.parts[part.key] = part
             plane = vtkPlane()
             self.planes[part.key] = plane
+        # Re-check before the first frame of a new scene: a larger board may
+        # no longer be safe to supersample.
+        self._apply_antialiasing()
         self.set_gap(self.gap_mm, reframe=not preserve_view)
         self._update_led_appearance()
         if not preserve_view:
@@ -411,14 +417,35 @@ class BoardViewport(QWidget):
             self.plotter.disable_parallel_projection()
         self.request_render()
 
+    def triangle_count(self):
+        return sum(part.mesh.n_cells for part in self.parts.values())
+
+    def effective_antialiasing(self):
+        """The requested mode, except supersampling on boards too large for it.
+
+        Supersampling multiplies every transparency pass's framebuffers. On a
+        multi-million-triangle board that can exhaust GPU memory and take the
+        graphics driver down, so large boards use high-quality FXAA instead.
+        """
+        if self.antialiasing == "ssaa" and self.triangle_count() > SSAA_MAX_TRIANGLES:
+            return "fxaa_hq"
+        return self.antialiasing
+
     def set_antialiasing(self, mode):
         self.antialiasing = mode
+        self._apply_antialiasing()
+        self.request_render()
+
+    def _apply_antialiasing(self):
+        mode = self.effective_antialiasing()
+        if mode == self._applied_antialiasing:
+            return
+        self._applied_antialiasing = mode
         self.plotter.disable_anti_aliasing()
         if mode != "none":
             self.plotter.enable_anti_aliasing("fxaa" if mode == "fxaa_hq" else mode)
             if mode in ("fxaa", "fxaa_hq"):
                 self._configure_fxaa(mode == "fxaa_hq")
-        self.request_render()
 
     def _configure_fxaa(self, high_quality):
         from vtkmodules.vtkRenderingCore import vtkFXAAOptions

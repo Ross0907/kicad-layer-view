@@ -21,7 +21,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 log = logging.getLogger(__name__)
 
-IDLE_SHUTDOWN_S = 90.
+IDLE_SHUTDOWN_S = 300.
 # Below this many conductor vertices, thread meshing finishes before workers start.
 MIN_VERTICES = 60_000
 MIN_LAYERS = 2

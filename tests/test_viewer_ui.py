@@ -464,3 +464,17 @@ def test_component_completion_during_staged_load_preserves_board_and_controls(wi
         assert "Missing fixture model" in window.scene.warnings
     finally:
         release.set()
+
+
+def test_supersampling_is_never_applied_to_a_large_board(window, monkeypatch):
+    """Supersampling a multi-million-triangle board can exhaust GPU memory."""
+    from layer_viewer import viewer as viewer_module
+    viewport = window.viewport
+    assert viewport.antialiasing == "fxaa_hq"  # the safe default
+    viewport.set_antialiasing("ssaa")
+    assert viewport.effective_antialiasing() == "ssaa"  # the small demo board may use it
+    monkeypatch.setattr(viewer_module, "SSAA_MAX_TRIANGLES", 10)
+    viewport.set_antialiasing("ssaa")
+    assert viewport.antialiasing == "ssaa" and viewport.effective_antialiasing() == "fxaa_hq"
+    assert viewport._applied_antialiasing == "fxaa_hq"
+    viewport.set_antialiasing("fxaa_hq")

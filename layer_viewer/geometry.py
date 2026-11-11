@@ -664,7 +664,7 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
         shared_outline()
     if dirty_copper:
         shared["pad_holes"] = drilled_pad_holes(snapshot)
-    workers = max(1, min(MAX_MESH_WORKERS, len(dirty_copper) + len(dielectric_jobs)))
+    workers = max(1, min(MAX_MESH_WORKERS, len(dirty_copper) + len(dielectric_jobs) + 2))
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pcb-mesh")
 
     def prepare_dielectric(dielectric):
@@ -701,6 +701,30 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
     remaining = iter(local_copper[in_flight:])
     dielectric_futures = {section: pool.submit(prepare_dielectric, dielectric)
                           for section, dielectric in dielectric_jobs.items()}
+
+    def prepare_silk(front):
+        """Union the ink, clip it to the mask and mesh it off the main thread."""
+        name = "F.Mask" if front else "B.Mask"
+        silk_name = "F.SilkS" if front else "B.SilkS"
+        cu = copper[0 if front else -1]
+        mask = mask_profiles.get(name)
+        mask = mask_geometry(snapshot, front) if mask is None else mask
+        # Printed ink is clipped to the board/mask, so it cannot cover exposed
+        # pads or float outside the board outline.
+        geom = polygon_union(polys_to_shapely(snapshot.silkscreen.get(silk_name, []))).intersection(mask)
+        z = cu.z_top_mm+CONTACT_INSET_MM if front else cu.z_bottom_mm-MASK_THICKNESS_MM-CONTACT_INSET_MM
+        ink_z = (z + MASK_THICKNESS_MM + CONTACT_INSET_MM if front
+                 else z - SILK_THICKNESS_MM - CONTACT_INSET_MM)
+        mesh = None if geom.is_empty else slab(geom, ink_z, SILK_THICKNESS_MM, smooth=False)
+        return geom, mesh
+
+    silk_futures = {}
+    if copper and snapshot.silkscreen is not None:
+        for front in (True, False):
+            silk_name = "F.SilkS" if front else "B.SilkS"
+            key = f"silk:{silk_name}"
+            if key in requested and key not in unchanged and snapshot.silkscreen.get(silk_name):
+                silk_futures[silk_name] = pool.submit(prepare_silk, front)
 
     def copper_result(index):
         future = remote.pop(index, None)
@@ -751,6 +775,7 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
             add_plugs(f"plug-copper:{cu.id}", f"Via plugging · {cu.name}", cu.id, 2*cu.index,
                       cu.z_bottom_mm, cu.thickness_mm)
         dielectric_futures = {section: future.result() for section, future in dielectric_futures.items()}
+        silk_futures = {name: future.result() for name, future in silk_futures.items()}
     finally:
         for future in remote.values():
             future.cancel()
@@ -813,18 +838,13 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
             silk_name = "F.SilkS" if front else "B.SilkS"
             silk_editor = snapshot.editor_colors.get(silk_name, default_colors()[silk_name])
             if snapshot.silkscreen is not None and not reuse(f"silk:{silk_name}", silk_name, silk_editor):
-                ink = snapshot.silkscreen.get(silk_name, [])
-                if ink:
+                if silk_name in silk_futures:
                     report(f"Meshing {silk_name}")
-                    # Printed ink is clipped to the board/mask, so it cannot
-                    # cover exposed pads or float outside the board outline.
-                    mask = mask_geometry(snapshot, front) if mask is None else mask
-                    geom = polygon_union(polys_to_shapely(ink)).intersection(mask)
-                    ink_z = (z + MASK_THICKNESS_MM + CONTACT_INSET_MM if front
-                             else z - SILK_THICKNESS_MM - CONTACT_INSET_MM)
-                    add(f"silk:{silk_name}", silk_name, "silk", None,
-                        slot - 1 if front else slot + 1, geom, ink_z, SILK_THICKNESS_MM,
-                        (.94, .94, .91), silk_editor)
+                    geom, mesh = silk_futures.pop(silk_name)
+                    if mesh is not None:
+                        scene.parts.append(ScenePart(f"silk:{silk_name}", silk_name, "silk", None,
+                                                     slot - 1 if front else slot + 1, mesh,
+                                                     (.94, .94, .91), silk_editor, geom.area))
             paste_name = "F.Paste" if front else "B.Paste"
             paste_editor = snapshot.editor_colors.get(paste_name, (.7, .7, .7))
             if snapshot.solder_paste is not None and not reuse(f"paste:{paste_name}", paste_name, paste_editor):
