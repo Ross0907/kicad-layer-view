@@ -117,7 +117,7 @@ def capture_from_viewport(viewport) -> RenderCapture:
                               if len(coatings) == 2 else None)
         led_color = getattr(viewport, "led_color", None)
         if led_color is None:
-            led_color = getattr(part, "color", actor.GetProperty().GetColor())
+            led_color = getattr(part, "color", actor.GetProperty().GetDiffuseColor())
             peak = max(max(led_color), .01)
             led_color = tuple(channel / peak for channel in led_color)
         emission = (tuple(float(channel) * getattr(viewport, "led_intensity", 20.)
@@ -127,7 +127,7 @@ def capture_from_viewport(viewport) -> RenderCapture:
         captured.append(CapturedMesh(part.name, part.kind,
                         _readonly(mesh.points, np.float64),
                         _readonly(np.asarray(mesh.faces).reshape(-1,4)[:,1:], np.int32),
-                        transform, tuple(actor.GetProperty().GetColor()),
+                        transform, tuple(actor.GetProperty().GetDiffuseColor()),
                         float(actor.GetProperty().GetOpacity()), clipping,
                         getattr(part, "metallic", None), getattr(part, "roughness", None),
                         covered_faces, coating_mask, back_covered_faces, emission))

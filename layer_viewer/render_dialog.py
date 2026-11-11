@@ -4,9 +4,10 @@ import logging
 
 from qtpy.QtCore import QThread, Signal, QUrl, QTimer
 from qtpy.QtGui import QDesktopServices
+from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QGroupBox, QLabel, QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QFrame, QGroupBox, QLabel, QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
 log = logging.getLogger(__name__)
@@ -65,10 +66,32 @@ class RenderDialog(QDialog):
         self._starting = False
         self.output_path = None
         self.setWindowTitle("Render settings")
-        self.setMinimumWidth(440)
-        layout = QVBoxLayout(self)
+        self.setMinimumWidth(460)
+        # Every setting lives in a scroll area so the dialog fits short screens
+        # and high display scaling; the window opens no taller than the screen.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 8)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(12, 12, 12, 4)
+        self.scroll.setWidget(content)
+        outer.addWidget(self.scroll, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.setContentsMargins(12, 0, 12, 0)
+        outer.addWidget(buttons)
         interactive = QGroupBox("Interactive viewer · full native pixel resolution")
         form = QFormLayout(interactive)
+        background = QComboBox()
+        background.addItems(["KiCad 3D viewer gradient", "Dark"])
+        background.setCurrentIndex(0 if getattr(window.viewport, "background", "kicad") == "kicad" else 1)
+        background.currentIndexChanged.connect(
+            lambda index: window.viewport.set_background(("kicad", "dark")[index]))
+        form.addRow("Background", background)
         antialias = QComboBox()
         antialias.addItems(["FXAA · high quality", "FXAA · standard", "Supersampling (SSAA)", "None"])
         antialias.setCurrentIndex(["fxaa_hq", "fxaa", "ssaa", "none"].index(window.viewport.antialiasing))
@@ -219,6 +242,7 @@ class RenderDialog(QDialog):
         self.open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(self.output_path)))
         ray_form.addRow(self.open_button)
         layout.addWidget(traced)
+        layout.addStretch(1)
 
     def start_render(self):
         if getattr(self.window, "_closing", False):
@@ -336,4 +360,12 @@ class RenderDialog(QDialog):
 
     def showEvent(self, event):
         self._sync_screenshot_scale()
+        self._fit_to_screen()
         super().showEvent(event)
+
+    def _fit_to_screen(self):
+        """Open at the content's natural height, capped to the available screen."""
+        screen = self.screen() or (self.window.screen() if hasattr(self.window, "screen") else None)
+        available = screen.availableGeometry().height() if screen is not None else 900
+        content = self.scroll.widget().sizeHint().height() + 70
+        self.resize(max(self.size().width(), 480), max(320, min(content, int(available * .85))))

@@ -53,6 +53,7 @@ def test_exposure_control_updates_shared_live_and_export_setting():
         enabled_changed = Signal(bool)
         enabled, samples, denoise, exposure_ev = False, 64, True, -.5
         denoise_strength = .35
+        bloom_enabled, bloom_strength, bloom_radius = False, .18, 1.
 
         def set_enabled(self, value):
             self.enabled = value
@@ -63,7 +64,8 @@ def test_exposure_control_updates_shared_live_and_export_setting():
 
     window = QWidget()
     live = Live(window)
-    window.viewport = SimpleNamespace(antialiasing="fxaa", auto_frame=True, live_ray=live)
+    window.viewport = SimpleNamespace(antialiasing="fxaa", auto_frame=True, live_ray=live,
+                                      led_enabled=False, led_intensity=20., led_color=None)
     window.screenshot_scale = 1
     window.mask_opacity = .5
     window.set_mask_opacity = lambda value: None
@@ -116,3 +118,46 @@ def test_png_export_passes_the_same_exposure_to_every_sample(monkeypatch, tmp_pa
     assert result == path
     assert calls == [(1, True, -.75, .55, False), (1, True, -.75, .55, False), (1, True, -.75, .55, True)]
     assert written == [("final image", str(path))]
+
+
+def test_settings_scroll_and_never_open_taller_than_the_screen():
+    from qtpy.QtWidgets import QScrollArea
+    app = QApplication.instance() or QApplication([])
+
+    class Live(QObject):
+        enabled_changed = Signal(bool)
+        enabled, samples, denoise, exposure_ev = False, 64, True, 0.
+        denoise_strength = .35
+        bloom_enabled, bloom_strength, bloom_radius = False, .18, 1.
+
+        def set_enabled(self, value):
+            self.enabled = value
+
+        def set_quality(self, **values):
+            pass
+
+    chosen = []
+    window = QWidget()
+    window.viewport = SimpleNamespace(antialiasing="fxaa", auto_frame=True, live_ray=Live(window),
+                                      led_enabled=False, led_intensity=20., led_color=None,
+                                      background="kicad", set_background=chosen.append)
+    window.screenshot_scale = 1
+    window.mask_opacity = .83
+    window.set_mask_opacity = lambda value: None
+    dialog = RenderDialog(window)
+    try:
+        dialog.show()
+        app.processEvents()
+        assert isinstance(dialog.scroll, QScrollArea) and dialog.scroll.widgetResizable()
+        assert dialog.size().height() <= dialog.screen().availableGeometry().height()
+        # A short window keeps every control reachable through the scroll bar.
+        dialog.resize(480, 320)
+        app.processEvents()
+        assert dialog.scroll.verticalScrollBar().maximum() > 0
+        combo = next(box for box in dialog.findChildren(type(dialog.screenshot_scale_combo))
+                     if box.itemText(0).startswith("KiCad"))
+        combo.setCurrentIndex(1)
+        assert chosen == ["dark"]
+    finally:
+        dialog.close()
+        window.close()

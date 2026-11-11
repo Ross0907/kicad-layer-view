@@ -3,7 +3,8 @@ import numpy as np
 from types import SimpleNamespace
 
 from layer_viewer import cache
-from layer_viewer.finishes import COPPER_COLOR, ENIG_COLOR, SILVER_COLOR, TIN_COLOR, finish_appearance
+from layer_viewer.finishes import (COPPER_COLOR, DEFAULT_FINISH_COLOR, ENIG_COLOR, SILVER_COLOR,
+                                   TIN_COLOR, finish_appearance, ray_metal_color)
 from layer_viewer.geometry import build_scene, scene_keys
 from layer_viewer.model import demo_snapshot
 from layer_viewer.via_surfaces import via_patch_color
@@ -35,16 +36,25 @@ def test_enig_refreshes_all_layers_from_disk_and_memory_without_remeshing(tmp_pa
                     expected = via_patch_color(expected)
                 assert tuple(part.color) == expected
     assert all(part.mesh is original_parts[part.key].mesh for part in reused.parts)
-    assert all(part.color == SILVER_COLOR for part in original.parts if part.kind == "copper")
+    assert all(part.color == DEFAULT_FINISH_COLOR for part in original.parts if part.kind == "copper")
 
 
 def test_universal_finish_palette_matches_kicad_and_explicit_bare_copper():
     from layer_viewer.progressive_raytrace import _linear
-    np.testing.assert_allclose(_linear(ENIG_COLOR), (1., .766, .336), atol=1e-6)
-    np.testing.assert_allclose(_linear(COPPER_COLOR), (.955, .637, .538), atol=1e-6)
-    assert SILVER_COLOR == (213/255,) * 3
-    for name, expected in (("", SILVER_COLOR), ("None", SILVER_COLOR), ("ENIG", ENIG_COLOR),
-                           ("Immersion silver", SILVER_COLOR), ("HASL", TIN_COLOR), ("OSP", COPPER_COLOR)):
+    # Display swatches are KiCad's g_FinishColors / g_DefaultSurfaceFinish ...
+    assert ENIG_COLOR == (178/255, 156/255, 0.) and COPPER_COLOR == (184/255, 115/255, 50/255)
+    assert SILVER_COLOR == (213/255,) * 3 and TIN_COLOR == (160/255,) * 3
+    assert DEFAULT_FINISH_COLOR == (.75, .61, .23)
+    # ... while the path tracer receives measured metal reflectance.
+    np.testing.assert_allclose(_linear(ray_metal_color(ENIG_COLOR)), (1., .766, .336), atol=1e-6)
+    np.testing.assert_allclose(_linear(ray_metal_color(COPPER_COLOR)), (.955, .637, .538), atol=1e-6)
+    assert ray_metal_color((.1, .2, .3)) == (.1, .2, .3)
+    for name, expected in (("", DEFAULT_FINISH_COLOR), ("None", DEFAULT_FINISH_COLOR),
+                           ("Not specified", DEFAULT_FINISH_COLOR), ("ENIG", ENIG_COLOR),
+                           ("ENEPIG", ENIG_COLOR), ("Hard gold", ENIG_COLOR), ("Immersion gold", ENIG_COLOR),
+                           ("Immersion silver", SILVER_COLOR), ("HAL lead-free", TIN_COLOR),
+                           ("HAL SnPb", TIN_COLOR), ("HASL", TIN_COLOR), ("Immersion tin", TIN_COLOR),
+                           ("Immersion nickel", TIN_COLOR), ("OSP", COPPER_COLOR), ("HT_OSP", COPPER_COLOR)):
         assert finish_appearance(name)[0] == expected
         snapshot = demo_snapshot()
         snapshot.surface_finish = name
@@ -58,8 +68,11 @@ def test_reused_barrel_actor_follows_live_finish_without_changing_custom_layer_c
     class Property:
         color = ENIG_COLOR
 
-        def SetColor(self, *color):
+        def SetDiffuseColor(self, *color):
             self.color = color
+
+        def __getattr__(self, name):
+            return lambda *args: None
 
     mesh = SimpleNamespace(n_points=3)
     actors, parts, updated = {}, {}, []

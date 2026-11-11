@@ -52,12 +52,14 @@ def test_legacy_cache_keeps_expensive_geometry_after_material_metadata_added(cac
     path.write_text(json.dumps(data))
     result = cache.load_cached_scene(snapshot)
     assert result is not None
-    assert result.parts[0].metallic is None
+    # Conductor appearance is always re-derived from the stackup finish.
+    assert result.parts[0].metallic == 1.
     np.testing.assert_array_equal(result.parts[0].mesh.points, scene.parts[0].mesh.points)
 
 
 def test_component_surface_cache_roundtrip(cache_setup):
     _, snapshot, scene = cache_setup
+    scene.parts[0].kind = "component"  # stackup materials are re-derived; model finishes persist
     scene.parts[0].metallic, scene.parts[0].roughness = 1.0, .24
     assert cache.save_cached_scene(snapshot, scene)
     part = cache.load_cached_scene(snapshot).parts[0]

@@ -36,6 +36,63 @@ def arcball_rotation(previous, current, size):
     return np.eye(3) + np.sin(angle)*skew + (1-np.cos(angle))*(skew @ skew)
 
 
+# KiCad's OpenGL viewer lights every material with three lights that each add
+# 0.084 ambient (render_3d_opengl.cpp, init_lights).
+KICAD_AMBIENT = 3 * .084
+BACKGROUNDS = {
+    # KiCad 3D viewer default gradient (board_adapter.cpp g_DefaultBackground*).
+    "kicad": ((.40, .40, .50), (.80, .80, .90)),
+    "dark": ((.063, .106, .161), (.141, .224, .290)),
+}
+
+
+def _mapf(x, in_min, in_max, out_min, out_max):
+    x = min(max(x, in_min), in_max)
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
+
+def kicad_material(kind, rgb):
+    """Phong terms KiCad's OpenGL viewer uses for this material and color.
+
+    Returns (ambient_color, specular_color, shininess). Constants follow
+    RENDER_3D_OPENGL::setupMaterials/setLayerMaterial so copper, mask, silk and
+    board look the way they do in KiCad, for any stackup color.
+    """
+    r, g, b = (float(v) for v in rgb[:3])
+    if kind in ("copper", "barrel", "via_patch"):
+        shininess = (.40 - _mapf(abs(r - g), .15, 1., 0., .30)) * 128.
+        return (r*.1, g*.1, b*.1), (r*.75 + .25, g*.75 + .25, b*.75 + .25), shininess
+    if kind == "mask":
+        return (r*.3, g*.3, b*.3), (r*r, g*g, b*b), .8 * 128.
+    if kind == "silk":
+        return (r, g, b), (r*r + .1, g*g + .1, b*b + .1), .078125 * 128.
+    if kind == "paste":
+        return (r, g, b), (r*r, g*g, b*b), .1 * 128.
+    if kind == "dielectric":
+        return (117/255, 97/255, 47/255), (18/255, 3/255, 20/255), .1 * 128.
+    if kind in ("fill", "plug"):
+        return (r*.3, g*.3, b*.3), (.2, .2, .2), .1 * 128.
+    # Component models keep their own colors with a restrained plastic highlight.
+    return (r, g, b), (.25, .25, .25), 32.
+
+
+def apply_material(prop, kind, rgb):
+    """Set a VTK property to KiCad's material for ``kind`` in color ``rgb``."""
+    ambient, specular, shininess = kicad_material(kind, rgb)
+    if kind == "component":
+        prop.SetAmbient(.18)
+        prop.SetDiffuse(.8)
+        prop.SetSpecular(.25)
+    else:
+        prop.SetAmbient(KICAD_AMBIENT)
+        prop.SetDiffuse(1.)
+        prop.SetSpecular(1.)
+    prop.SetAmbientColor(*ambient)
+    prop.SetDiffuseColor(*(float(v) for v in rgb[:3]))
+    prop.SetSpecularColor(*specular)
+    prop.SetSpecularPower(max(1., shininess))
+
+
 def layer_offset(stack_index: float, copper_count: int, gap_mm: float) -> float:
     return (copper_count - 1 - stack_index) * max(0.0, gap_mm)
 
@@ -69,7 +126,8 @@ class BoardViewport(QWidget):
         # core. VTK redraws on camera interactions; controls request one frame.
         self.plotter = QtInteractor(self, auto_update=False, multi_samples=0)
         layout.addWidget(self.plotter.interactor)
-        self.plotter.set_background("#101b29", top="#24394a")
+        self.background = "kicad"
+        self.set_background(self.background, render=False)
         self.plotter.enable_anti_aliasing("fxaa")
         self._configure_fxaa(True)
         # A finite peel count changes the composite as thin mask faces move
@@ -149,19 +207,27 @@ class BoardViewport(QWidget):
         self.request_render()
 
     def _setup_lighting(self):
-        """Neutral camera/top/bottom/diagonal lights, following KiCad's layout."""
+        """KiCad's OpenGL light rig: a camera headlight plus top and bottom lights.
+
+        Directions and strengths follow init_lights in render_3d_opengl.cpp: a
+        0.3 headlight and two 0.7 directional lights tilted 0.03 pi off the board
+        normal, so both faces of the board are lit the way KiCad lights them.
+        """
         import pyvista as pv
         self.plotter.remove_all_lights()
-        self.plotter.add_light(pv.Light(light_type="headlight", intensity=.2))
-        for z in (-1., 1.):
-            self.plotter.add_light(pv.Light(position=(0, 0, z), focal_point=(0, 0, 0),
-                                            light_type="scene light", intensity=.247))
-            for angle in np.radians((45, 135, 225, 315)):
-                elevation = np.radians(67)
-                position = (np.cos(angle)*np.cos(elevation), np.sin(angle)*np.cos(elevation),
-                            z*np.sin(elevation))
-                self.plotter.add_light(pv.Light(position=position, focal_point=(0, 0, 0),
-                                                light_type="scene light", intensity=.168))
+        self.plotter.add_light(pv.Light(light_type="headlight", intensity=.3))
+        theta, phi = np.pi * .03, np.pi * .25
+        tilt = (np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi))
+        for z in (1., -1.):
+            self.plotter.add_light(pv.Light(position=(*tilt, z * np.cos(theta)), focal_point=(0, 0, 0),
+                                            light_type="scene light", intensity=.7))
+
+    def set_background(self, name, render=True):
+        bottom, top = BACKGROUNDS.get(name, BACKGROUNDS["kicad"])
+        self.background = name if name in BACKGROUNDS else "kicad"
+        self.plotter.set_background(bottom, top=top)
+        if render:
+            self.request_render()
 
     def _picked_actor(self, actor):
         for key, current in self.actors.items():
@@ -186,19 +252,23 @@ class BoardViewport(QWidget):
                 if self.parts[part.key].mesh is not part.mesh:
                     self.actors[part.key].mapper.dataset = part.mesh
                 self.parts[part.key] = part
-                if part.kind == "barrel":
-                    # Barrels have no layer-color row to refresh their actor.
+                if part.kind in ("barrel", "fill", "plug"):
+                    # These have no layer-color row to refresh their actor.
                     # Reuse its geometry while following live finish changes.
-                    self.actors[part.key].GetProperty().SetColor(*part.color)
+                    apply_material(self.actors[part.key].GetProperty(), part.kind, part.color)
                 continue
             actor = self.plotter.add_mesh(
                 part.mesh, color=part.color,
                 opacity=part.opacity, smooth_shading=part.kind == "component", show_edges=False,
-                ambient=.18, diffuse=.8,
-                specular=.04 if part.kind == "silk" else .12 if part.kind == "mask" else .25,
-                specular_power=12 if part.kind == "via_patch" else 32,
                 name=part.key, reset_camera=False, render=False,
             )
+            prop = actor.GetProperty()
+            apply_material(prop, part.kind, part.color)
+            if part.kind == "component" or part.mesh.GetPointData().GetNormals() is not None:
+                # Per-pixel lighting with the mesh's smoothed wall normals.
+                prop.SetInterpolationToPhong()
+            else:
+                prop.SetInterpolationToFlat()
             self.actors[part.key] = actor
             # Hide disabled categories before the first render, avoiding a huge
             # initial frame containing every dielectric, mask and via interior.
@@ -239,22 +309,21 @@ class BoardViewport(QWidget):
             return
         if visible is not None:
             actor.SetVisibility(visible)
+        part = self.parts[key]
         if editor is not None:
-            part = self.parts[key]
-            actor.GetProperty().SetColor(part.editor_color if editor else part.color)
+            apply_material(actor.GetProperty(), part.kind, part.editor_color if editor else part.color)
         if color is not None:
-            actor.GetProperty().SetColor(*color)
+            apply_material(actor.GetProperty(), part.kind, color)
         if opacity is not None:
             actor.GetProperty().SetOpacity(opacity)
-        part = self.parts[key]
         if part.kind == "copper":
             patch = self.actors.get(f"via-patch:{part.layer_id}")
             if patch is not None:
                 from .via_surfaces import via_patch_color
-                color = actor.GetProperty().GetColor()
+                color = actor.GetProperty().GetDiffuseColor()
                 if getattr(self, "show_via_patches", True):
                     color = via_patch_color(color)
-                patch.GetProperty().SetColor(*color)
+                apply_material(patch.GetProperty(), "via_patch", color)
                 patch.GetProperty().SetOpacity(actor.GetProperty().GetOpacity())
         if render:
             self.refresh()
@@ -273,9 +342,12 @@ class BoardViewport(QWidget):
                 continue
             prop = self.actors[key].GetProperty()
             active = self.led_enabled and self.led_intensity > 0
-            prop.SetAmbient(1. if active else .18)
-            prop.SetDiffuse(0. if active else .8)
-            prop.SetColor(*(self.led_color if active and self.led_color is not None else part.color))
+            color = self.led_color if active and self.led_color is not None else part.color
+            apply_material(prop, part.kind, color)
+            if active:
+                prop.SetAmbient(1.)
+                prop.SetAmbientColor(*color)
+                prop.SetDiffuse(0.)
 
     def set_led_glow(self, *, enabled=None, intensity=None, color="unchanged"):
         if enabled is not None:

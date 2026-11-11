@@ -38,7 +38,7 @@ def test_capture_isolated_and_preserves_actor_color_opacity_transform_and_clip()
         capture = raytrace.capture_from_viewport(viewport)
         assert len(capture.meshes) == 1
         captured = capture.meshes[0]
-        assert captured.color == pytest.approx(actor.GetProperty().GetColor())
+        assert captured.color == pytest.approx(actor.GetProperty().GetDiffuseColor())
         assert captured.opacity == pytest.approx(.6)
         assert captured.metallic == 1.0
         assert captured.roughness == .24

@@ -15,7 +15,7 @@ def _viewport(mask="F.Mask", coverage=None):
     coverage = np.asarray((0, 1), dtype=np.uint8) if coverage is None else coverage
     mesh = SimpleNamespace(points=points, faces=faces, n_points=6, n_cells=2,
                            is_all_triangles=True, cell_data={f"coat:{mask}": coverage})
-    properties = SimpleNamespace(GetOpacity=lambda: 1., GetColor=lambda: (.8, .7, .2))
+    properties = SimpleNamespace(GetOpacity=lambda: 1., GetDiffuseColor=lambda: (.8, .7, .2))
     matrix = np.eye(4)
     matrix[:3, 3] = (4., 5., 6.)
     actor = SimpleNamespace(

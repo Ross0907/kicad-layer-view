@@ -103,31 +103,31 @@ def test_default_z_zero_has_no_cut_and_hiding_top_does_not_move_plane(window):
 def test_layer_color_picker_updates_only_selected_actor(window, monkeypatch):
     key = next(key for key in window.rows if window.viewport.parts[key].kind == "copper")
     control = window.rows[key][1]
-    original = {name: actor.GetProperty().GetColor() for name, actor in window.viewport.actors.items()}
+    original = {name: actor.GetProperty().GetDiffuseColor() for name, actor in window.viewport.actors.items()}
     requested = (.2, .4, .7)
     monkeypatch.setattr(QColorDialog, "getColor", lambda *args, **kwargs: QColor.fromRgbF(*requested))
     control.swatch.click()
     actor = window.viewport.actors[key]
     assert control.combo.currentText() == "Custom"
-    assert actor.GetProperty().GetColor() == pytest.approx(requested, abs=2e-5)
+    assert actor.GetProperty().GetDiffuseColor() == pytest.approx(requested, abs=2e-5)
     for name, other in window.viewport.actors.items():
         if name not in (key, key.replace("copper:", "via-patch:")):
-            assert other.GetProperty().GetColor() == original[name]
+            assert other.GetProperty().GetDiffuseColor() == original[name]
     control.combo.setCurrentIndex(1)
-    assert actor.GetProperty().GetColor() == pytest.approx(window.viewport.parts[key].editor_color)
+    assert actor.GetProperty().GetDiffuseColor() == pytest.approx(window.viewport.parts[key].editor_color)
     control.combo.setCurrentIndex(0)
-    assert actor.GetProperty().GetColor() == pytest.approx(window.viewport.parts[key].color)
+    assert actor.GetProperty().GetDiffuseColor() == pytest.approx(window.viewport.parts[key].color)
 
 
-def test_mask_opacity_defaults_to_half_and_layer_control_changes_it(window):
+def test_mask_opacity_defaults_to_stackup_alpha_and_layer_control_changes_it(window):
     masks = [key for key in window.rows if window.viewport.parts[key].kind == "mask"]
     assert len(masks) == 2
     for key in masks:
-        assert window.rows[key][2].value() == .5
-        assert window.viewport.actors[key].GetProperty().GetOpacity() == .5
+        assert window.rows[key][2].value() == pytest.approx(.83)
+        assert window.viewport.actors[key].GetProperty().GetOpacity() == pytest.approx(.83)
     window.rows[masks[0]][2].setValue(.75)
     assert window.viewport.actors[masks[0]].GetProperty().GetOpacity() == .75
-    assert window.viewport.actors[masks[1]].GetProperty().GetOpacity() == .5
+    assert window.viewport.actors[masks[1]].GetProperty().GetOpacity() == pytest.approx(.83)
 
 
 def test_actual_vtk_drag_orbits_and_reverse_drag_restores_camera(window):
@@ -199,7 +199,8 @@ def test_exact_transparency_and_closed_surface_culling(window):
     assert viewport.plotter.renderer.GetMaximumNumberOfPeels() == 0
     assert viewport.plotter.renderer.GetOcclusionRatio() == 0
     window.apply_preset("stackup")
-    assert all(bool(actor.GetProperty().GetBackfaceCulling()) == (viewport.parts[key].kind != "mask")
+    # Opaque closed solids cull inward faces; translucent mask and laminate keep both.
+    assert all(bool(actor.GetProperty().GetBackfaceCulling()) == (actor.GetProperty().GetOpacity() >= .999)
                for key, actor in viewport.actors.items())
     window.clip_slider.setValue(400)
     assert not any(actor.GetProperty().GetBackfaceCulling() for actor in viewport.actors.values())
@@ -351,10 +352,10 @@ def test_via_details_start_disabled_and_finish_toggle_keeps_caps_closed(window):
     actor = window.viewport.actors[patch.key]
     copper = window.viewport.actors[copper_key]
     assert actor.GetVisibility()
-    assert actor.GetProperty().GetColor() != copper.GetProperty().GetColor()
+    assert actor.GetProperty().GetDiffuseColor() != copper.GetProperty().GetDiffuseColor()
     window.kind_boxes["via_patch"].setChecked(False)
     assert actor.GetVisibility(), "Disabling finish contrast must not open a capped hole"
-    assert actor.GetProperty().GetColor() == copper.GetProperty().GetColor()
+    assert actor.GetProperty().GetDiffuseColor() == copper.GetProperty().GetDiffuseColor()
     window.rows[copper_key][0].setChecked(False)
     assert not actor.GetVisibility()
 

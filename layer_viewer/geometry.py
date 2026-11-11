@@ -22,7 +22,7 @@ from vtkmodules.util.numpy_support import numpy_to_vtk
 from vtkmodules.vtkCommonCore import vtkPoints
 from .model import BoardSnapshot
 from .colors import copper_color, default_colors
-from .finishes import SILVER_COLOR, apply_surface_finish
+from .finishes import DEFAULT_FINISH_COLOR, apply_surface_finish
 
 from .meshing import (  # noqa: F401 - re-exported public geometry API
     CIRCLE_QUAD_SEGS, SMOOTH_WALL_COS, _circles, _track_shapes, _triangulate_geos, _weld,
@@ -83,7 +83,7 @@ def coated_slab(geom: BaseGeometry, z_bottom: float, thickness: float,
 
 # Default neutral metal; apply_surface_finish selects the same board finish
 # for every copper foil, independently of PCB editor/custom layer colors.
-NATURAL_COPPER_COLOR = SILVER_COLOR
+NATURAL_COPPER_COLOR = DEFAULT_FINISH_COLOR
 
 
 

@@ -51,7 +51,10 @@ def display_radiance(pixels, exposure_ev=0.):
 def _material(mesh, *, coated=False):
     rgb = {"type": "rgb", "value": _linear(mesh.color).tolist()}
     if mesh.kind in ("copper", "barrel", "via_patch"):
-        opaque = {"type": "principled", "base_color": rgb, "metallic": 1.,
+        from .finishes import ray_metal_color
+        # KiCad finish swatches are display colors; trace measured metal F0.
+        metal = {"type": "rgb", "value": _linear(ray_metal_color(mesh.color)).tolist()}
+        opaque = {"type": "principled", "base_color": metal, "metallic": 1.,
                   "roughness": mesh.roughness if mesh.roughness is not None else
                               (.32 if mesh.kind == "via_patch" else .22)}
         if coated:
