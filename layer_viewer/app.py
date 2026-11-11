@@ -109,10 +109,11 @@ class LoadWorker(QThread):
     failed = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, source, path=None, parent=None, *, via_details=False):
+    def __init__(self, source, path=None, parent=None, *, via_details=False, components=True):
         super().__init__(parent)
         self.source, self.path = source, path
         self.via_details = via_details
+        self.components = components
 
     def info(self, message):
         log.info(message)
@@ -133,7 +134,7 @@ class LoadWorker(QThread):
         try:
             started = time.perf_counter()
             from .cache import save_cached_scene
-            from .loading import load_scene_stages
+            from .loading import load_complete_scene
             from .model import demo_snapshot, load_snapshot
             if self.source == "demo":
                 snapshot = demo_snapshot()
@@ -146,13 +147,14 @@ class LoadWorker(QThread):
                 snapshot = extract_from_kicad(progress=self)
             self.check_cancel()
             self.info("Checking cached geometry…")
-            for scene, cached in load_scene_stages(snapshot, via_details=self.via_details, progress=self):
-                self.elapsed = time.perf_counter() - started
-                self.cache_hit = cached
-                self.reused_count = len(scene.reused_keys)
-                self.ready.emit(snapshot, scene)
-                self.check_cancel()
+            # One complete scene: all layers and 3D models appear together.
+            scene, cached = load_complete_scene(snapshot, via_details=self.via_details,
+                                                components=self.components, progress=self)
             self.check_cancel()
+            self.elapsed = time.perf_counter() - started
+            self.cache_hit = cached
+            self.reused_count = len(scene.reused_keys)
+            self.ready.emit(snapshot, scene)
             self.elapsed = time.perf_counter() - started
             self.cache_hit = cached
             self.reused_count = len(getattr(scene, "reused_keys", ()))
@@ -470,10 +472,12 @@ class MainWindow(QMainWindow):
         if source == "ipc":
             from .live_worker import LiveWorker
             self.worker = LiveWorker(self, via_details=self._via_details_enabled())
+            self.worker.components = self.kind_boxes["component"].isChecked()
             self.worker.state.connect(self._worker_state)
             self.worker.failed.connect(self.live_failed)
         else:
-            self.worker = LoadWorker(source, path, self, via_details=self._via_details_enabled())
+            self.worker = LoadWorker(source, path, self, via_details=self._via_details_enabled(),
+                                     components=self.kind_boxes["component"].isChecked())
             self.worker.failed.connect(self.failed)
             self.connection_status.setText("Saved PCB · offline" if source == "board" else "Snapshot · offline")
         self.worker.progress.connect(self._worker_progress)
@@ -551,6 +555,11 @@ class MainWindow(QMainWindow):
             self._component_warnings = []
             if self._component_worker is not None:
                 self._component_worker.requestInterruption()
+        delivered = getattr(scene, "_components", None)
+        if delivered is not None and delivered[2] == signature:
+            # The load worker built the models alongside the board.
+            self._component_parts, self._component_warnings = list(delivered[0]), list(delivered[1])
+            self._component_loaded_signature = signature
         if self._component_parts or self._component_warnings:
             scene = replace(scene, parts=list(scene.parts) + self._component_parts,
                             warnings=list(dict.fromkeys(scene.warnings + self._component_warnings)))

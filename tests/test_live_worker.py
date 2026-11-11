@@ -36,7 +36,8 @@ def test_live_worker_retries_without_rebuilding_unchanged_board(monkeypatch):
     def build(snapshot, **kwargs):
         builds.append((snapshot, kwargs))
         return SimpleNamespace(parts=[], reused_keys=())
-    monkeypatch.setattr(cache, "load_cached_scene", lambda snapshot: None)
+    monkeypatch.setattr(cache, "load_cached_scene", lambda snapshot, **kwargs: None)
+    monkeypatch.setattr(cache, "load_previous_scene", lambda snapshot, **kwargs: None)
     monkeypatch.setattr(geometry, "build_scene", build)
     worker = LiveWorker(source_factory=lambda: source, interval=0.)
     worker.ready.connect(lambda snapshot, scene: ready.append(snapshot), Qt.DirectConnection)
@@ -102,7 +103,7 @@ def test_paused_live_sync_still_updates_local_via_detail_without_polling(monkeyp
         assert len(ready) == 2
         assert polls == [True]
         assert acknowledged == [snapshot]
-        assert builds[0]["requested_keys"] is None
+        assert builds[0]["requested_keys"] == geometry.scene_keys(snapshot, via_details=True)
         assert builds[1]["requested_keys"] == geometry.scene_keys(snapshot, via_details=False)
     finally:
         worker.requestInterruption()
@@ -134,13 +135,14 @@ def test_failed_build_is_not_acknowledged_and_retries_same_snapshot(monkeypatch,
             failed = True
             assert not acknowledged
             raise RuntimeError("temporary build failure")
-    def load(item):
+    def load(item, **kwargs):
         maybe_fail("cache")
         return None
     def build(item, **kwargs):
         maybe_fail("geometry")
         return SimpleNamespace(parts=[], reused_keys=())
     monkeypatch.setattr(cache, "load_cached_scene", load)
+    monkeypatch.setattr(cache, "load_previous_scene", lambda *args, **kwargs: None)
     monkeypatch.setattr(geometry, "build_scene", build)
     worker = LiveWorker(source_factory=lambda: source, interval=0.)
     worker.ready.connect(lambda item, scene: ready.append(item), Qt.DirectConnection)

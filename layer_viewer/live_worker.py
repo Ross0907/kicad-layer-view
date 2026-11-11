@@ -35,6 +35,7 @@ class LiveWorker(QThread):
         self.reused_count = 0
         self.update_count = 0
         self.via_details = via_details
+        self.components = True
         self._details_changed = threading.Event()
 
     def set_via_details(self, enabled):
@@ -67,7 +68,7 @@ class LiveWorker(QThread):
             raise RuntimeError("Live connection stopped")
 
     def run(self):
-        from .cache import load_cached_scene, load_previous_scene, save_cached_scene
+        from .cache import save_cached_scene
         from .geometry import build_scene, scene_keys
         from .live_source import LiveBoardSource
         source = (self.source_factory or LiveBoardSource)()
@@ -102,21 +103,12 @@ class LiveWorker(QThread):
                                                 previous_snapshot=previous_snapshot,
                                                 previous_scene=previous_scene, requested_keys=requested)
                         else:
-                            if not self.via_details:
-                                from .loading import load_scene_stages
-                                for scene, cached in load_scene_stages(snapshot, progress=self):
-                                    self.cache_hit = cached
-                                    self.elapsed = time.perf_counter() - started
-                                    if getattr(scene, "_preview", False):
-                                        self.ready.emit(snapshot, scene)
-                                    self.check_cancel()
-                            else:
-                                scene = load_cached_scene(snapshot)
-                                self.cache_hit = scene is not None
-                                if scene is None:
-                                    scene = build_scene(snapshot, progress=self,
-                                                        previous_scene=load_previous_scene(snapshot),
-                                                        requested_keys=requested)
+                            # A newly opened board arrives complete: every
+                            # layer and its 3D models in a single scene.
+                            from .loading import load_complete_scene
+                            scene, self.cache_hit = load_complete_scene(
+                                snapshot, via_details=self.via_details,
+                                components=self.components, progress=self)
                         self.check_cancel()
                         acknowledge = getattr(source, "acknowledge", None)
                         if acknowledge is not None and source_update:

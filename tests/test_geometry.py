@@ -180,3 +180,34 @@ def test_tall_walls_shade_smoothly_and_thin_foils_stay_compact():
     assert smooth.volume == pytest.approx(shape.area * 1.6, rel=1e-9)
     thin = slab(shape, 0., .035, smooth=False)
     assert "Normals" not in thin.point_data and thin.n_open_edges == 0
+
+
+def test_conform_splits_an_edge_that_passes_over_a_vertex():
+    """A T-junction would extrude into a stray internal wall; splitting removes it."""
+    from layer_viewer.geometry import slab_from_triangles
+    from layer_viewer.meshing import conform
+    # Upper triangle spans (0,0)-(2,0); the two lower ones meet at (1,0) on that edge.
+    points = np.array([(0., 0.), (2., 0.), (1., 1.), (1., 0.), (1., -1.)])
+    triangles = np.array([(0, 1, 2), (0, 4, 3), (3, 4, 1)])
+    labels = np.array([7, 8, 9], dtype=np.uint8)
+    leaky = slab_from_triangles(points, triangles, 0., .5)[0]
+    outline = 4 * np.sqrt(2.)
+    assert leaky.area > 2 * 2. + outline * .5 + .5  # the hidden wall adds area
+    fixed, fixed_labels = conform(points, triangles, labels)
+    assert len(fixed) == 4 and sorted(fixed_labels.tolist()) == [7, 7, 8, 9]
+    mesh = slab_from_triangles(points, fixed, 0., .5, smooth=False)[0]
+    assert mesh.n_open_edges == 0
+    assert mesh.area == pytest.approx(2 * 2. + outline * .5)
+    assert mesh.volume == pytest.approx(2. * .5)
+    # An already conforming mesh is returned unchanged.
+    again, _ = conform(points, fixed)
+    assert len(again) == 4
+
+
+def test_islands_touching_at_a_point_are_never_stitched_together():
+    from layer_viewer.meshing import conform
+    # Two triangles of different islands; the second one's corner lies on the first one's edge.
+    points = np.array([(0., 0.), (2., 0.), (1., 1.), (1., 0.), (0., -1.), (2., -1.)])
+    triangles = np.array([(0, 1, 2), (3, 4, 5)])
+    fixed, _ = conform(points, triangles, groups=np.array([0, 0, 0, 1, 1, 1]))
+    assert len(fixed) == 2

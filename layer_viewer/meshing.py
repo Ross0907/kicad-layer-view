@@ -21,6 +21,8 @@ from shapely.geometry.base import BaseGeometry
 CIRCLE_QUAD_SEGS = 16
 # Adjacent wall facets turning by less than this share a smoothed normal.
 SMOOTH_WALL_COS = math.cos(math.radians(40.))
+# Non-axis-aligned edges shorter than this are curve facets, never artwork edges.
+LONG_EDGE_MM = .25
 
 
 def iter_polygons(geometry):
@@ -109,12 +111,105 @@ def _weld(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return ordered[keep], inverse
 
 
-def triangulate(geom: BaseGeometry) -> Tuple[np.ndarray, np.ndarray]:
+def conform(points, triangles, labels=None, groups=None):
+    """Remove T-junctions: split any triangle whose edge passes over a vertex.
+
+    Earcut may leave an edge running exactly through a vertex that other
+    triangles use (holes bridged along a collinear edge, dropped collinear ring
+    vertices, removed zero-area slivers, or two polygons sharing a boundary).
+    Extruding such a mesh grows a stray internal wall along that edge. Only
+    untwinned edges can be affected, and only where vertices are exactly
+    collinear, which earcut itself requires before skipping one (typically the
+    straight edges of pads and apertures).
+    Every boundary vertex lying exactly on such an edge splits its triangle, so
+    shape and area are unchanged. ``groups`` gives each vertex's polygon/island:
+    separate islands may touch at a point and must never be stitched together.
+    Returns ``(triangles, labels)``; ``labels`` follow their triangle.
+    """
+    triangles = np.asarray(triangles, dtype=np.int64).reshape(-1, 3).copy()
+    count = len(points)
+    # Twin edges only pair up when every triangle winds the same way.
+    p0, p1, p2 = points[triangles[:, 0]], points[triangles[:, 1]], points[triangles[:, 2]]
+    clockwise = ((p1[:, 0]-p0[:, 0])*(p2[:, 1]-p0[:, 1]) - (p1[:, 1]-p0[:, 1])*(p2[:, 0]-p0[:, 0])) < 0
+    triangles[clockwise] = triangles[clockwise][:, ::-1]
+    for _ in range(4):
+        size = len(triangles)
+        if not size:
+            break
+        edges = np.concatenate([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]])
+        key = edges[:, 0] * count + edges[:, 1]
+        reverse = np.sort(edges[:, 1] * count + edges[:, 0])
+        at = reverse.searchsorted(key)
+        untwinned = at == len(reverse)
+        inside = ~untwinned
+        untwinned[inside] = reverse[at[inside]] != key[inside]
+        loose = np.flatnonzero(untwinned)
+        if not len(loose):
+            break
+        start, end = edges[loose, 0], edges[loose, 1]
+        a, b = points[start], points[end]
+        # Boundary vertices inside each loose edge's bounding box, then an
+        # exact collinearity test: the same zero-area test earcut applies.
+        span = b - a
+        axis_aligned = (span[:, 0] == 0) | (span[:, 1] == 0)
+        # Curves are short facets; only straight artwork edges can hide a vertex.
+        selected = np.flatnonzero(axis_aligned | (np.einsum("ij,ij->i", span, span) > LONG_EDGE_MM ** 2))
+        if not len(selected):
+            break
+        vertices = np.unique(np.concatenate([start, end]))
+        tree = shapely.STRtree(shapely.points(points[vertices]))
+        low, high = np.minimum(a, b)[selected], np.maximum(a, b)[selected]
+        which, hit = tree.query(shapely.box(low[:, 0], low[:, 1], high[:, 0], high[:, 1]),
+                                predicate="intersects")
+        edge, hit = selected[which], vertices[hit]
+        offset = points[hit] - a[edge]
+        direction = span[edge]
+        along = np.einsum("ij,ij->i", offset, direction)
+        interior = ((direction[:, 0] * offset[:, 1] - direction[:, 1] * offset[:, 0] == 0)
+                    & (along > 0) & (along < np.einsum("ij,ij->i", direction, direction)))
+        # Leave slivers alone: when a triangle's own apex already lies along its
+        # loose edge, that edge is the flattened outline, not a hidden junction.
+        apex = points[triangles[loose % size].sum(axis=1) - start - end] - a
+        flat = np.abs(span[:, 0] * apex[:, 1] - span[:, 1] * apex[:, 0]) <= 1e-12 * np.einsum("ij,ij->i", span, span)
+        interior &= ~flat[edge]
+        if groups is not None:
+            interior &= groups[hit] == groups[start[edge]]
+        edge, hit, along = edge[interior], hit[interior], along[interior]
+        if not len(edge):
+            break
+        order = np.lexsort((along, edge))
+        edge, hit, along = edge[order], hit[order], along[order]
+        breaks = np.flatnonzero(np.diff(edge)) + 1
+        updated = triangles
+        used, extra, extra_labels = set(), [], []
+        for group_edge, chain, distance in zip(edge[np.concatenate([[0], breaks])].tolist(),
+                                               np.split(hit, breaks), np.split(along, breaks)):
+            triangle = int(loose[group_edge]) % size
+            if triangle in used:
+                continue  # a second edge of this triangle is handled next round
+            used.add(triangle)
+            # Coincident vertices of touching islands collapse to one split point.
+            keep = np.concatenate([[True], np.diff(distance) > 0])
+            first, last = int(start[group_edge]), int(end[group_edge])
+            apex = int(updated[triangle].sum()) - first - last
+            path = [first, *chain[keep].tolist(), last]
+            updated[triangle] = [path[0], path[1], apex]
+            for position in range(1, len(path) - 1):
+                extra.append([path[position], path[position + 1], apex])
+                extra_labels.append(triangle)
+        triangles = np.concatenate([updated, np.asarray(extra, dtype=np.int64).reshape(-1, 3)])
+        if labels is not None:
+            labels = np.concatenate([labels, np.asarray(labels)[extra_labels]])
+    return triangles, labels
+
+
+def triangulate(geom: BaseGeometry, conforming: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """Triangulate exact boundary vertices, avoiding costly Delaunay refinement.
 
     Earcut handles holes using the same full-detail polygon rings. Every result
     is checked against the polygon area; exceptional shapes use GEOS instead.
-    Vertices are welded exactly, without coordinate rounding or simplification.
+    Vertices are welded exactly, without coordinate rounding or simplification,
+    and the result is conforming: no triangle edge passes over another vertex.
     """
     import mapbox_earcut
     vertices, indices, offset = [], [], 0
@@ -139,7 +234,11 @@ def triangulate(geom: BaseGeometry) -> Tuple[np.ndarray, np.ndarray]:
         offset += len(points)
     if not indices:
         return np.zeros((0, 2)), np.zeros((0, 3), dtype=np.int64)
-    return np.concatenate(vertices), np.concatenate(indices)
+    points = np.concatenate(vertices)
+    if not conforming:
+        return points, np.concatenate(indices)
+    groups = np.repeat(np.arange(len(vertices)), [len(chunk) for chunk in vertices])
+    return points, conform(points, np.concatenate(indices), groups=groups)[0]
 
 
 def slab_arrays(pts2: np.ndarray, tris: np.ndarray, z_bottom: float, thickness: float,
@@ -289,24 +388,10 @@ def coated_slab_arrays(geom: BaseGeometry, z_bottom: float, thickness: float,
     split = np.bincount(owner, minlength=len(islands)) > 1
     points, triangles, labels, owners = [], [], [], []
     offset = 0
-    # Constrained triangulation preserves collinear vertices shared by the
-    # partitions of one island. Dropping one creates a T-junction and an
-    # artificial vertical wall when the triangles are extruded. One vectorized
-    # GEOS call triangulates every partitioned piece with the GIL released.
-    partitioned = np.flatnonzero(split[owner])
-    if len(partitioned):
-        triangles_geos = shapely.constrained_delaunay_triangles([pieces[k] for k in partitioned])
-        coords, which = shapely.get_coordinates(triangles_geos, return_index=True)
-        if len(coords):
-            coords = coords.reshape(-1, 4, 2)[:, :3, :].reshape(-1, 2)
-            which = partitioned[which.reshape(-1, 4)[:, 0]]
-            points.append(coords)
-            triangles.append(np.arange(len(coords), dtype=np.int64).reshape(-1, 3))
-            labels.append(np.asarray(piece_flags, dtype=np.uint8)[which])
-            owners.append(np.repeat(owner[which], 3))
-            offset = len(coords)
-    for k in np.flatnonzero(~split[owner]):
-        vertices, faces = triangulate(pieces[k])
+    # Pieces of one partitioned island share boundary vertices; the conforming
+    # pass after welding ties them together, so fast earcut serves every piece.
+    for k in range(len(pieces)):
+        vertices, faces = triangulate(pieces[k], conforming=False)
         if not len(faces):
             continue
         points.append(vertices)
@@ -327,7 +412,7 @@ def coated_slab_arrays(geom: BaseGeometry, z_bottom: float, thickness: float,
     inverse[order] = np.cumsum(keep) - 1
     faces, flags = inverse[np.concatenate(triangles)], np.concatenate(labels)
     valid = (faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2])
-    faces, flags = faces[valid], flags[valid]
+    faces, flags = conform(ordered[keep], faces[valid], flags[valid], groups=ordered_island[keep])
     if not len(faces):
         return None
     points, triangles, normals, _ = slab_arrays(ordered[keep], faces, z_bottom, thickness, smooth)
