@@ -1,5 +1,5 @@
-import pytest
 """Light/material configuration checks: no renderer, window, GPU or ray tracing."""
+import pytest
 from types import SimpleNamespace
 
 import numpy as np

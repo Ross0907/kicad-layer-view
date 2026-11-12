@@ -1,5 +1,5 @@
-import pytest
 """Finish edits refresh appearance while preserving PCB meshes and editor colors."""
+import pytest
 import numpy as np
 from types import SimpleNamespace
 
