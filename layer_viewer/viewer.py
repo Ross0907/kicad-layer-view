@@ -187,6 +187,11 @@ class BoardViewport(QWidget):
         self.plotter.iren.add_observer("StartInteractionEvent", lambda *_: self.camera_animation.stop())
         from .live_raytrace import LiveRayController
         self.live_ray = LiveRayController(self)
+        # Refine edges with accumulated sub-pixel samples whenever the view rests.
+        from .idle_aa import IdleAntialiaser
+        self.idle_aa = IdleAntialiaser(self)
+        self.camera_changed.connect(self.idle_aa.invalidate)
+        self.scene_changed.connect(self.idle_aa.invalidate)
 
     def _orbit_motion(self, style, _event):
         # VTK style observers replace default dispatch. Keep its pan/dolly/spin,
@@ -282,7 +287,8 @@ class BoardViewport(QWidget):
             self.planes[part.key] = plane
         # Re-check before the first frame of a new scene: a larger board may
         # no longer be safe to supersample.
-        self._apply_antialiasing()
+        if hasattr(self, "_applied_antialiasing"):
+            self._apply_antialiasing()
         self.set_gap(self.gap_mm, reframe=not preserve_view)
         self._update_led_appearance()
         if not preserve_view:
@@ -367,6 +373,9 @@ class BoardViewport(QWidget):
         self.refresh()
 
     def request_render(self):
+        refiner = getattr(self, "idle_aa", None)
+        if refiner is not None:
+            refiner.invalidate()
         if not self.render_timer.isActive():
             self.render_timer.start()
 
@@ -519,10 +528,16 @@ class BoardViewport(QWidget):
             if not self.live_ray.last_image.save(str(path)):
                 raise OSError(f"Could not save {path}")
             return
+        if scale == 1 and self.idle_aa.image is not None:
+            # The refined, fully antialiased frame currently on screen.
+            if not self.idle_aa.image.save(str(path)):
+                raise OSError(f"Could not save {path}")
+            return
         self.plotter.render()
         self.plotter.screenshot(str(path), scale=scale)
 
     def closeEvent(self, event):
+        self.idle_aa.shutdown()
         self.render_timer.stop()
         self.camera_animation.stop()
         self.plotter.close()

@@ -101,6 +101,15 @@ class RenderDialog(QDialog):
         antialias.currentIndexChanged.connect(
             lambda index: window.viewport.set_antialiasing(["fxaa_hq", "fxaa", "ssaa", "none"][index]))
         form.addRow("Antialiasing", antialias)
+        refine = QCheckBox("Refine edges when the view is still (16× antialiasing)")
+        refiner = getattr(window.viewport, "idle_aa", None)
+        refine.setChecked(refiner is None or refiner.enabled)
+        refine.setEnabled(refiner is not None)
+        refine.setToolTip("Blends 16 sub-pixel-shifted frames once the camera rests, for clean thin "
+                          "lines and edges. Uses no extra GPU memory; any movement returns to the fast view.")
+        if refiner is not None:
+            refine.toggled.connect(refiner.set_enabled)
+        form.addRow(refine)
         framing = QCheckBox("Fit the full stack when spacing changes")
         framing.setChecked(window.viewport.auto_frame)
         framing.toggled.connect(lambda enabled: setattr(window.viewport, "auto_frame", enabled))

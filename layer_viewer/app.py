@@ -929,6 +929,7 @@ class MainWindow(QMainWindow):
         self._pending_load = None
         self.animation.stop()
         self.viewport.camera_animation.stop()
+        self.viewport.idle_aa.shutdown()
         self.viewport.render_timer.stop()
         waiting = not self.viewport.live_ray.shutdown()
         export = self.render_dialog.worker if self.render_dialog is not None else None

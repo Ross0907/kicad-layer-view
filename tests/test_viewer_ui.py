@@ -478,3 +478,23 @@ def test_supersampling_is_never_applied_to_a_large_board(window, monkeypatch):
     assert viewport.antialiasing == "ssaa" and viewport.effective_antialiasing() == "fxaa_hq"
     assert viewport._applied_antialiasing == "fxaa_hq"
     viewport.set_antialiasing("fxaa_hq")
+
+
+def test_still_view_refinement_appears_when_idle_and_clears_on_movement(window):
+    import time
+    from qtpy.QtWidgets import QApplication
+    viewport = window.viewport
+    refiner = viewport.idle_aa
+    assert refiner.enabled
+    viewport.request_render()
+    deadline = time.monotonic() + 10
+    while refiner.image is None and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(.01)
+    assert refiner.image is not None
+    assert refiner.image.width() > 0 and refiner.overlay.isVisible()
+    viewport.plotter.camera.Azimuth(5)
+    assert refiner.image is None and not refiner.overlay.isVisible()
+    refiner.set_enabled(False)
+    assert not refiner.timer.isActive()
+    refiner.set_enabled(True)
