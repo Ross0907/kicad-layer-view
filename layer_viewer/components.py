@@ -156,8 +156,11 @@ def model_transform(footprint, model: Model3D, board_thickness_mm):
     units are converted while loading, before user scale/offset are applied.
     """
     placement = np.eye(4)
+    # BOARD_ADAPTER::GetFootprintZPos: top models sit on F.Paste's top face,
+    # bottom models on the bare B.Cu face (KiCad's B.Paste "bottom").
+    from .geometry import PASTE_THICKNESS_MM
     placement[:3, 3] = (footprint.position[0], -footprint.position[1],
-                        board_thickness_mm + .025 if footprint.side == "top" else -.025)
+                        board_thickness_mm + PASTE_THICKNESS_MM if footprint.side == "top" else 0.)
     placement = placement @ _rotation(2, footprint.angle_deg)
     if footprint.side == "bottom":
         placement = placement @ _rotation(1, 180) @ _rotation(2, 180)

@@ -7,7 +7,6 @@ from layer_viewer.finishes import (COPPER_COLOR, DEFAULT_FINISH_COLOR, ENIG_COLO
                                    TIN_COLOR, finish_appearance, ray_metal_color)
 from layer_viewer.geometry import build_scene, scene_keys
 from layer_viewer.model import demo_snapshot
-from layer_viewer.via_surfaces import via_patch_color
 
 
 def test_enig_refreshes_all_layers_from_disk_and_memory_without_remeshing(tmp_path, monkeypatch):
@@ -31,9 +30,8 @@ def test_enig_refreshes_all_layers_from_disk_and_memory_without_remeshing(tmp_pa
             np.testing.assert_array_equal(part.mesh.faces, previous.mesh.faces)
             assert tuple(part.editor_color) == tuple(previous.editor_color)
             if part.kind in ("copper", "via_patch"):
+                # Capped-via patches carry the same finish; contrast is display-only.
                 expected = ENIG_COLOR
-                if part.kind == "via_patch":
-                    expected = via_patch_color(expected)
                 assert tuple(part.color) == expected
     assert all(part.mesh is original_parts[part.key].mesh for part in reused.parts)
     assert all(part.color == DEFAULT_FINISH_COLOR for part in original.parts if part.kind == "copper")

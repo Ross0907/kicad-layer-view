@@ -24,7 +24,7 @@ from .model import load_snapshot
 from .helper_process import run_cancellable
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "2-native-ink-knockout-paste"
+VERSION = "3-kicad-stackup"
 FORMAT = "kicad-layer-viewer-source-cache"
 MAX_ENTRIES = 3
 MAX_BYTES = 256 * 1024 * 1024

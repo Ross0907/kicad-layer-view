@@ -52,13 +52,34 @@ class DielectricLayer:
     color: object = ""     # KiCad color name/#RRGGBBAA, or live IPC RGBA tuple
 
 
+# KiCad 3D viewer constants (3d-viewer/3d_canvas/board_adapter.cpp).
+DEFAULT_COPPER_THICKNESS_MM = .035       # BOARD_STACKUP_ITEM::GetCopperDefaultThickness
+DEFAULT_MASK_ITEM_THICKNESS_MM = .01     # BOARD_STACKUP_ITEM::GetMaskDefaultThickness
+TECH_LAYER_THICKNESS_MM = .025           # DEFAULT_TECH_LAYER_THICKNESS: mask w/o stackup item, silk
+MIN_LAYER_THICKNESS_MM = .001            # KiCad's clamp for copper and mask items
+
+
 @dataclass
 class Stackup:
     copper: List[CopperLayer]
     dielectrics: List[DielectricLayer]
-    board_thickness_mm: float
+    board_thickness_mm: float  # bottom of B.Cu to top of F.Cu (z of the front copper face)
     from_board: bool = True  # False when a default stackup had to be synthesized
     colors: Dict[str, object] = field(default_factory=dict)  # F/B.Mask and F/B.SilkS material colors
+    # Solder-mask item thickness per side ("F.Mask"/"B.Mask"), as in the stackup.
+    mask_thickness_mm: Dict[str, float] = field(default_factory=dict)
+
+    def mask_thickness(self, name: str) -> float:
+        """Mask slab thickness like KiCad's 3D viewer: the stackup item, else 0.025 mm."""
+        value = self.mask_thickness_mm.get(name)
+        if value is None:
+            return TECH_LAYER_THICKNESS_MM
+        return max(float(value), MIN_LAYER_THICKNESS_MM)
+
+    @property
+    def overall_thickness_mm(self) -> float:
+        """Finished thickness including solder mask, as KiCad's Board Setup reports it."""
+        return self.board_thickness_mm + sum(self.mask_thickness_mm.values())
 
     def layer(self, layer_id: int) -> Optional[CopperLayer]:
         for layer in self.copper:
@@ -284,8 +305,17 @@ def load_snapshot(path) -> BoardSnapshot:
     return BoardSnapshot(**data)
 
 
+# Boards saved before this file format stored solder-mask colors as #RRGGBB;
+# KiCad's parser gives those an 0.83 alpha (pcb_io_kicad_sexpr_parser.cpp).
+MASK_ALPHA_FORMAT_VERSION = 20210824
+
+
 def read_board_stackup(path):
-    """Read the saved setup/stackup header only; never load or modify the PCB."""
+    """Read the saved setup/stackup header only; never load or modify the PCB.
+
+    Legacy ``#RRGGBB`` solder-mask colors are returned as ``#RRGGBBD4`` (0.83
+    alpha), exactly as KiCad loads them, so every reader sees KiCad's value.
+    """
     import json
     from pathlib import Path
     import re
@@ -293,6 +323,7 @@ def read_board_stackup(path):
     with Path(path).open(encoding="utf-8-sig") as stream:
         header = stream.read(4 * 1024 * 1024)
     stack = []
+    version = None
     for match in re.finditer(r'"(?:\\.|[^"\\])*"|[()]|[^()\s]+', header):
         token = match.group()
         if token == "(":
@@ -302,12 +333,91 @@ def read_board_stackup(path):
                 return None
             node = stack.pop()
             if node and node[0] == "stackup" and stack and stack[-1][:1] == ["setup"]:
-                return node
+                return _legacy_mask_alpha(node, version)
+            if (node[:1] == ["version"] and len(node) > 1 and len(stack) == 1
+                    and stack[0][:1] == ["kicad_pcb"]):
+                try:
+                    version = int(node[1])
+                except ValueError:
+                    pass
             if stack:
                 stack[-1].append(node)
         elif stack:
             stack[-1].append(json.loads(token) if token.startswith('"') else token)
     return None
+
+
+def _legacy_mask_alpha(stackup, version):
+    if version is None or version >= MASK_ALPHA_FORMAT_VERSION:
+        return stackup
+    import re
+    for layer in stackup[1:]:
+        if not isinstance(layer, list) or layer[:1] != ["layer"] or len(layer) < 2:
+            continue
+        if layer[1] not in ("F.Mask", "B.Mask"):
+            continue
+        for item in layer[2:]:
+            if (isinstance(item, list) and item[:1] == ["color"] and len(item) > 1
+                    and re.fullmatch(r"#[0-9A-Fa-f]{6}", str(item[1]))):
+                item[1] = f"{item[1]}D4"
+    return stackup
+
+
+def stackup_layer_values(node):
+    """Values of one saved stackup ``(layer ...)`` node, as KiCad reads them.
+
+    A dielectric can hold several sublayers separated by ``addsublayer``.
+    KiCad sums their thicknesses and takes material, epsilon and color from
+    sublayer 0 (BOARD_STACKUP_ITEM::GetColor(0)). Returns a dict of sublayer 0
+    values with the summed ``thickness``.
+    """
+    sublayers = [[]]
+    for item in node[2:]:
+        if item == "addsublayer":
+            sublayers.append([])
+        elif isinstance(item, list) and len(item) > 1:
+            sublayers[-1].append(item)
+    parts = [{entry[0]: entry[1] for entry in part} for part in sublayers]
+    values = dict(parts[0])
+    if any("thickness" in part for part in parts):
+        values["thickness"] = sum(float(part.get("thickness", 0) or 0) for part in parts)
+    return values
+
+
+def saved_color_names(expression):
+    """Sublayer-0 color per saved stackup layer, as KiCad's 3D adapter uses it."""
+    colors = {}
+    for node in (expression or [])[1:]:
+        if not isinstance(node, list) or len(node) < 2 or node[0] != "layer":
+            continue
+        color = stackup_layer_values(node).get("color")
+        if color is not None:
+            colors[str(node[1])] = str(color)
+    return colors
+
+
+def saved_mask_thickness(expression):
+    """Per-side solder-mask item thickness from a saved stackup, in mm."""
+    result = {}
+    for node in (expression or [])[1:]:
+        if (isinstance(node, list) and len(node) > 1 and node[0] == "layer"
+                and node[1] in ("F.Mask", "B.Mask")):
+            values = stackup_layer_values(node)
+            if "thickness" in values:
+                result[str(node[1])] = float(values["thickness"])
+    return result
+
+
+def default_stackup_thicknesses(board_thickness_mm, copper_count, mask_count):
+    """KiCad's BOARD_STACKUP::BuildDefaultStackupList for a board without a stackup.
+
+    Returns ``(copper_mm, dielectric_mm, mask_mm)``: 35 um copper on every
+    layer, 10 um per enabled mask, and the remaining thickness split evenly
+    over the dielectrics (dielectric colors stay "Not specified").
+    """
+    dielectric = (board_thickness_mm - DEFAULT_COPPER_THICKNESS_MM * copper_count
+                  - DEFAULT_MASK_ITEM_THICKNESS_MM * mask_count) / max(1, copper_count - 1)
+    return DEFAULT_COPPER_THICKNESS_MM, dielectric, DEFAULT_MASK_ITEM_THICKNESS_MM
 
 
 def read_board_surface_finish(path) -> str:
@@ -319,7 +429,8 @@ def read_board_surface_finish(path) -> str:
     """
     for node in (read_board_stackup(path) or [])[1:]:
         if isinstance(node, list) and len(node) > 1 and node[0] == "copper_finish":
-            return str(node[1]).strip()
+            # Exactly as stored: KiCad's finish rules are case- and space-sensitive.
+            return str(node[1])
     return ""
 
 

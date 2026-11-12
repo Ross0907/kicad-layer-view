@@ -132,9 +132,12 @@ def slab(geom: BaseGeometry, z_bottom: float, thickness: float, *,
 MAX_MESH_WORKERS = max(2, min(12, (os.cpu_count() or 4) - 1))
 PLATING_MM = .020  # IPC does not expose the manufacturing barrel plating thickness.
 CONTACT_INSET_MM = .001  # Render-only separation of touching dissimilar materials.
-MASK_THICKNESS_MM = .015
-SILK_THICKNESS_MM = .012
-PASTE_THICKNESS_MM = .08  # Illustrative stencil deposit, not a reflowed solder joint.
+# KiCad 3D viewer constants (board_adapter.cpp). Solder-mask thickness comes
+# from the stackup (Stackup.mask_thickness); these apply to the other layers.
+SILK_THICKNESS_MM = .025   # DEFAULT_TECH_LAYER_THICKNESS
+PASTE_THICKNESS_MM = .04   # SOLDERPASTE_LAYER_THICKNESS; a stencil deposit, not a reflowed joint
+# Silk starts 1.1 tech-layer thicknesses above the copper face (layerThicknessMargin).
+SILK_OFFSET_MM = 1.1 * SILK_THICKNESS_MM
 PLUG_DEPTH_MM = .10  # Illustrative only: KiCad records plug presence, not its depth.
 
 
@@ -366,7 +369,7 @@ def _polygon_signature(polygons):
 
 
 def _signature(value):
-    profile = (CIRCLE_QUAD_SEGS, PLATING_MM, CONTACT_INSET_MM, MASK_THICKNESS_MM, PLUG_DEPTH_MM)
+    profile = (CIRCLE_QUAD_SEGS, PLATING_MM, CONTACT_INSET_MM, PLUG_DEPTH_MM)
     raw = json.dumps((profile, value), separators=(",", ":"), allow_nan=False)
     return hashlib.blake2b(raw.encode("utf-8"), digest_size=20).hexdigest()
 
@@ -455,7 +458,8 @@ def _scene_signatures(snapshot):
                       via.mask_margin_mm) for via in snapshot.vias if copper.id in via.layers
                      and not (via.front_tented if front else via.back_tented)])
             result[f"mask:{name}"] = _signature((outline, openings, copper.z_bottom_mm,
-                                                 copper.thickness_mm, len(snapshot.stackup.copper)))
+                                                 copper.thickness_mm, len(snapshot.stackup.copper),
+                                                 snapshot.stackup.mask_thickness(name)))
             for kind in ("copper", "via-patch"):
                 key = f"{kind}:{copper.id}"
                 result[key] = _signature((result[key], "exact-mask-coverage-1", name,
@@ -463,7 +467,8 @@ def _scene_signatures(snapshot):
             silk_name = "F.SilkS" if front else "B.SilkS"
             if snapshot.silkscreen is not None:
                 result[f"silk:{silk_name}"] = _signature((result[f"mask:{name}"],
-                    _polygon_signature(snapshot.silkscreen.get(silk_name, [])), SILK_THICKNESS_MM))
+                    _polygon_signature(snapshot.silkscreen.get(silk_name, [])), SILK_THICKNESS_MM,
+                    SILK_OFFSET_MM))
             paste_name = "F.Paste" if front else "B.Paste"
             if snapshot.solder_paste is not None:
                 result[f"paste:{paste_name}"] = _signature((outline, copper.z_bottom_mm,
@@ -702,6 +707,11 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
     dielectric_futures = {section: pool.submit(prepare_dielectric, dielectric)
                           for section, dielectric in dielectric_jobs.items()}
 
+    def silk_offset(front):
+        """KiCad's silk height above the copper face, kept clear of a thick mask."""
+        mask_t = snapshot.stackup.mask_thickness("F.Mask" if front else "B.Mask")
+        return max(SILK_OFFSET_MM, mask_t + 2 * CONTACT_INSET_MM)
+
     def prepare_silk(front):
         """Union the ink, clip it to the mask and mesh it off the main thread."""
         name = "F.Mask" if front else "B.Mask"
@@ -712,9 +722,8 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
         # Printed ink is clipped to the board/mask, so it cannot cover exposed
         # pads or float outside the board outline.
         geom = polygon_union(polys_to_shapely(snapshot.silkscreen.get(silk_name, []))).intersection(mask)
-        z = cu.z_top_mm+CONTACT_INSET_MM if front else cu.z_bottom_mm-MASK_THICKNESS_MM-CONTACT_INSET_MM
-        ink_z = (z + MASK_THICKNESS_MM + CONTACT_INSET_MM if front
-                 else z - SILK_THICKNESS_MM - CONTACT_INSET_MM)
+        ink_z = (cu.z_top_mm + silk_offset(front) if front
+                 else cu.z_bottom_mm - silk_offset(front) - SILK_THICKNESS_MM)
         mesh = None if geom.is_empty else slab(geom, ink_z, SILK_THICKNESS_MM, smooth=False)
         return geom, mesh
 
@@ -751,10 +760,9 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
 
     try:
         for index, cu in enumerate(copper):
-            from .via_surfaces import via_patch_color
             base_reused = reuse(f"copper:{cu.id}", cu.name, copper_color(snapshot, cu))
             patch_reused = reuse(f"via-patch:{cu.id}", f"Via cap finish · {cu.name}",
-                                 via_patch_color(copper_color(snapshot, cu)))
+                                 copper_color(snapshot, cu))
             if not base_reused or not patch_reused:
                 report(f"Meshing {cu.name}")
                 mesh, area, patch_mesh, patch_area = copper_result(index)
@@ -764,8 +772,7 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
                 if patch_mesh is not None and not patch_reused:
                     scene.parts.append(ScenePart(f"via-patch:{cu.id}", f"Via cap finish · {cu.name}",
                                                  "via_patch", cu.id, 2 * cu.index, patch_mesh,
-                                                 via_patch_color(copper_rgb),
-                                                 via_patch_color(copper_color(snapshot, cu)), patch_area))
+                                                 copper_rgb, copper_color(snapshot, cu), patch_area))
             if not reuse(f"fill-copper:{cu.id}", f"Via filling · {cu.name}"):
                 fill_key = tuple(i for i, v in enumerate(snapshot.vias)
                                  if v.filled and cu.id in v.layers and v.drill_mm > 2*CONTACT_INSET_MM
@@ -826,7 +833,8 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
         for front in (True, False):
             name = "F.Mask" if front else "B.Mask"
             cu = snapshot.stackup.copper[0 if front else -1]
-            z = cu.z_top_mm+CONTACT_INSET_MM if front else cu.z_bottom_mm-MASK_THICKNESS_MM-CONTACT_INSET_MM
+            mask_t = snapshot.stackup.mask_thickness(name)
+            z = cu.z_top_mm+CONTACT_INSET_MM if front else cu.z_bottom_mm-mask_t-CONTACT_INSET_MM
             slot = -1 if front else scene.slot_count
             editor = snapshot.editor_colors.get(name, default_colors()[name])
             mask = mask_profiles.get(name)
@@ -834,7 +842,7 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
                 report(f"Meshing {name}")
                 mask = mask_geometry(snapshot, front) if mask is None else mask
                 add(f"mask:{name}", name, "mask", None, slot, mask,
-                    z, MASK_THICKNESS_MM, (.06,.30,.17), editor)
+                    z, mask_t, (.06,.30,.17), editor)
             silk_name = "F.SilkS" if front else "B.SilkS"
             silk_editor = snapshot.editor_colors.get(silk_name, default_colors()[silk_name])
             if snapshot.silkscreen is not None and not reuse(f"silk:{silk_name}", silk_name, silk_editor):

@@ -31,13 +31,13 @@ def test_kicad_placement_rotation_offsets_and_backside():
     model = Model3D("part.step", scale=(2, 1, 1), offset_mm=(1, 0, .2))
     point = np.array([1, 2, 3, 1])
     top = components.model_transform(footprint, model, 1.6) @ point
-    np.testing.assert_allclose(top, [8, -17, 4.825, 1])
+    np.testing.assert_allclose(top, [8, -17, 4.84, 1])
     bottom = components.model_transform(replace(footprint, side="bottom"), model, 1.6) @ point
-    np.testing.assert_allclose(bottom, [12, -17, -3.225, 1])
+    np.testing.assert_allclose(bottom, [12, -17, -3.2, 1])
     # Model X rotation is negated, unlike footprint orientation.
     matrix = components.model_transform(replace(footprint, angle_deg=0),
                                         Model3D("part.step", rotation_deg=(90, 0, 0)), 1.6)
-    np.testing.assert_allclose(matrix @ [0, 1, 0, 1], [10, -20, .625, 1], atol=1e-12)
+    np.testing.assert_allclose(matrix @ [0, 1, 0, 1], [10, -20, .64, 1], atol=1e-12)
 
 
 def test_resolve_project_path_alias_and_missing_wrl_counterpart(tmp_path):

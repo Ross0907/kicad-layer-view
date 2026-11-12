@@ -39,6 +39,8 @@ def arcball_rotation(previous, current, size):
 # KiCad's OpenGL viewer lights every material with three lights that each add
 # 0.084 ambient (render_3d_opengl.cpp, init_lights).
 KICAD_AMBIENT = 3 * .084
+# Closed stackup solids, drawn single-sided like KiCad's layers.
+SLAB_KINDS = ("copper", "dielectric", "mask", "silk", "paste", "via_patch")
 # Largest scene that may be supersampled; beyond this, FXAA is used instead.
 SSAA_MAX_TRIANGLES = 3_000_000
 BACKGROUNDS = {
@@ -58,7 +60,8 @@ def kicad_material(kind, rgb):
 
     Returns (ambient_color, specular_color, shininess). Constants follow
     RENDER_3D_OPENGL::setupMaterials/setLayerMaterial so copper, mask, silk and
-    board look the way they do in KiCad, for any stackup color.
+    board look the way they do in KiCad, for any stackup color. ``shininess``
+    is KiCad's raw m_Shininess; OglSetMaterial clamps what OpenGL receives.
     """
     r, g, b = (float(v) for v in rgb[:3])
     if kind in ("copper", "barrel", "via_patch"):
@@ -78,9 +81,15 @@ def kicad_material(kind, rgb):
     return (r, g, b), (.25, .25, .25), 32.
 
 
-def apply_material(prop, kind, rgb):
-    """Set a VTK property to KiCad's material for ``kind`` in color ``rgb``."""
-    ambient, specular, shininess = kicad_material(kind, rgb)
+def apply_material(prop, kind, rgb, base_rgb=None):
+    """Set a VTK property to KiCad's material for ``kind`` in color ``rgb``.
+
+    For conductors, ``base_rgb`` is the finish color that defines KiCad's
+    ambient/specular/shininess terms: KiCad's "board editor copper colors" mode
+    swaps only the diffuse color and keeps the finish-derived highlights.
+    """
+    terms_rgb = base_rgb if base_rgb is not None and kind in ("copper", "barrel", "via_patch") else rgb
+    ambient, specular, shininess = kicad_material(kind, terms_rgb)
     if kind == "component":
         prop.SetAmbient(.18)
         prop.SetDiffuse(.8)
@@ -92,7 +101,9 @@ def apply_material(prop, kind, rgb):
     prop.SetAmbientColor(*ambient)
     prop.SetDiffuseColor(*(float(v) for v in rgb[:3]))
     prop.SetSpecularColor(*specular)
-    prop.SetSpecularPower(max(1., shininess))
+    # OglSetMaterial passes min(shininess, 1) * 128 for board materials
+    # (3d_rendering/opengl/ogl_utils.cpp), i.e. 128 for all of them.
+    prop.SetSpecularPower(max(1., shininess if kind == "component" else 128. * min(1., shininess)))
 
 
 def layer_offset(stack_index: float, copper_count: int, gap_mm: float) -> float:
@@ -323,19 +334,23 @@ class BoardViewport(QWidget):
             actor.SetVisibility(visible)
         part = self.parts[key]
         if editor is not None:
-            apply_material(actor.GetProperty(), part.kind, part.editor_color if editor else part.color)
+            apply_material(actor.GetProperty(), part.kind, part.editor_color if editor else part.color,
+                           base_rgb=part.color)
         if color is not None:
-            apply_material(actor.GetProperty(), part.kind, color)
+            apply_material(actor.GetProperty(), part.kind, color, base_rgb=part.color)
         if opacity is not None:
             actor.GetProperty().SetOpacity(opacity)
         if part.kind == "copper":
             patch = self.actors.get(f"via-patch:{part.layer_id}")
             if patch is not None:
+                # Capped vias carry the same finish as the copper (KiCad shows no
+                # difference); the contrast is an optional inspection aid.
                 from .via_surfaces import via_patch_color
                 color = actor.GetProperty().GetDiffuseColor()
-                if getattr(self, "show_via_patches", True):
-                    color = via_patch_color(color)
-                apply_material(patch.GetProperty(), "via_patch", color)
+                base = part.color
+                if getattr(self, "show_via_patches", False):
+                    color, base = via_patch_color(color), via_patch_color(part.color)
+                apply_material(patch.GetProperty(), "via_patch", color, base_rgb=base)
                 patch.GetProperty().SetOpacity(actor.GetProperty().GetOpacity())
         if render:
             self.refresh()
@@ -488,11 +503,15 @@ class BoardViewport(QWidget):
         if (not self.clip_flip and self.clip_fraction <= 0) or (self.clip_flip and self.clip_fraction >= 1):
             axis = None
         for key, actor in self.actors.items():
-            # Cull the enclosed faces of opaque solids. Translucent slabs keep
-            # both surfaces, with exact peeling independent of camera zoom.
-            # Cut sections retain inward faces so their interiors remain visible.
+            # Closed, outward-wound stackup slabs show only their outer faces,
+            # as KiCad draws them (glCullFace(GL_BACK)), at any opacity: drawing
+            # both faces made a 0.83 mask cover like 0.97. Other translucent
+            # solids stay two-sided. Cut sections retain inward faces so their
+            # interiors remain visible.
+            part = self.parts.get(key)
+            slab = getattr(part, "kind", None) in SLAB_KINDS
             actor.GetProperty().SetBackfaceCulling(
-                axis is None and actor.GetProperty().GetOpacity() >= .999)
+                axis is None and (slab or actor.GetProperty().GetOpacity() >= .999))
             mapper = actor.GetMapper()
             if axis is None:
                 if mapper.GetNumberOfClippingPlanes():

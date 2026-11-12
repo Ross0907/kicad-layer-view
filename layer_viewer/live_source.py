@@ -106,6 +106,20 @@ class _PolledBoard(Board):
         return self.get_text()
 
 
+def _shape_stackup(proto):
+    """Stackup bytes without colors or finish: only what can change 2D shapes."""
+    copy = type(proto)()
+    copy.CopyFrom(proto)
+    for layer in copy.layers:
+        layer.ClearField("color")
+    for field in ("finish",):
+        try:
+            copy.ClearField(field)
+        except ValueError:  # older schema without a finish field
+            pass
+    return copy.SerializeToString(deterministic=True)
+
+
 def _file_signature(document):
     """Track saved fallback-rule changes without reading the complete board."""
     filename = Path(document.board_filename)
@@ -271,8 +285,12 @@ class LiveBoardSource:
             metadata = (stackup.proto.SerializeToString(deterministic=True),
                         tuple(enabled_layers), _file_signature(board.document))
             metadata_signature = hashlib.blake2b(repr(metadata).encode(), digest_size=20).digest()
-            if self._cache.context != metadata_signature:
-                self._cache.reset(metadata_signature)
+            # Cached 2D shapes do not depend on stackup colors or the finish; a
+            # color-only stackup edit must recolor, not re-read every pad and zone.
+            cache_context = hashlib.blake2b(repr((_shape_stackup(stackup.proto), *metadata[1:])).encode(),
+                                            digest_size=20).digest()
+            if self._cache.context != cache_context:
+                self._cache.reset(cache_context)
             digest = hashlib.blake2b(digest_size=24)
             digest.update(identity)
             digest.update(metadata_signature)

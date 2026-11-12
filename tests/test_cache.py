@@ -75,8 +75,8 @@ def test_old_natural_copper_finish_updates_without_remeshing(cache_setup, kind):
     part.color = cache.via_patch_color((.77, .50, .24)) if kind == "via_patch" else (.77, .50, .24)
     assert cache.save_cached_scene(snapshot, scene)
     migrated = cache.load_cached_scene(snapshot).parts[0]
-    expected = (cache.via_patch_color(geometry.NATURAL_COPPER_COLOR) if kind == "via_patch"
-                else geometry.NATURAL_COPPER_COLOR)
+    # Every conductor, including capped-via patches, is re-derived from the finish.
+    expected = geometry.NATURAL_COPPER_COLOR
     assert tuple(migrated.color) == expected
     assert tuple(migrated.editor_color) == part.editor_color
     np.testing.assert_array_equal(migrated.mesh.points, part.mesh.points)

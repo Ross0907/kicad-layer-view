@@ -226,8 +226,11 @@ def test_silk_slab_stays_outside_mask_and_respects_apertures_and_cache_dependenc
     front, back = parts["silk:F.SilkS"], parts["silk:B.SilkS"]
     assert front.area_mm2 == pytest.approx(15)
     assert back.area_mm2 == pytest.approx(1)
-    assert front.mesh.bounds.z_min > 1.6 + geometry.MASK_THICKNESS_MM
-    assert back.mesh.bounds.z_max < -geometry.MASK_THICKNESS_MM
+    # KiCad's silk height: 1.1 x 0.025 mm off the copper face, above the mask.
+    assert front.mesh.bounds.z_min == pytest.approx(1.6 + geometry.SILK_OFFSET_MM)
+    assert front.mesh.bounds.z_min > 1.6 + snapshot.stackup.mask_thickness("F.Mask")
+    assert back.mesh.bounds.z_max == pytest.approx(-geometry.SILK_OFFSET_MM)
+    assert front.mesh.bounds.z_max - front.mesh.bounds.z_min == pytest.approx(geometry.SILK_THICKNESS_MM)
     assert front.stack_index == -2 and back.stack_index == scene.slot_count+1
     assert min(front.color) > .9 and front.kind == "silk"
     changed = deepcopy(snapshot)

@@ -124,7 +124,11 @@ class RenderDialog(QDialog):
         mask.setRange(.05, 1.)
         mask.setSingleStep(.05)
         mask.setValue(window.mask_opacity)
+        mask.setToolTip("Starts at the board's stackup mask opacity (KiCad 0.83 for named colors).")
         mask.valueChanged.connect(window.set_mask_opacity)
+        self.mask_opacity = mask
+        if hasattr(window, "scene_ready"):
+            window.scene_ready.connect(self._sync_mask_opacity)
         form.addRow("Solder mask opacity", mask)
         note = QLabel("Copper/via geometry stays at full quality. Lower mask opacity reveals traces beneath it.")
         note.setWordWrap(True)
@@ -370,7 +374,13 @@ class RenderDialog(QDialog):
         self.screenshot_scale_combo.setCurrentIndex(index)
         self.screenshot_scale_combo.blockSignals(blocked)
 
+    def _sync_mask_opacity(self):
+        blocked = self.mask_opacity.blockSignals(True)
+        self.mask_opacity.setValue(self.window.mask_opacity)
+        self.mask_opacity.blockSignals(blocked)
+
     def showEvent(self, event):
+        self._sync_mask_opacity()
         self._sync_screenshot_scale()
         self._fit_to_screen()
         super().showEvent(event)

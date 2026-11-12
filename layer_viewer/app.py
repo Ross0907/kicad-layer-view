@@ -193,8 +193,6 @@ class MainWindow(QMainWindow):
         self.rows = {}
         self._solo_key = None
         self._row_keys = []
-        self.mask_opacity = .83
-        self._mask_opacity_override = False
         self._opacity_overrides = {}
         self.screenshot_scale = 1
         self.render_dialog = None
@@ -279,7 +277,8 @@ class MainWindow(QMainWindow):
         for kind, title in (("component", "3D components"), ("via_patch", "POFV finish contrast"),
                             ("paste", "Solder paste")):
             box = QCheckBox(title)
-            box.setChecked(kind != "paste")
+            # KiCad shows capped vias in the plain finish; contrast is opt-in.
+            box.setChecked(kind not in ("paste", "via_patch"))
             box.toggled.connect(self.apply_visibility)
             self.kind_boxes[kind] = box
             detail_row.addWidget(box)
@@ -579,7 +578,7 @@ class MainWindow(QMainWindow):
             self.viewport.fit()
         count = len(snapshot.stackup.copper)
         self.summary.setText(f"{snapshot.board_name}\n{count} copper layers · "
-                             f"{snapshot.stackup.board_thickness_mm:.3f} mm · "
+                             f"{snapshot.stackup.overall_thickness_mm:.3f} mm · "
                              f"{len(snapshot.vias):,} vias\n"
                              f"{sum(v.filled for v in snapshot.vias):,} filled · "
                              f"{sum(v.capped for v in snapshot.vias):,} capped · "
@@ -840,17 +839,23 @@ class MainWindow(QMainWindow):
         """Material alpha follows live edits unless the user explicitly overrides it."""
         if part.key in self._opacity_overrides:
             return self._opacity_overrides[part.key]
-        if part.kind == "mask" and self._mask_opacity_override:
-            return self.mask_opacity
         return part.opacity
 
     def _set_layer_opacity(self, key, value):
         self._opacity_overrides[key] = value
         self.viewport.set_part(key, opacity=value)
 
+    @property
+    def mask_opacity(self):
+        """Current solder-mask opacity: the first mask layer's value, else KiCad's 0.83."""
+        for key, (_, _, opacity) in self.rows.items():
+            if self.viewport.parts[key].kind == "mask":
+                return opacity.value()
+        return .83
+
     def set_mask_opacity(self, value):
-        self.mask_opacity = value
-        self._mask_opacity_override = True
+        # A per-layer override: cleared on a new board and by the view presets,
+        # so it never replaces another board's stackup alpha.
         for key, (_, _, opacity) in self.rows.items():
             if self.viewport.parts[key].kind == "mask":
                 self._opacity_overrides[key] = value

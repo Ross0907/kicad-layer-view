@@ -86,34 +86,53 @@ def _stackup_expression(path):
 
 
 def _stackup(board, path, layers, names, warnings):
-    from layer_viewer.finishes import saved_color_names
+    """The board's physical stackup exactly as KiCad's 3D viewer builds it.
+
+    Dielectric sublayers (``addsublayer``) add up, with material and color from
+    sublayer 0. Copper is clamped to 1 um like KiCad. A board saved without a
+    stackup gets KiCad's BuildDefaultStackupList stackup (35 um copper, 10 um
+    masks, "Not specified" colors), not an approximation.
+    """
+    from layer_viewer.model import (default_stackup_thicknesses, saved_color_names,
+                                    saved_mask_thickness, stackup_layer_values,
+                                    MIN_LAYER_THICKNESS_MM)
     expression = _stackup_expression(path)
     material_colors = saved_color_names(expression)
+    mask_thickness = saved_mask_thickness(expression)
+    canonical_to_id = {name: _ipc_id(name) for name in names.values()}
     entries = []
     if expression:
         for node in expression[1:]:
             if not isinstance(node, list) or node[0] != "layer":
                 continue
-            values = {item[0]: item[1] for item in node[2:]
-                      if isinstance(item, list) and len(item) > 1}
             if node[1] not in names.values() and not node[1].startswith("dielectric "):
                 continue
-            entries.append((node[1], float(values.get("thickness", 0)), values))
-    canonical_to_id = {name: _ipc_id(name) for name in names.values()}
+            values = stackup_layer_values(node)
+            thickness = float(values.get("thickness", 0) or 0)
+            if node[1] in canonical_to_id:
+                thickness = max(thickness, MIN_LAYER_THICKNESS_MM)
+            entries.append((node[1], max(thickness, 0.), values))
     expected = list(canonical_to_id)
     actual = [name for name, _, _ in entries if name in canonical_to_id]
-    explicit = actual == expected and all(thickness > 0 for _, thickness, _ in entries)
+    explicit = bool(expression) and actual == expected
     if not explicit:
-        warnings.append("Saved stackup was unavailable or incomplete; using evenly spaced copper layers.")
-        total = _mm(board.GetDesignSettings().GetBoardThickness())
-        copper_thicknesses = [.035 if i in (0, len(layers)-1) else .0175
-                              for i in range(len(layers))]
-        dielectric = max(.01, (total-sum(copper_thicknesses)) / (len(layers)-1))
+        if expression:
+            warnings.append("Saved stackup did not list the enabled copper layers in order; "
+                            "using KiCad's default stackup.")
+        import pcbnew
+        enabled = board.GetEnabledLayers()
+        masks = [name for layer, name in ((pcbnew.F_Mask, "F.Mask"), (pcbnew.B_Mask, "B.Mask"))
+                 if enabled.Contains(layer)]
+        copper_t, dielectric_t, mask_t = default_stackup_thicknesses(
+            _mm(board.GetDesignSettings().GetBoardThickness()), len(layers), len(masks))
+        mask_thickness = {name: mask_t for name in masks}
+        material_colors = {}
         entries = []
         for index, layer in enumerate(layers):
-            entries.append((names[layer], copper_thicknesses[index], {}))
+            entries.append((names[layer], copper_t, {}))
             if index < len(layers)-1:
-                entries.append((f"dielectric {index+1}", dielectric, {"material": "FR4"}))
+                entries.append((f"dielectric {index+1}", max(dielectric_t, 0.), {"material": "FR4",
+                                                                                    "epsilon_r": 4.5}))
     total = sum(entry[1] for entry in entries)
     z, index = total, 0
     copper, dielectric = [], []
@@ -132,7 +151,8 @@ def _stackup(board, path, layers, names, warnings):
                                                material_colors.get(name, "")))
     colors = {name: value for name, value in material_colors.items()
               if name in ("F.Mask", "B.Mask", "F.SilkS", "B.SilkS")}
-    return Stackup(copper, dielectric, total, from_board=explicit, colors=colors)
+    return Stackup(copper, dielectric, total, from_board=explicit, colors=colors,
+                   mask_thickness_mm=mask_thickness)
 
 
 def _drawing_ink(drawing, output, layer, max_error, error_loc):

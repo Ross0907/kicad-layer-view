@@ -17,7 +17,8 @@ from typing import Dict, Iterable, List, Optional
 
 from .model import (
     BoardSnapshot, CopperLayer, DielectricLayer, Footprint, Model3D, Net, Pad, Poly, Stackup,
-    Track, Via, Zone, read_board_stackup, read_board_surface_finish,
+    Track, Via, Zone, MIN_LAYER_THICKNESS_MM, default_stackup_thicknesses, read_board_stackup,
+    read_board_surface_finish, saved_color_names,
 )
 from contextlib import contextmanager
 
@@ -53,8 +54,6 @@ NULL = ProgressReporter()
 
 NM_PER_MM = 1_000_000.0
 DEFAULT_BOARD_THICKNESS_MM = 1.6
-DEFAULT_OUTER_CU_MM = 0.035
-DEFAULT_INNER_CU_MM = 0.0175
 ARC_SEGMENTS_PER_CIRCLE = 64
 
 
@@ -241,7 +240,8 @@ def _surface_finish(board_stackup, board) -> str:
             available = False
     if available:
         # An explicitly cleared live finish must not revive a stale saved value.
-        return str(getattr(finish, "type_name", "")).strip()
+        # Exactly as KiCad stores it: its finish rules are case-sensitive.
+        return str(getattr(finish, "type_name", ""))
     try:
         filename = board.document.board_filename
         if not filename:
@@ -258,7 +258,6 @@ def _surface_finish(board_stackup, board) -> str:
 
 
 def _saved_color_names(board):
-    from .finishes import saved_color_names
     try:
         filename = board.document.board_filename
         if not filename:
@@ -274,16 +273,31 @@ def _saved_color_names(board):
         return {}
 
 
-def _live_stackup_color(layer, saved="", *, progress=None, layer_name="layer"):
-    """Retain explicit live RGBA, including black and fully transparent colors.
+# wx parses KiCad's simple palette names into these RGB values; IPC then
+# reports the RGB, not the name. Two-word names (e.g. "Light Green") and the
+# board materials cannot be parsed by wx and arrive as opaque black.
+_WX_PALETTE = {"Black": ((0, 0, 0),), "White": ((255, 255, 255),), "Red": ((255, 0, 0),),
+               "Blue": ((0, 0, 255),), "Green": ((0, 128, 0), (0, 255, 0)),
+               "Yellow": ((255, 255, 0),), "Purple": ((128, 0, 128), (160, 32, 240))}
+_WARNED_BLACK = set()
 
-    IPC drops the original name and serializes generic wx named colors. Where
-    a saved standard name demonstrably matches that RGBA, retain the name so
-    the same manufacturing palette as KiCad's 3D viewer can be used. Changed
-    live colors and explicit cleared fields win. Some manufacturing names
-    cannot be parsed by wx and arrive as opaque black. Recover a known saved
-    name in that ambiguous case, with a notice about unsaved black overrides.
+
+def _rgb255(rgba):
+    return tuple(round(channel * 255) for channel in rgba[:3])
+
+
+def _live_stackup_color(layer, saved="", *, kind="mask", progress=None, layer_name="layer"):
+    """The stackup color KiCad would resolve, from a live IPC layer.
+
+    IPC reports RGBA, not KiCad's color name. Mask and silk palette names that
+    wx can parse come back as plain RGB (Green -> 0,128,0), so map them back to
+    the palette name and KiCad's palette RGB (and 0.83 mask alpha) instead of
+    showing raw saturated RGB. Names wx cannot parse arrive as opaque black;
+    the saved name is the only way to recover them, with a one-time notice
+    that unsaved changes to such names need a save. A cleared color is
+    "Not specified". Explicit custom colors keep their exact RGBA.
     """
+    from .finishes import is_named_stackup_color, material_appearance
     proto = getattr(layer, "proto", None)
     if proto is not None:
         try:
@@ -297,21 +311,28 @@ def _live_stackup_color(layer, saved="", *, progress=None, layer_name="layer"):
     rgba = tuple(float(getattr(color, name)) for name in ("red", "green", "blue", "alpha"))
     if not all(math.isfinite(value) and 0 <= value <= 1 for value in rgba):
         return ""
-    generic = {"black": ((0, 0, 0),), "white": ((255, 255, 255),),
-               "red": ((255, 0, 0),), "blue": ((0, 0, 255),),
-               "green": ((0, 128, 0), (0, 255, 0)), "yellow": ((255, 255, 0),),
-               "purple": ((128, 0, 128), (160, 32, 240))}
-    if isinstance(saved, str) and rgba[3] == 1.:
-        for expected in generic.get(saved.strip().lower(), ()):
-            if all(abs(actual - channel/255) < 1e-7 for actual, channel in zip(rgba[:3], expected)):
-                return saved
-        from .finishes import is_named_stackup_color
-        if (rgba == (0., 0., 0., 1.) and saved.strip().lower() not in generic
-                and is_named_stackup_color(saved)):
-            if progress is not None:
-                progress.warn(f"{layer_name}: KiCad IPC loses some named stackup colors; using saved "
-                              f"'{saved}'. Save a changed custom-black color before refreshing.")
+    saved = saved if isinstance(saved, str) else ""
+    if saved.startswith("#"):
+        # A saved custom color that the live value still equals stays exact.
+        if all(abs(a - b) < 1 / 255 for a, b in zip(material_appearance(kind, saved), rgba)):
             return saved
+    if rgba[3] != 1.:
+        return rgba
+    rgb = _rgb255(rgba)
+    if rgb == (0, 0, 0) and saved and (is_named_stackup_color(saved) or saved in _WX_PALETTE):
+        key = (layer_name, saved)
+        if progress is not None and saved != "Black" and key not in _WARNED_BLACK:
+            _WARNED_BLACK.add(key)
+            progress.warn(f"{layer_name}: KiCad's API reports this stackup color as black, which "
+                          f"can mean a palette color it cannot name; showing the saved '{saved}'. "
+                          "Save the board to show an unsaved stackup color change.")
+        return saved
+    if kind in ("mask", "silk"):
+        if rgb in _WX_PALETTE.get(saved, ()):
+            return saved
+        for name, values in _WX_PALETTE.items():
+            if rgb in values:
+                return name
     return rgba
 
 
@@ -335,6 +356,7 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
     technical_names = {BoardLayer.BL_F_Mask: "F.Mask", BoardLayer.BL_B_Mask: "B.Mask",
                        BoardLayer.BL_F_SilkS: "F.SilkS", BoardLayer.BL_B_SilkS: "B.SilkS"}
     colors = {}
+    mask_thickness = {}
     dielectric_index = 0
     entries = []  # (kind, layer_id, thickness_mm, material, epsilon_r, color), top to bottom
     try:
@@ -344,9 +366,13 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
             if sl.layer in technical_names:
                 name = technical_names[sl.layer]
                 colors[name] = _live_stackup_color(sl, saved_colors.get(name, ""),
+                                                  kind="mask" if "Mask" in name else "silk",
                                                   progress=progress, layer_name=name)
+                if sl.type == board_pb2.BoardStackupLayerType.BSLT_SOLDERMASK:
+                    mask_thickness[name] = _mm(sl.thickness)
             if sl.type == board_pb2.BoardStackupLayerType.BSLT_COPPER and sl.layer in names:
-                entries.append(("cu", sl.layer, _mm(sl.thickness), "", 0.0, ""))
+                # KiCad clamps copper to 1 um to avoid degenerate solids.
+                entries.append(("cu", sl.layer, max(_mm(sl.thickness), MIN_LAYER_THICKNESS_MM), "", 0.0, ""))
             elif sl.type == board_pb2.BoardStackupLayerType.BSLT_DIELECTRIC:
                 diel = sl.dielectric
                 subs = diel.layers if diel is not None else []
@@ -355,7 +381,7 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
                 er = subs[0].epsilon_r if subs else 0.0
                 dielectric_index += 1
                 name = f"dielectric {dielectric_index}"
-                color = _live_stackup_color(sl, saved_colors.get(name, ""),
+                color = _live_stackup_color(sl, saved_colors.get(name, ""), kind="dielectric",
                                            progress=progress, layer_name=name)
                 entries.append(("diel", -1, t, mat, er, color))
     except Exception as e:  # noqa: BLE001 - stackup is optional; fall back below
@@ -364,14 +390,16 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
 
     from_board = sum(1 for e in entries if e[0] == "cu") == len(cu_ids) and len(cu_ids) > 0
     if not from_board:
-        progress.warn("Stackup incomplete; synthesizing a default "
+        # KiCad always reports a stackup (its default one for boards saved
+        # without); this only covers a failed read. Mirror BuildDefaultStackupList.
+        progress.warn("Stackup incomplete; using KiCad's default "
                       f"{DEFAULT_BOARD_THICKNESS_MM} mm stackup")
         entries = []
         n = len(cu_ids)
-        cu_t = [DEFAULT_OUTER_CU_MM if i in (0, n - 1) else DEFAULT_INNER_CU_MM for i in range(n)]
-        diel_t = (DEFAULT_BOARD_THICKNESS_MM - sum(cu_t)) / max(1, n - 1)
+        cu_t, diel_t, mask_t = default_stackup_thicknesses(DEFAULT_BOARD_THICKNESS_MM, n, 2)
+        mask_thickness = {"F.Mask": mask_t, "B.Mask": mask_t}
         for i, lid in enumerate(cu_ids):
-            entries.append(("cu", lid, cu_t[i], "", 0.0, ""))
+            entries.append(("cu", lid, cu_t, "", 0.0, ""))
             if i < n - 1:
                 entries.append(("diel", -1, diel_t, "FR4", 4.5, ""))
 
@@ -401,7 +429,7 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
     for c in copper:
         progress.info(f"  {c.name:<8} t={c.thickness_mm * 1000:.1f} um  z={c.z_mid_mm:.3f} mm")
     return Stackup(copper=copper, dielectrics=dielectrics, board_thickness_mm=total,
-                   from_board=from_board, colors=colors)
+                   from_board=from_board, colors=colors, mask_thickness_mm=mask_thickness)
 
 
 # ---------------------------------------------------------------------------

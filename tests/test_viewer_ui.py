@@ -199,8 +199,11 @@ def test_exact_transparency_and_closed_surface_culling(window):
     assert viewport.plotter.renderer.GetMaximumNumberOfPeels() == 0
     assert viewport.plotter.renderer.GetOcclusionRatio() == 0
     window.apply_preset("stackup")
-    # Opaque closed solids cull inward faces; translucent mask and laminate keep both.
-    assert all(bool(actor.GetProperty().GetBackfaceCulling()) == (actor.GetProperty().GetOpacity() >= .999)
+    # Stackup slabs show only their outer faces at any opacity, like KiCad;
+    # other opaque solids cull too, other translucent solids stay two-sided.
+    from layer_viewer.viewer import SLAB_KINDS
+    assert all(bool(actor.GetProperty().GetBackfaceCulling())
+               == (viewport.parts[key].kind in SLAB_KINDS or actor.GetProperty().GetOpacity() >= .999)
                for key, actor in viewport.actors.items())
     window.clip_slider.setValue(400)
     assert not any(actor.GetProperty().GetBackfaceCulling() for actor in viewport.actors.values())
@@ -352,6 +355,9 @@ def test_via_details_start_disabled_and_finish_toggle_keeps_caps_closed(window):
     actor = window.viewport.actors[patch.key]
     copper = window.viewport.actors[copper_key]
     assert actor.GetVisibility()
+    assert not window.kind_boxes["via_patch"].isChecked()  # KiCad shows no contrast
+    assert actor.GetProperty().GetDiffuseColor() == copper.GetProperty().GetDiffuseColor()
+    window.kind_boxes["via_patch"].setChecked(True)
     assert actor.GetProperty().GetDiffuseColor() != copper.GetProperty().GetDiffuseColor()
     window.kind_boxes["via_patch"].setChecked(False)
     assert actor.GetVisibility(), "Disabling finish contrast must not open a capped hole"
