@@ -284,9 +284,26 @@ def _mask_openings(board):
     return result
 
 
+def _quiet_kicad_messages():
+    """Send KiCad's informational messages to stderr instead of modal boxes.
+
+    Loading a board that uses a font missing on this computer makes KiCad log
+    "Font ... not found; substituting ...". Without a GUI target, wxWidgets
+    shows each one as a blocking message box, which stalls this headless
+    reader until someone clicks OK.
+    """
+    try:
+        import wx
+        wx.Log.SetActiveTarget(wx.LogStderr())
+    except Exception:  # noqa: BLE001 - wxPython is optional in KiCad's Python
+        pass
+
+
 def extract_saved_board(path):
+    _quiet_kicad_messages()
     import pcbnew
 
+    _quiet_kicad_messages()  # pcbnew may install its own log target on import
     path = Path(path).resolve(strict=True)
     print(f"Reading {path.name} (saved board; no refill)", file=sys.stderr, flush=True)
     board = pcbnew.LoadBoard(str(path))
