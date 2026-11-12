@@ -31,7 +31,7 @@ Stackup fidelity (checked against kicad-cli renders of real boards)
 
 Appearance
 - KiCad's OpenGL material model (per-material ambient/specular/shininess), its
-  headlight plus top/bottom light rig and its background gradient.
+  headlight and camera-fixed light pair, and its background gradient.
 - Smoothly shaded round holes, barrels, fills and board edges.
 - Translucent mask and board layers are single-sided like KiCad's, so an 83%
   mask covers like 83% (it looked 97% opaque).
