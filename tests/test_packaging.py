@@ -85,3 +85,18 @@ def test_metadata_matches_kicad_pcm_schema(built):
     package = {"$ref": "#/definitions/Package", "definitions": schema["definitions"]}
     _, release = built
     jsonschema.validate(json.loads(release.read_text(encoding="utf-8")), package)
+
+
+def test_mesh_pool_creation_failure_falls_back_to_threads(monkeypatch):
+    from layer_viewer import mesh_pool
+    monkeypatch.setattr(mesh_pool, "_pool", None)
+    monkeypatch.setattr(mesh_pool, "_broken", False)
+
+    def broken(*args, **kwargs):
+        raise ValueError("max_workers must be <= 61")
+    monkeypatch.setattr(mesh_pool, "ProcessPoolExecutor", broken)
+    assert mesh_pool.submit(print, "never") is None
+    assert not mesh_pool.available()
+    monkeypatch.setenv("LAYER_VIEW_MESH_PROCESSES", "200")
+    import os
+    assert mesh_pool.process_count() == (61 if os.name == "nt" else 200)

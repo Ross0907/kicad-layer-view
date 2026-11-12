@@ -43,9 +43,9 @@ physical copper, dielectric, solder-mask, silkscreen and paste layers.
   CUDA/OptiX) with denoising, and ray-traced PNG export at any resolution.
 - **Read-only.** The plugin never saves, refills or edits the board.
 
-| Assembled | Via inspection |
+| Assembled | X-ray with via barrels |
 |---|---|
-| ![Assembled](docs/assembled.png) | ![Vias](docs/vias.png) |
+| ![Assembled](docs/assembled.png) | ![X-ray](docs/xray.png) |
 
 ## Requirements
 
@@ -71,6 +71,8 @@ Then use **Layer View — Exploded PCB** on the PCB editor toolbar or under
 **Tools → External Plugins**.
 
 ## Using it
+
+![Layer View window](docs/window.png)
 
 - **Orbit** with the left mouse button, **pan** with the middle/right button or
   Shift-drag, **zoom** with the wheel, Ctrl-drag to spin. Click the XYZ widget

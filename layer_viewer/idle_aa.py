@@ -59,7 +59,12 @@ class IdleAntialiaser(QObject):
         self.invalidate()
 
     def eventFilter(self, watched, event):
-        if event.type() in (QEvent.Resize, QEvent.MouseButtonPress, QEvent.Wheel):
+        kind = event.type()
+        if kind in (QEvent.Resize, QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.Wheel,
+                    QEvent.KeyPress):
+            self.invalidate()
+        elif kind == QEvent.MouseMove and (event.buttons() != Qt.NoButton
+                                           or getattr(self.viewport, "_measurement", None) is not None):
             self.invalidate()
         return False
 

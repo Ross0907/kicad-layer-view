@@ -504,3 +504,12 @@ def test_still_view_refinement_appears_when_idle_and_clears_on_movement(window):
     refiner.set_enabled(False)
     assert not refiner.timer.isActive()
     refiner.set_enabled(True)
+
+
+def test_presets_keep_capped_via_contrast_off_and_lights_follow_the_camera(window):
+    for mode in ("stackup", "xray", "copper", "vias"):
+        window.apply_preset(mode)
+        assert not window.kind_boxes["via_patch"].isChecked()
+    lights = list(window.viewport.plotter.renderer.GetLights())
+    kinds = sorted(light.GetLightType() for light in lights)
+    assert len(lights) == 3 and kinds.count(2) == 2  # 1 headlight + 2 camera lights (VTK_LIGHT_TYPE_CAMERA_LIGHT)

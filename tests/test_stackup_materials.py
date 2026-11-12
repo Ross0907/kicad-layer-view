@@ -64,7 +64,7 @@ def test_ipc_unparseable_palette_names_recover_saved_color_with_ambiguity_notice
 
 @pytest.mark.parametrize('saved,live,kind,expected', [
     ('Green', (255, 0, 0), 'mask', (181/255, 19/255, 21/255, .83)),
-    ('Green', (0, 0, 0), 'mask', (20/255, 51/255, 36/255, .83)),
+    ('Green', (0, 0, 0), 'mask', (11/255, 11/255, 11/255, .83)),       # changed to Black, unsaved
     ('', (0, 0, 0), 'mask', (11/255, 11/255, 11/255, .83)),
     ('White', (255, 0, 0), 'silk', (181/255, 19/255, 21/255, 1.)),
     ('', (255, 255, 255), 'dielectric', (1., 1., 1., 1.)),

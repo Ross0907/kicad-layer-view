@@ -182,3 +182,36 @@ def test_cancel_after_preview_never_reads_inner_payloads(cached_demo, monkeypatc
     with pytest.raises(Cancelled):
         next(stages)
     assert set(reads) == set(parts(preview))
+
+
+def test_complete_load_skips_models_already_shown_and_never_waits_for_them_on_error(monkeypatch):
+    import threading
+    import time
+    from layer_viewer import components, geometry
+    from layer_viewer.loading import load_complete_scene
+    from layer_viewer.model import Footprint, Model3D, demo_snapshot
+    snapshot = demo_snapshot()
+    snapshot.footprints = [Footprint("f", "U1", "IC", (5, 5), "top", models=[Model3D("part.step")])]
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def slow_models(snapshot, slot_count, progress=None):
+        calls.append(1)
+        started.set()
+        release.wait(5)
+        progress.check_cancel()
+        return [], []
+    monkeypatch.setattr(components, "build_component_parts", slow_models)
+    signature = components.component_signature(snapshot)
+    # Unchanged models are not rebuilt.
+    scene, _ = load_complete_scene(snapshot, known_component_signature=signature)
+    assert not calls and getattr(scene, "_components", None) is None
+    # A board error returns at once instead of waiting for a running model load.
+    monkeypatch.setattr(geometry, "build_scene", lambda *a, **k: (started.wait(5), 1 / 0))
+    monkeypatch.setattr("layer_viewer.cache.load_cached_scene", lambda *a, **k: None)
+    monkeypatch.setattr("layer_viewer.cache.load_previous_scene", lambda *a, **k: None)
+    begin = time.monotonic()
+    with pytest.raises(ZeroDivisionError):
+        load_complete_scene(snapshot)
+    assert time.monotonic() - begin < 2
+    release.set()

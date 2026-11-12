@@ -319,7 +319,10 @@ def _live_stackup_color(layer, saved="", *, kind="mask", progress=None, layer_na
     if rgba[3] != 1.:
         return rgba
     rgb = _rgb255(rgba)
-    if rgb == (0, 0, 0) and saved and (is_named_stackup_color(saved) or saved in _WX_PALETTE):
+    # Opaque black can mean "Black" or a name wx cannot parse, never a saved
+    # name wx can parse (that would arrive as its own RGB): only those recover.
+    if rgb == (0, 0, 0) and saved and (saved == "Black" or (is_named_stackup_color(saved)
+                                                             and saved not in _WX_PALETTE)):
         key = (layer_name, saved)
         if progress is not None and saved != "Black" and key not in _WARNED_BLACK:
             _WARNED_BLACK.add(key)

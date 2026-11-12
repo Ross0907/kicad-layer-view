@@ -211,3 +211,19 @@ def test_islands_touching_at_a_point_are_never_stitched_together():
     triangles = np.array([(0, 1, 2), (3, 4, 5)])
     fixed, _ = conform(points, triangles, groups=np.array([0, 0, 0, 1, 1, 1]))
     assert len(fixed) == 2
+
+
+def test_earcut_zero_area_triangle_never_leaves_an_internal_wall():
+    """A 45-degree artwork island where earcut emits one zero-area triangle.
+
+    Dropping that sliver left a T-junction, which extruded into a stray wall.
+    """
+    import shapely
+    from layer_viewer.meshing import slab_arrays, triangulate
+    polygon = shapely.from_wkb(bytes.fromhex("010300000001000000190000003A0F96447DBD2040AA66C39909210940C5E044C12B6D194003F1C894539E1440CDC8A77118911F400CD92B4540C21A40CDC8A77118911F407E7FF0FEBA302340A8F2ADEFCB8320407E7FF0FEBA302340A8F2ADEFCB8320408FF5DFB2BF381C40F7CA7E40E38B21402DA68154EE481E40B12160BEEC562340B7F8BE58DBB21A40A6F8F97572412340C13EE70F09581A40D17AE8A4F52A23409595D29C56DA1940A6F56491BD1A23402817E293D6581940B0F60B38F2102340CCE8C53AC8D41840689188BEAB0D2340534F5624714F1840B0F60B38F2102340DAB5E60D1ACA1740A6F56491BD1A23407E87CAB40B461740D17AE8A4F52A23401009DAAB8BC41640A6F8F97572412340E55FC538D946164058F3A093FC5D23407AB4F0402ACE1540E1A238A14D80234078126E4DA85B15401EAEE80311A82340D7A970AD6DF01440E7503BB3E4D4234051F349BE828D14402AACCE2A5A062440C0ADA45FDB3314407B60CD7AF73B24404497449A54E41340117813BE1E5724400385DCBFC7C313403A0F96447DBD2040AA66C39909210940"))
+    points, triangles = triangulate(polygon)
+    faces = shapely.polygons(points[triangles])
+    assert sum(shapely.area(faces)) == pytest.approx(polygon.area, rel=1e-12)
+    pts, tris, _, _ = slab_arrays(points, triangles, 0., .035, smooth=False)
+    walls = len(tris) - 2 * len(triangles)
+    assert walls == 2 * (len(polygon.exterior.coords) - 1)

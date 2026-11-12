@@ -109,11 +109,13 @@ class LoadWorker(QThread):
     failed = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, source, path=None, parent=None, *, via_details=False, components=True):
+    def __init__(self, source, path=None, parent=None, *, via_details=False, components=True,
+                 known_component_signature=None):
         super().__init__(parent)
         self.source, self.path = source, path
         self.via_details = via_details
         self.components = components
+        self.known_component_signature = known_component_signature
 
     def info(self, message):
         log.info(message)
@@ -148,8 +150,9 @@ class LoadWorker(QThread):
             self.check_cancel()
             self.info("Checking cached geometry…")
             # One complete scene: all layers and 3D models appear together.
-            scene, cached = load_complete_scene(snapshot, via_details=self.via_details,
-                                                components=self.components, progress=self)
+            scene, cached = load_complete_scene(
+                snapshot, via_details=self.via_details, components=self.components, progress=self,
+                known_component_signature=self.known_component_signature)
             self.check_cancel()
             self.elapsed = time.perf_counter() - started
             self.cache_hit = cached
@@ -472,11 +475,13 @@ class MainWindow(QMainWindow):
             from .live_worker import LiveWorker
             self.worker = LiveWorker(self, via_details=self._via_details_enabled())
             self.worker.components = self.kind_boxes["component"].isChecked()
+            self.worker.known_component_signature = self._component_loaded_signature
             self.worker.state.connect(self._worker_state)
             self.worker.failed.connect(self.live_failed)
         else:
             self.worker = LoadWorker(source, path, self, via_details=self._via_details_enabled(),
-                                     components=self.kind_boxes["component"].isChecked())
+                                     components=self.kind_boxes["component"].isChecked(),
+                                     known_component_signature=self._component_loaded_signature)
             self.worker.failed.connect(self.failed)
             self.connection_status.setText("Saved PCB · offline" if source == "board" else "Snapshot · offline")
         self.worker.progress.connect(self._worker_progress)
@@ -585,7 +590,7 @@ class MainWindow(QMainWindow):
                              f"{sum(v.front_plugged or v.back_plugged for v in snapshot.vias):,} plugged")
         self.setWindowTitle(f"{snapshot.board_name} · Layer View")
         warnings = getattr(scene, "warnings", []) or getattr(snapshot, "warnings", [])
-        if snapshot.silkscreen is None:
+        if snapshot.silkscreen is None and snapshot.source != "demo":
             warnings = ["This older snapshot has no silkscreen. Reopen the PCB or reload from KiCad.", *warnings]
         self.notices.setText("\n".join(str(w) for w in warnings[:3]))
         self.notices.setToolTip("\n".join(str(w) for w in warnings))
@@ -762,7 +767,14 @@ class MainWindow(QMainWindow):
             self.viewport.set_part(key, color=color.rgb(), render=False)
         self.viewport.refresh()
 
+    def _sync_worker_flags(self):
+        """Keep a running worker's model choices current (read once per load)."""
+        if self.worker is not None and hasattr(self.worker, "components"):
+            self.worker.components = self.kind_boxes["component"].isChecked()
+            self.worker.known_component_signature = self._component_loaded_signature
+
     def apply_visibility(self, *_):
+        self._sync_worker_flags()
         if self.scene is None:
             return
         self.viewport.show_via_patches = self.kind_boxes["via_patch"].isChecked()
@@ -813,7 +825,8 @@ class MainWindow(QMainWindow):
         use_editor = self.all_colors.isChecked()
         for kind, box in self.kind_boxes.items():
             box.blockSignals(True)
-            if kind != "paste":
+            # Paste and the capped-via contrast stay as the user set them.
+            if kind not in ("paste", "via_patch"):
                 box.setChecked(mode not in ("copper", "vias") or kind in ("barrel", "fill"))
             box.blockSignals(False)
         for key, (visible, color, opacity) in self.rows.items():
@@ -956,6 +969,6 @@ class MainWindow(QMainWindow):
         if self.render_dialog is not None:
             self.render_dialog.close()
         from . import mesh_pool
-        mesh_pool.shutdown()
+        mesh_pool.shutdown(terminate=True)
         self.viewport.plotter.close()
         super().closeEvent(event)

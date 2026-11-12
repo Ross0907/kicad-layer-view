@@ -226,11 +226,12 @@ class BoardViewport(QWidget):
         self.request_render()
 
     def _setup_lighting(self):
-        """KiCad's OpenGL light rig: a camera headlight plus top and bottom lights.
+        """KiCad's OpenGL light rig: a 0.3 headlight plus two 0.7 camera lights.
 
-        Directions and strengths follow init_lights in render_3d_opengl.cpp: a
-        0.3 headlight and two 0.7 directional lights tilted 0.03 pi off the board
-        normal, so both faces of the board are lit the way KiCad lights them.
+        init_lights in render_3d_opengl.cpp sets the two 0.7 directional lights
+        once, in eye space: one from just off the view direction (tilted 0.03 pi)
+        and one from directly behind. They follow the camera, so every face
+        turned towards the viewer is lit the same way KiCad lights it.
         """
         import pyvista as pv
         self.plotter.remove_all_lights()
@@ -239,7 +240,7 @@ class BoardViewport(QWidget):
         tilt = (np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi))
         for z in (1., -1.):
             self.plotter.add_light(pv.Light(position=(*tilt, z * np.cos(theta)), focal_point=(0, 0, 0),
-                                            light_type="scene light", intensity=.7))
+                                            light_type="camera light", intensity=.7))
 
     def set_background(self, name, render=True):
         bottom, top = BACKGROUNDS.get(name, BACKGROUNDS["kicad"])
@@ -534,6 +535,10 @@ class BoardViewport(QWidget):
             self._measurement = self.plotter.add_measurement_widget(
                 callback=lambda a, b, distance: self.picked.emit(
                     f"3D distance: {distance:.4f} mm · includes exploded layer spacing"))
+            # The rubber band moves without camera changes; never freeze it
+            # under a refined still frame.
+            for name in ("StartInteractionEvent", "InteractionEvent", "EndInteractionEvent"):
+                self._measurement.AddObserver(name, lambda *_: self.idle_aa.invalidate())
         elif not enabled and self._measurement is not None:
             self._measurement.Off()
             self._measurement = None

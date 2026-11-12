@@ -36,6 +36,7 @@ class LiveWorker(QThread):
         self.update_count = 0
         self.via_details = via_details
         self.components = True
+        self.known_component_signature = None
         self._details_changed = threading.Event()
 
     def set_via_details(self, enabled):
@@ -108,7 +109,8 @@ class LiveWorker(QThread):
                             from .loading import load_complete_scene
                             scene, self.cache_hit = load_complete_scene(
                                 snapshot, via_details=self.via_details,
-                                components=self.components, progress=self)
+                                components=self.components, progress=self,
+                                known_component_signature=self.known_component_signature)
                         self.check_cancel()
                         acknowledge = getattr(source, "acknowledge", None)
                         if acknowledge is not None and source_update:

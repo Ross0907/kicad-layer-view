@@ -11,7 +11,7 @@
       "github": "https://github.com/Ross0907"
     }
   },
-  "license": "GPL-3.0",
+  "license": "GPL-3.0-or-later",
   "resources": {
     "homepage": "https://github.com/Ross0907/kicad-layer-view",
     "issues": "https://github.com/Ross0907/kicad-layer-view/issues"

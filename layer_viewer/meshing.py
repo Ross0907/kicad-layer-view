@@ -203,6 +203,26 @@ def conform(points, triangles, labels=None, groups=None):
     return triangles, labels
 
 
+def _outline_matches(points, triangles, cross, perimeter):
+    """True when the triangles' open edges trace exactly the polygon outline.
+
+    A triangulation with a T-junction has an extra unpaired interior edge,
+    which makes its open-edge length exceed the polygon's perimeter.
+    """
+    oriented = triangles.copy()
+    flip = cross < 0
+    oriented[flip] = oriented[flip][:, ::-1]
+    edges = np.concatenate([oriented[:, [0, 1]], oriented[:, [1, 2]], oriented[:, [2, 0]]])
+    count = len(points)
+    keys = edges[:, 0].astype(np.int64) * count + edges[:, 1]
+    reverse = np.sort(edges[:, 1].astype(np.int64) * count + edges[:, 0])
+    at = np.minimum(reverse.searchsorted(keys), len(reverse) - 1)
+    open_edges = edges[reverse[at] != keys]
+    delta = points[open_edges[:, 1]] - points[open_edges[:, 0]]
+    return math.isclose(float(np.hypot(delta[:, 0], delta[:, 1]).sum()), perimeter,
+                        rel_tol=1e-9, abs_tol=1e-9)
+
+
 def triangulate(geom: BaseGeometry, conforming: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """Triangulate exact boundary vertices, avoiding costly Delaunay refinement.
 
@@ -223,9 +243,13 @@ def triangulate(geom: BaseGeometry, conforming: bool = True) -> Tuple[np.ndarray
         triangles = inverse[triangles]
         a, b, c = points[triangles[:, 0]], points[triangles[:, 1]], points[triangles[:, 2]]
         cross = (b[:, 0]-a[:, 0])*(c[:, 1]-a[:, 1]) - (b[:, 1]-a[:, 1])*(c[:, 0]-a[:, 0])
+        # A zero-area triangle means earcut met (nearly) collinear vertices;
+        # removing it would leave a T-junction that a float-exact repair cannot
+        # always see, so use the constrained triangulation for that polygon.
+        degenerate = bool((cross == 0).any())
         triangles = triangles[cross != 0]
-        if not math.isclose(float(np.abs(cross).sum()) / 2, polygon.area,
-                            rel_tol=1e-9, abs_tol=1e-9):
+        if not math.isclose(float(np.abs(cross).sum()) / 2, polygon.area, rel_tol=1e-9, abs_tol=1e-9) or (
+                degenerate and not _outline_matches(points, triangles, cross[cross != 0], polygon.length)):
             points, triangles = _triangulate_geos(polygon)
         if not len(triangles):
             continue

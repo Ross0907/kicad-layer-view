@@ -29,7 +29,7 @@ from .via_surfaces import via_patch_color
 from .model import BoardSnapshot, Stackup, DielectricLayer
 from .finishes import apply_surface_finish
 
-ENGINE_VERSION = "10-kicad-stackup-thickness"
+ENGINE_VERSION = "11-conforming-slivers"
 FORMAT = "kicad-layer-viewer-mesh-cache"
 MAX_ENTRIES = 3
 MAX_BYTES = 512 * 1024 * 1024

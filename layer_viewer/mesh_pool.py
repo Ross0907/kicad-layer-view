@@ -36,7 +36,8 @@ _timer = None
 def process_count() -> int:
     configured = os.environ.get("LAYER_VIEW_MESH_PROCESSES", "").strip()
     if configured.isdigit():
-        return int(configured)
+        # Windows' ProcessPoolExecutor accepts at most 61 workers.
+        return min(int(configured), 61) if os.name == "nt" else int(configured)
     return max(2, min(10, (os.cpu_count() or 4) - 2))
 
 
@@ -66,9 +67,14 @@ def _get_pool(launch_all=False):
     global _pool
     with _lock:
         if _pool is None and available():
-            context = multiprocessing.get_context("spawn")
-            pool = ProcessPoolExecutor(max_workers=process_count(), mp_context=context,
-                                       initializer=_initialize_worker)
+            try:
+                context = multiprocessing.get_context("spawn")
+                pool = ProcessPoolExecutor(max_workers=process_count(), mp_context=context,
+                                           initializer=_initialize_worker)
+            except Exception:  # noqa: BLE001 - any failure means "use threads"
+                log.warning("Mesh worker processes unavailable; using threads", exc_info=True)
+                globals()["_broken"] = True
+                return None
             # Spawn executors otherwise start one worker per submission, inside
             # submit(). Starting them all up front keeps that latency (which can
             # be seconds per process under on-access scanning) off the mesh path.
@@ -119,10 +125,10 @@ def should_use(snapshot, dirty_layers) -> bool:
 def submit(function, *args):
     """Submit work or return None when workers are unavailable."""
     global _broken
-    pool = _get_pool()
-    if pool is None:
-        return None
     try:
+        pool = _get_pool()
+        if pool is None:
+            return None
         future = pool.submit(function, *args)
     except Exception:  # noqa: BLE001 - BrokenProcessPool, shutdown, spawn failure
         log.warning("Mesh worker processes unavailable; using threads", exc_info=True)
@@ -159,12 +165,31 @@ def _idle_check():
         _touch()
 
 
-def shutdown(wait=False):
+def shutdown(wait=False, terminate=False):
+    """Stop the workers; ``terminate`` also ends jobs already running.
+
+    Closing the viewer must not leave Python and its workers busy meshing a
+    board nobody will see: concurrent.futures would otherwise wait for every
+    running job at interpreter exit.
+    """
     global _pool
     with _lock:
         pool, _pool = _pool, None
-    if pool is not None:
-        pool.shutdown(wait=wait, cancel_futures=True)
+    if pool is None:
+        return
+    if terminate and hasattr(pool, "terminate_workers"):  # Python 3.14+
+        try:
+            pool.terminate_workers()
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    processes = list((getattr(pool, "_processes", None) or {}).values()) if terminate else []
+    pool.shutdown(wait=wait, cancel_futures=True)
+    for process in processes:  # private API; best effort
+        try:
+            process.terminate()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 atexit.register(shutdown)
