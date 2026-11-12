@@ -385,7 +385,6 @@ def coated_slab_arrays(geom: BaseGeometry, z_bottom: float, thickness: float,
         probe, hit = shapely.STRtree(islands).query(shapely.point_on_surface(pieces),
                                                      predicate="intersects")
         owner[probe[::-1]] = hit[::-1]  # first match wins for points on a shared vertex
-    split = np.bincount(owner, minlength=len(islands)) > 1
     points, triangles, labels, owners = [], [], [], []
     offset = 0
     # Pieces of one partitioned island share boundary vertices; the conforming

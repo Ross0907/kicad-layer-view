@@ -1,0 +1,34 @@
+{
+  "$schema": "https://go.kicad.org/pcm/schemas/v2",
+  "name": "Layer View - Exploded PCB",
+  "description": "Live exploded 3D view of the PCB stackup, with KiCad stackup colors and 3D models",
+  "description_full": "Opens a separate 3D window that follows the active PCB editor, including unsaved edits. Explode the board into its physical copper, dielectric, solder mask, silkscreen and paste layers, with materials taken from the board stackup exactly as KiCad's 3D viewer resolves them. Shows STEP/VRML footprint models, filled/capped/plugged via treatments, plated barrels, cross-sections and measurements. Large boards mesh in parallel and open with every layer and component at once; unchanged layers are reused from a persistent cache. Optional GPU path tracing (Mitsuba, NVIDIA CUDA/OptiX). Read-only: never changes the board.",
+  "identifier": "com.github.roshan0907.layer-viewer",
+  "type": "plugin",
+  "author": {
+    "name": "Roshan-0907",
+    "contact": {
+      "github": "https://github.com/Ross0907"
+    }
+  },
+  "license": "GPL-3.0",
+  "resources": {
+    "homepage": "https://github.com/Ross0907/kicad-layer-view",
+    "issues": "https://github.com/Ross0907/kicad-layer-view/issues"
+  },
+  "tags": [
+    "viewer-3d",
+    "stackup",
+    "exploded-view",
+    "visualization",
+    "ipc-api"
+  ],
+  "versions": [
+    {
+      "version": "0.5.0",
+      "status": "testing",
+      "kicad_version": "10.0",
+      "runtime": "ipc"
+    }
+  ]
+}

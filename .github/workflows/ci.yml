@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYVISTA_OFF_SCREEN: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: pyvista/setup-headless-display-action@v4
+      - name: Install
+        run: python -m pip install -r requirements.txt pytest pillow jsonschema ruff
+      - name: Fetch KiCad's PCM schema
+        shell: bash
+        run: |
+          curl -fsSL -o pcm.v2.schema.json \
+            https://gitlab.com/kicad/code/kicad/-/raw/master/kicad/pcm/schemas/pcm.v2.schema.json \
+            && echo "KICAD_PCM_SCHEMA=$PWD/pcm.v2.schema.json" >> "$GITHUB_ENV" || true
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: python -m pytest -q
+      - name: Package
+        run: python tools/package_pcm.py

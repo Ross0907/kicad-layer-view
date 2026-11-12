@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: pyvista/setup-headless-display-action@v4
+      - name: Install
+        run: python -m pip install -r requirements.txt pytest pillow jsonschema
+      - name: Check the tag matches metadata.json
+        run: |
+          version=$(python -c "import json; print(json.load(open('pcm/metadata.json'))['versions'][0]['version'])")
+          test "v$version" = "${GITHUB_REF_NAME}" || { echo "Tag ${GITHUB_REF_NAME} != pcm/metadata.json v$version"; exit 1; }
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+      - name: Build Plugin Manager package
+        run: python tools/package_pcm.py
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$(python - <<'PY'
+          import os, re
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          version = os.environ["GITHUB_REF_NAME"][1:]
+          match = re.search(rf"^## {re.escape(version)}\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+          print(match.group(1).strip() if match else "")
+          PY
+          )
+          gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" \
+            --notes "${notes}
+
+          Install: KiCad → Plugin and Content Manager → Install from File… → the .zip below."
