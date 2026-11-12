@@ -14,8 +14,10 @@ from qtpy.QtCore import QAbstractAnimation, QEvent, QObject, QRect, Qt, QTimer
 from qtpy.QtGui import QImage, QPixmap, QRegion
 from qtpy.QtWidgets import QLabel
 
-IDLE_DELAY_MS = 220
-SAMPLES = 16
+IDLE_DELAY_MS = 150
+SAMPLES = 32
+# The refined image appears after this many samples and sharpens until done.
+PREVIEW_EVERY = 8
 
 
 def jitter_offsets(count=SAMPLES):
@@ -154,6 +156,11 @@ class IdleAntialiaser(QObject):
             self._sum += sample
             self._count += 1
         if self._pending:
+            if self._count % PREVIEW_EVERY == 0:
+                # Far-zoomed boards are mostly sub-pixel detail; show the
+                # partial average now instead of waiting for every sample.
+                self._show(np.ascontiguousarray(np.clip(self._sum / self._count + .5, 0, 255)
+                                                .astype(np.uint8)))
             self.step_timer.start()
             return
         # Leave the real framebuffer on the unshifted view under the overlay.

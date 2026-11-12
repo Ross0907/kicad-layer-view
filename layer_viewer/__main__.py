@@ -48,6 +48,9 @@ def main(plugin=False):
         name = instance_name()
         if activate_existing(name):
             return 0
+        # Read the board from KiCad while Qt/VTK load and the window is built.
+        from . import prefetch
+        prefetch.start()
     from .app import MainWindow
     window = MainWindow(gap=max(0, min(args.gap, 30)))
     if live:

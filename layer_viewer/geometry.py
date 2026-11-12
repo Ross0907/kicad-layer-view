@@ -25,7 +25,7 @@ from .colors import copper_color, default_colors
 from .finishes import DEFAULT_FINISH_COLOR, apply_surface_finish
 
 from .meshing import (  # noqa: F401 - re-exported public geometry API
-    CIRCLE_QUAD_SEGS, SMOOTH_WALL_COS, _circles, _track_shapes, _triangulate_geos, _weld,
+    CIRCLE_QUAD_SEGS, SMOOTH_WALL_COS, _circles, _track_shapes, _triangulate_geos, _weld, disjoint_union,
     board_outline, circle, coated_slab_arrays, copper_geometry, drilled_pad_holes,
     iter_polygons, layer_inputs, mesh_copper_layer, pad_hole, poly_to_shapely, polygon_union,
     polys_to_shapely, slab_arrays, triangulate,
@@ -191,7 +191,7 @@ def dielectric_geometry(snapshot, dielectric, *, outline=None):
                  for pad in snapshot.pads if min(pad.drill_mm) > 0)
     if outline is None:
         outline = board_outline(snapshot)
-    return outline.difference(polygon_union(holes))
+    return outline.difference(disjoint_union(holes))
 
 
 def mask_geometry(snapshot, front):

@@ -3,13 +3,13 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
-from qtpy.QtCore import QCoreApplication
+from qtpy.QtWidgets import QApplication
 
 from layer_viewer.live_raytrace import LiveRayWorker
 
 
 def test_camera_only_updates_reuse_backend_and_queued_camera_keeps_new_scene():
-    app = QCoreApplication.instance() or QCoreApplication([])
+    app = QApplication.instance() or QApplication([])
     built, frames = [], []
 
     class Backend:
@@ -68,7 +68,7 @@ def test_camera_only_updates_reuse_backend_and_queued_camera_keeps_new_scene():
 
 
 def test_quality_updates_keep_samples_and_redisplay_completed_frame():
-    app = QCoreApplication.instance() or QCoreApplication([])
+    app = QApplication.instance() or QApplication([])
     built, frames = [], []
 
     class Backend:
@@ -145,4 +145,105 @@ def test_quality_updates_keep_samples_and_redisplay_completed_frame():
     finally:
         worker.stop()
         assert worker.wait(3000)
+        app.processEvents()
+
+
+def test_motion_frames_are_shown_while_newer_cameras_queue():
+    """While dragging, a newer camera always waits; the finished frame still shows."""
+    app = QApplication.instance() or QApplication([])
+    frames, gate = [], []
+
+    class Backend:
+        def __init__(self, capture, width, height, progress):
+            self.size, self.samples = (width, height), 0
+            self.backend, self.last_batch_seconds, self.denoiser_available = "test", .01, True
+
+        def update_camera(self, camera, width, height):
+            self.size, self.samples = (width, height), 0
+
+        def render_batch(self, samples, denoise, exposure_ev=0.0, denoise_strength=.35,
+                         bloom_strength=.18, bloom_radius=1., display=True):
+            self.samples += samples
+            gate.append(True)
+            # A newer camera arrives while this motion frame renders.
+            worker.submit(len(gate) + 10, None, f"drag-{len(gate)}", (40, 30), 1, True, motion=True)
+
+        def display_image(self, **settings):
+            return np.zeros((self.size[1], self.size[0], 3), dtype=np.uint8)
+
+        def close(self):
+            pass
+
+    worker = LiveRayWorker(backend_factory=Backend)
+    worker.frame.connect(lambda revision, pixels, info: frames.append((revision, pixels.shape, info)))
+    worker.submit(1, SimpleNamespace(camera="start"), "start", (40, 30), 1, True, motion=True)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 3
+        while len(frames) < 3 and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(.005)
+        assert len(frames) >= 3
+        assert all(info["motion"] for _, _, info in frames)
+        assert frames[0][1] == (30, 40, 3)
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()
+
+
+def test_moving_keeps_the_ray_traced_image_and_traces_at_reduced_resolution():
+    app = QApplication.instance() or QApplication([])
+    from qtpy.QtCore import Signal
+    from qtpy.QtWidgets import QWidget
+    from layer_viewer import live_raytrace
+    from layer_viewer.live_raytrace import LiveRayController
+
+    class Viewport(QWidget):
+        scene_changed = Signal()
+        camera_changed = Signal()
+
+    viewport = Viewport()
+    host = QWidget(viewport)
+    host.resize(200, 100)
+    viewport.plotter = SimpleNamespace(interactor=host, window_size=(200, 100), camera=None)
+    viewport.actors = {"x": 1}
+    controller = LiveRayController(viewport)
+    submitted = []
+    controller.worker = SimpleNamespace(isInterruptionRequested=lambda: False, pause=lambda: None,
+                                        isRunning=lambda: False,
+                                        submit=lambda *args, **kw: submitted.append((args, kw)))
+    controller.enabled = True
+    controller._scene_dirty = False
+    import layer_viewer.raytrace as raytrace
+    original = (raytrace.available, raytrace.capture_camera_from_viewport)
+    raytrace.available = lambda: True
+    raytrace.capture_camera_from_viewport = lambda _: "camera"
+    try:
+        controller.overlay.show()
+        controller._moved()
+        assert not controller.overlay.isHidden()  # never falls back to OpenGL while moving
+        assert controller.motion_timer.isActive() and controller.timer.isActive()
+        controller._dispatch(motion=True)
+        args, kw = submitted[-1]
+        assert kw["motion"] and args[3] == (100, 50) and args[4] == live_raytrace.MOTION_SAMPLES
+        # A motion frame from an earlier drag position is still displayed...
+        stale = controller._revision
+        controller._moved()
+        controller._frame(stale, np.zeros((50, 100, 3), np.uint8),
+                          {"motion": True, "backend": "test", "seconds": .01, "denoised": True})
+        assert controller.last_image is not None and controller.last_image.width() == 100
+        # ...but not a refined frame for a view that has since moved on.
+        controller.last_image = None
+        controller._frame(stale, np.zeros((100, 200, 3), np.uint8),
+                          {"motion": False, "samples": 4, "target": 64, "backend": "test",
+                           "seconds": .01, "denoised": True})
+        assert controller.last_image is None
+        controller._dispatch()
+        args, kw = submitted[-1]
+        assert not kw["motion"] and args[3] == (200, 100)
+    finally:
+        raytrace.available, raytrace.capture_camera_from_viewport = original
+        controller.shutdown()
+        viewport.deleteLater()
         app.processEvents()

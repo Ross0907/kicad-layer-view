@@ -9,6 +9,9 @@ from layer_viewer.finishes import (COPPER_COLOR, DEFAULT_BOARD_BODY, DEFAULT_FIN
 from layer_viewer.geometry import build_scene
 from layer_viewer.model import demo_snapshot
 
+# These tests pin KiCad's own 3D-viewer material rules.
+pytestmark = pytest.mark.usefixtures("kicad_style")
+
 BLACK = (0., 0., 0., 1.)
 
 

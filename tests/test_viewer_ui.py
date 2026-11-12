@@ -123,11 +123,12 @@ def test_mask_opacity_defaults_to_stackup_alpha_and_layer_control_changes_it(win
     masks = [key for key in window.rows if window.viewport.parts[key].kind == "mask"]
     assert len(masks) == 2
     for key in masks:
-        assert window.rows[key][2].value() == pytest.approx(.83)
-        assert window.viewport.actors[key].GetProperty().GetOpacity() == pytest.approx(.83)
+        alpha = window.viewport.parts[key].opacity  # the stackup resist opacity
+        assert window.rows[key][2].value() == pytest.approx(alpha)
+        assert window.viewport.actors[key].GetProperty().GetOpacity() == pytest.approx(alpha)
     window.rows[masks[0]][2].setValue(.75)
     assert window.viewport.actors[masks[0]].GetProperty().GetOpacity() == .75
-    assert window.viewport.actors[masks[1]].GetProperty().GetOpacity() == pytest.approx(.83)
+    assert window.viewport.actors[masks[1]].GetProperty().GetOpacity() == pytest.approx(alpha)
 
 
 def test_actual_vtk_drag_orbits_and_reverse_drag_restores_camera(window):
@@ -477,6 +478,8 @@ def test_supersampling_is_never_applied_to_a_large_board(window, monkeypatch):
     from layer_viewer import viewer as viewer_module
     viewport = window.viewport
     assert viewport.antialiasing == "fxaa_hq"  # the safe default
+    # Multisampling would drop the translucent solder resist under depth peeling.
+    assert viewport.plotter.render_window.GetMultiSamples() == 0
     viewport.set_antialiasing("ssaa")
     assert viewport.effective_antialiasing() == "ssaa"  # the small demo board may use it
     monkeypatch.setattr(viewer_module, "SSAA_MAX_TRIANGLES", 10)

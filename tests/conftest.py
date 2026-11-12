@@ -30,3 +30,10 @@ def pytest_collection_modifyitems(config, items):
         key = f"{item.path.name}::{item.name.split('[')[0]}"
         if key in _NEEDS_LLVM and not _llvm_backend():
             item.add_marker(skip)
+
+
+@pytest.fixture
+def kicad_style(monkeypatch):
+    """Resolve materials exactly like KiCad's 3D viewer (not the realistic default)."""
+    from layer_viewer import finishes
+    monkeypatch.setattr(finishes, "STYLE", "kicad")

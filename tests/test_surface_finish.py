@@ -1,3 +1,4 @@
+import pytest
 """Finish edits refresh appearance while preserving PCB meshes and editor colors."""
 import numpy as np
 from types import SimpleNamespace
@@ -7,6 +8,9 @@ from layer_viewer.finishes import (COPPER_COLOR, DEFAULT_FINISH_COLOR, ENIG_COLO
                                    TIN_COLOR, finish_appearance, ray_metal_color)
 from layer_viewer.geometry import build_scene, scene_keys
 from layer_viewer.model import demo_snapshot
+
+# These tests pin KiCad's own 3D-viewer material rules.
+pytestmark = pytest.mark.usefixtures("kicad_style")
 
 
 def test_enig_refreshes_all_layers_from_disk_and_memory_without_remeshing(tmp_path, monkeypatch):

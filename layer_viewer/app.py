@@ -440,7 +440,8 @@ class MainWindow(QMainWindow):
         toolbar.addAction(ortho)
         self.live_ray_action = QAction("Live ray tracing", self)
         self.live_ray_action.setCheckable(True)
-        self.live_ray_action.setToolTip("Progressive GPU ray tracing; orbit in OpenGL, then refine at full resolution")
+        self.live_ray_action.setToolTip("Real-time GPU path tracing: stays ray traced while you orbit, "
+                                        "then refines at full resolution when the view rests")
         self.live_ray_action.toggled.connect(lambda enabled: self.viewport.live_ray.set_enabled(enabled))
         toolbar.addAction(self.live_ray_action)
         toolbar.addAction("Screenshot…", self.save_screenshot)
@@ -473,7 +474,9 @@ class MainWindow(QMainWindow):
         self.follow_action.blockSignals(False)
         if source == "ipc":
             from .live_worker import LiveWorker
-            self.worker = LiveWorker(self, via_details=self._via_details_enabled())
+            from . import prefetch
+            self.worker = LiveWorker(self, via_details=self._via_details_enabled(),
+                                     source_factory=prefetch.take_source)
             self.worker.components = self.kind_boxes["component"].isChecked()
             self.worker.known_component_signature = self._component_loaded_signature
             self.worker.state.connect(self._worker_state)
@@ -489,8 +492,9 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._worker_finished)
         self.statusBar().showMessage("Loading board…")
         self.loading.show()
-        if source != "demo":
-            # Start mesh workers now so they are ready when the board has been read.
+        if source in ("board", "snapshot"):
+            # Start mesh workers now so they are ready when the board has been
+            # read (live boards start them from the early read instead).
             from . import mesh_pool
             mesh_pool.warm_up()
         self.worker.start(QThread.LowPriority)
@@ -758,6 +762,21 @@ class MainWindow(QMainWindow):
             self.table.selectRow(self._row_keys.index(selected))
         if previous:
             self.table.verticalScrollBar().setValue(scroll_position)
+
+    def material_style(self):
+        from . import finishes
+        return finishes.STYLE
+
+    def set_material_style(self, style):
+        """Switch realistic/KiCad material colors without rebuilding any mesh."""
+        from . import finishes
+        if style == finishes.STYLE:
+            return
+        finishes.set_style(style)
+        if self.scene is None or self.snapshot is None:
+            return
+        self._refresh_extra_scene(finishes.apply_surface_finish(self.scene, self.snapshot))
+        self.viewport.refresh()
 
     def set_all_colors(self, enabled):
         for key, (_, color, _) in self.rows.items():

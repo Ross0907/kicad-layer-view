@@ -24,7 +24,8 @@ log = logging.getLogger(__name__)
 IDLE_SHUTDOWN_S = 300.
 # Below this many conductor vertices, thread meshing finishes before workers start.
 MIN_VERTICES = 60_000
-MIN_LAYERS = 2
+# Two or three foils mesh as fast on threads, without process start-up.
+MIN_LAYERS = 4
 
 _lock = threading.Lock()
 _pool = None
@@ -63,13 +64,14 @@ def available() -> bool:
     return not _broken and process_count() > 1
 
 
-def _get_pool(launch_all=False):
+def _get_pool(launch_all=False, workers=None):
     global _pool
     with _lock:
         if _pool is None and available():
             try:
                 context = multiprocessing.get_context("spawn")
-                pool = ProcessPoolExecutor(max_workers=process_count(), mp_context=context,
+                count = process_count() if not workers else max(2, min(process_count(), workers))
+                pool = ProcessPoolExecutor(max_workers=count, mp_context=context,
                                            initializer=_initialize_worker)
             except Exception:  # noqa: BLE001 - any failure means "use threads"
                 log.warning("Mesh worker processes unavailable; using threads", exc_info=True)
@@ -88,14 +90,17 @@ def _get_pool(launch_all=False):
         return _pool
 
 
-def warm_up():
-    """Start workers in the background while the board is being read."""
+def warm_up(layers=None):
+    """Start workers in the background while the board is being read.
+
+    ``layers`` (the copper layer count, when known) caps how many start.
+    """
     if not available():
         return
 
     def start():
         try:
-            pool = _get_pool(launch_all=True)
+            pool = _get_pool(launch_all=True, workers=layers)
             if pool is not None:
                 for _ in range(process_count()):
                     pool.submit(_ping)

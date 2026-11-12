@@ -1,4 +1,10 @@
-"""Progressive ray-traced viewport with persistent geometry and responsive orbiting."""
+"""Real-time ray-traced viewport: path tracing while moving, refining when still.
+
+While the camera moves, every view change is path traced at reduced
+resolution with one denoised sample, so orbiting, panning and zooming stay
+ray traced (never falling back to the flat OpenGL look). Once the view rests
+the same scene is refined progressively at full native resolution.
+"""
 from __future__ import annotations
 
 import logging
@@ -10,6 +16,15 @@ from qtpy.QtGui import QImage, QPixmap, QRegion
 from qtpy.QtWidgets import QLabel
 
 log = logging.getLogger(__name__)
+
+# Fraction of the window resolution traced while the view moves. It adapts
+# between the limits to hold roughly MOTION_FRAME_S per frame on any GPU/board.
+MOTION_SCALE = .5
+MOTION_SCALE_LIMITS = (.25, .75)
+MOTION_FRAME_S = 1 / 30
+MOTION_SAMPLES = 1
+# Refinement at full resolution starts once the view has rested this long.
+STILL_DELAY_MS = 140
 
 
 class _Stopped(Exception):
@@ -29,14 +44,14 @@ class LiveRayWorker(QThread):
         self._backend_factory = backend_factory
 
     def submit(self, revision, capture, camera, size, samples, denoise, exposure_ev=0.0,
-               denoise_strength=.35, bloom_strength=.18, bloom_radius=1.):
+               denoise_strength=.35, bloom_strength=.18, bloom_radius=1., motion=False):
         with self._condition:
             # A later camera can supersede a queued camera, but it must retain
             # new geometry which has not yet reached the worker.
             if capture is None and self._pending is not None:
                 capture = self._pending[1]
             self._pending = (revision, capture, camera, size, samples, denoise, exposure_ev,
-                             denoise_strength, bloom_strength, bloom_radius)
+                             denoise_strength, bloom_strength, bloom_radius, motion)
             self._paused = False
             self._condition.notify_all()
 
@@ -64,6 +79,7 @@ class LiveRayWorker(QThread):
         bloom_strength, bloom_radius = .18, 1.
         active_camera, active_size = None, None
         last_display = 0.
+        motion = False
         try:
             if self._backend_factory is None:
                 from functools import partial
@@ -82,7 +98,7 @@ class LiveRayWorker(QThread):
                 redisplay = False
                 if pending is not None:
                     (revision, capture, camera, size, target, denoise, exposure_ev,
-                     denoise_strength, bloom_strength, bloom_radius) = pending
+                     denoise_strength, bloom_strength, bloom_radius, motion) = pending
                     size = tuple(size)
                     if capture is not None:
                         if tracer is not None:
@@ -106,7 +122,9 @@ class LiveRayWorker(QThread):
                             # This also updates a completed image at its target.
                             redisplay = tracer.samples > 0
                 with self._condition:
-                    if self._paused or self._pending is not None:
+                    # Mid-drag a newer camera is always queued; trace this one
+                    # anyway (it is one frame old) or nothing would ever show.
+                    if self._paused or (self._pending is not None and not motion):
                         continue
                 if tracer is None:
                     continue
@@ -121,21 +139,26 @@ class LiveRayWorker(QThread):
                                         display=False)
                 self.check_cancel()
                 with self._condition:
-                    if self._paused or self._pending is not None:
+                    if self._paused or (self._pending is not None and not motion):
                         continue
                 now = time.perf_counter()
                 if not redisplay and tracer.samples < target and last_display and now - last_display < .1:
                     continue
-                pixels = tracer.display_image(denoise=denoise, exposure_ev=exposure_ev,
-                                              denoise_strength=denoise_strength,
-                                              bloom_strength=bloom_strength, bloom_radius=bloom_radius)
+                settings = dict(denoise=denoise, exposure_ev=exposure_ev,
+                                denoise_strength=denoise_strength,
+                                bloom_strength=bloom_strength, bloom_radius=bloom_radius)
+                if motion:
+                    # One sample needs the denoiser most; skip its guide pass.
+                    settings.update(denoise_strength=max(denoise_strength, .85) if denoise else 0.,
+                                    fast=True)
+                pixels = tracer.display_image(**settings)
                 last_display = time.perf_counter()
                 self.check_cancel()
                 with self._condition:
-                    if self._paused or self._pending is not None:
+                    if self._paused or (self._pending is not None and not motion):
                         continue
                 self.frame.emit(revision, pixels, {
-                    "samples": tracer.samples, "target": target,
+                    "samples": tracer.samples, "target": target, "motion": motion,
                     "backend": tracer.backend, "seconds": last_display - frame_started,
                     "denoised": bool(denoise and denoise_strength > 0 and tracer.denoiser_available),
                     "exposure_ev": exposure_ev,
@@ -170,6 +193,10 @@ class LiveRayController(QObject):
         self.bloom_radius = 1.
         self.worker = None
         self._revision = 0
+        # Motion frames lag the camera by a frame and are still shown; frames
+        # from before a reset (scene, resize, settings) never are.
+        self._valid_from = 0
+        self.motion_scale = MOTION_SCALE
         self._scene_dirty = True
         self._camera_signature = None
         self.last_image = None
@@ -180,8 +207,13 @@ class LiveRayController(QObject):
         self.overlay.hide()
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
-        self.timer.setInterval(180)
+        self.timer.setInterval(STILL_DELAY_MS)
         self.timer.timeout.connect(self._dispatch)
+        # Coalesces the many camera events of one mouse move into one frame.
+        self.motion_timer = QTimer(self)
+        self.motion_timer.setSingleShot(True)
+        self.motion_timer.setInterval(0)
+        self.motion_timer.timeout.connect(lambda: self._dispatch(motion=True))
         viewport.scene_changed.connect(self.scene_changed)
         viewport.camera_changed.connect(self.camera_changed)
         viewport.plotter.interactor.installEventFilter(self)
@@ -197,6 +229,7 @@ class LiveRayController(QObject):
             self.status.emit("Live ray tracing: preparing the current view…")
         else:
             self.timer.stop()
+            self.motion_timer.stop()
             self.overlay.hide()
             self.last_image = None
             if self.worker is not None:
@@ -237,10 +270,22 @@ class LiveRayController(QObject):
                      camera.GetParallelProjection(), camera.GetParallelScale(), camera.GetViewAngle())
         if signature != self._camera_signature:
             self._camera_signature = signature
-            self._invalidate()
+            self._moved()
 
-    def _invalidate(self, clear_image=True, delay=180):
+    def _moved(self):
+        """Trace the moved view now at reduced resolution; refine once still.
+
+        The last ray-traced frame stays on screen until the new one arrives,
+        so the view never drops back to OpenGL while it moves.
+        """
         self._revision += 1
+        if not self.motion_timer.isActive():
+            self.motion_timer.start()
+        self.timer.start(STILL_DELAY_MS)
+
+    def _invalidate(self, clear_image=True, delay=STILL_DELAY_MS):
+        self._revision += 1
+        self._valid_from = self._revision
         if clear_image:
             self.overlay.hide()
             self.last_image = None
@@ -249,13 +294,15 @@ class LiveRayController(QObject):
         self.timer.start(delay)
 
     def eventFilter(self, watched, event):
-        if self.enabled and event.type() in (QEvent.Resize, QEvent.MouseButtonPress, QEvent.Wheel):
+        if self.enabled and event.type() == QEvent.Resize:
             self._invalidate()
         return False
 
-    def _dispatch(self):
+    def _dispatch(self, motion=False):
         if not self.enabled or not self.viewport.actors:
             return
+        if motion and self.worker is None:
+            motion = False  # the first frame builds the scene at full size
         if self.worker is not None and self.worker.isInterruptionRequested():
             self.timer.start(100)
             return
@@ -275,15 +322,21 @@ class LiveRayController(QObject):
             capture = capture_from_viewport(self.viewport) if self._scene_dirty else None
             camera = capture_camera_from_viewport(self.viewport)
             size = tuple(max(1, int(v)) for v in self.viewport.plotter.window_size)
-            self.worker.submit(self._revision, capture, camera, size, self.samples, self.denoise,
+            if motion:
+                size = tuple(max(16, int(round(v * self.motion_scale))) for v in size)
+            self.worker.submit(self._revision, capture, camera, size,
+                               MOTION_SAMPLES if motion else self.samples, self.denoise,
                                self.exposure_ev, self.denoise_strength,
-                               self.bloom_strength if self.bloom_enabled else 0., self.bloom_radius)
+                               self.bloom_strength if self.bloom_enabled else 0., self.bloom_radius,
+                               motion=motion)
             self._scene_dirty = False
         except Exception as exc:
             self._failed(str(exc))
 
     def _frame(self, revision, pixels, info):
-        if not self.enabled or revision != self._revision:
+        if not self.enabled or revision < self._valid_from:
+            return
+        if revision != self._revision and not info.get("motion"):
             return
         height, width, _ = pixels.shape
         # Copy before the worker's next frame releases its numpy buffer.
@@ -291,6 +344,11 @@ class LiveRayController(QObject):
         self.last_image = picture
         rect = self.viewport.plotter.interactor.rect()
         self.overlay.setGeometry(rect)
+        full = tuple(max(1, int(v)) for v in self.viewport.plotter.window_size)
+        if info.get("motion") and width < full[0]:
+            # Filter the reduced motion frame up to the window, not blocky pixels.
+            picture = picture.scaled(full[0], full[1], Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            width = full[0]
         pixmap = QPixmap.fromImage(picture)
         pixmap.setDevicePixelRatio(width / max(1, rect.width()))
         self.overlay.setPixmap(pixmap)
@@ -302,6 +360,16 @@ class LiveRayController(QObject):
         self.overlay.raise_()
         quality = (f" · denoise {info.get('denoise_strength', 1.):.0%}"
                    if info["denoised"] else "")
+        if info.get("motion"):
+            # Trade resolution for frame rate: pixel count scales with scale².
+            seconds = float(info.get("seconds", MOTION_FRAME_S))
+            if seconds > 0:
+                ratio = (MOTION_FRAME_S / seconds) ** .5
+                low, high = MOTION_SCALE_LIMITS
+                self.motion_scale = min(high, max(low, self.motion_scale * min(1.15, max(.7, ratio))))
+            self.status.emit(f"Live ray tracing · {info['backend']} · moving · "
+                             f"{pixels.shape[1]}×{pixels.shape[0]} · {info['seconds']*1000:.0f} ms/frame")
+            return
         self.status.emit(f"Live ray tracing · {info['backend']} · {width}×{height} · "
                          f"{info['samples']}/{info['target']} samples{quality} · "
                          f"{info['seconds']*1000:.0f} ms/frame")
@@ -321,6 +389,7 @@ class LiveRayController(QObject):
     def shutdown(self):
         self.enabled = False
         self.timer.stop()
+        self.motion_timer.stop()
         self.overlay.hide()
         if self.worker is not None and self.worker.isRunning():
             self.worker.stop()

@@ -41,6 +41,7 @@ def arcball_rotation(previous, current, size):
 KICAD_AMBIENT = 3 * .084
 # Closed stackup solids, drawn single-sided like KiCad's layers.
 SLAB_KINDS = ("copper", "dielectric", "mask", "silk", "paste", "via_patch")
+ANTIALIASING_MODES = ("fxaa_hq", "fxaa", "ssaa", "none")
 # Largest scene that may be supersampled; beyond this, FXAA is used instead.
 SSAA_MAX_TRIANGLES = 3_000_000
 BACKGROUNDS = {
@@ -137,6 +138,10 @@ class BoardViewport(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         # Rendering continuously at 20 Hz made an idle dense PCB consume a GPU
         # core. VTK redraws on camera interactions; controls request one frame.
+        # No hardware multisampling: with a multisampled framebuffer VTK's depth
+        # peeling (and OIT) drop translucent layers drawn over opaque copper,
+        # which made the solder resist vanish. FXAA covers motion; the idle
+        # refiner accumulates jittered frames for still views.
         self.plotter = QtInteractor(self, auto_update=False, multi_samples=0)
         layout.addWidget(self.plotter.interactor)
         self.background = "kicad"
@@ -284,6 +289,8 @@ class BoardViewport(QWidget):
             )
             prop = actor.GetProperty()
             apply_material(prop, part.kind, part.color)
+            self.parts[part.key] = part
+            self._apply_coated_copper(actor, part)
             if part.kind == "component" or part.mesh.GetPointData().GetNormals() is not None:
                 # Per-pixel lighting with the mesh's smoothed wall normals.
                 prop.SetInterpolationToPhong()
@@ -342,6 +349,7 @@ class BoardViewport(QWidget):
         if opacity is not None:
             actor.GetProperty().SetOpacity(opacity)
         if part.kind == "copper":
+            self._apply_coated_copper(actor, part)
             patch = self.actors.get(f"via-patch:{part.layer_id}")
             if patch is not None:
                 # Capped vias carry the same finish as the copper (KiCad shows no
@@ -355,6 +363,40 @@ class BoardViewport(QWidget):
                 patch.GetProperty().SetOpacity(actor.GetProperty().GetOpacity())
         if render:
             self.refresh()
+
+    @staticmethod
+    def _apply_coated_copper(actor, part):
+        """Show bare copper where the resist covers a realistic-finish foil.
+
+        Fabricated boards are plated only where copper is exposed, so pads
+        show the finish and traces under the resist stay copper (which tints
+        green resist yellow-green). KiCad-style, editor and custom colors keep
+        one uniform color. The exact per-face coverage comes from meshing.
+        """
+        from .finishes import covered_copper_color
+        mapper = actor.GetMapper()
+        mesh = part.mesh
+        names = [name for name in ("coat:F.Mask", "coat:B.Mask") if name in mesh.cell_data]
+        color = tuple(actor.GetProperty().GetDiffuseColor())
+        under = covered_copper_color(color)
+        if part.kind != "copper" or not names or np.allclose(under, color, atol=1e-6):
+            mapper.ScalarVisibilityOff()
+            return
+        covered = np.zeros(mesh.n_cells, dtype=bool)
+        for name in names:
+            covered |= np.asarray(mesh.cell_data[name]).reshape(mesh.n_cells, -1)[:, 0] > .5
+        rgb = np.empty((mesh.n_cells, 3), dtype=np.uint8)
+        rgb[:] = np.round(np.asarray(color) * 255)
+        rgb[covered] = np.round(np.asarray(under) * 255)
+        from vtkmodules.util.numpy_support import numpy_to_vtk
+        array = numpy_to_vtk(rgb, deep=True)
+        array.SetName("_layer_view_rgb")
+        # Added, not made active: ray capture and caches read only coat:* tags.
+        mesh.GetCellData().AddArray(array)
+        mapper.SetScalarModeToUseCellFieldData()
+        mapper.SelectColorArray("_layer_view_rgb")
+        mapper.SetColorModeToDirectScalars()
+        mapper.ScalarVisibilityOn()
 
     def refresh(self):
         self.update_clip()
@@ -454,7 +496,7 @@ class BoardViewport(QWidget):
         """
         if self.antialiasing == "ssaa" and self.triangle_count() > SSAA_MAX_TRIANGLES:
             return "fxaa_hq"
-        return self.antialiasing
+        return self.antialiasing if self.antialiasing in ANTIALIASING_MODES else "fxaa_hq"
 
     def set_antialiasing(self, mode):
         self.antialiasing = mode

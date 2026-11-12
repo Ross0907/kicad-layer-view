@@ -93,15 +93,28 @@ class RenderDialog(QDialog):
             lambda index: window.viewport.set_background(("kicad", "dark")[index]))
         form.addRow("Background", background)
         antialias = QComboBox()
-        antialias.addItems(["FXAA · high quality", "FXAA · standard", "Supersampling (SSAA) · small boards", "None"])
-        antialias.setToolTip("Supersampling gives the cleanest thin lines but needs far more GPU memory. "
-                             "It applies only to boards under 3 million triangles; larger boards "
-                             "use high-quality FXAA automatically.")
-        antialias.setCurrentIndex(["fxaa_hq", "fxaa", "ssaa", "none"].index(window.viewport.antialiasing))
-        antialias.currentIndexChanged.connect(
-            lambda index: window.viewport.set_antialiasing(["fxaa_hq", "fxaa", "ssaa", "none"][index]))
+        modes = ("fxaa_hq", "fxaa", "ssaa", "none")
+        antialias.addItems(["FXAA · high quality", "FXAA · standard",
+                            "Supersampling (SSAA) · small boards", "None"])
+        antialias.setToolTip("Applies while the view moves; a still view is refined with 32 jittered "
+                             "samples. Supersampling needs far more GPU memory and applies only to "
+                             "boards under 3 million triangles; larger boards use high-quality FXAA.")
+        current = window.viewport.antialiasing
+        antialias.setCurrentIndex(modes.index(current) if current in modes else 0)
+        antialias.currentIndexChanged.connect(lambda index: window.viewport.set_antialiasing(modes[index]))
         form.addRow("Antialiasing", antialias)
-        refine = QCheckBox("Refine edges when the view is still (16× antialiasing)")
+        styles = ("realistic", "kicad")
+        material = QComboBox()
+        material.addItems(["Realistic \u00b7 fabricated board (JLCPCB reference)", "KiCad 3D viewer colors"])
+        material.setToolTip("Realistic shows real resist pigments and opacity, natural FR4, bare copper "
+                            "under the resist and the plating finish on exposed copper (HASL when the "
+                            "stackup names none). KiCad matches KiCad's own 3D viewer exactly.")
+        style = window.material_style() if hasattr(window, "material_style") else "realistic"
+        material.setCurrentIndex(styles.index(style) if style in styles else 0)
+        material.currentIndexChanged.connect(
+            lambda index: window.set_material_style(styles[index]) if hasattr(window, "set_material_style") else None)
+        form.addRow("Material colors", material)
+        refine = QCheckBox("Refine edges when the view is still (32× antialiasing)")
         refiner = getattr(window.viewport, "idle_aa", None)
         refine.setChecked(refiner is None or refiner.enabled)
         refine.setEnabled(refiner is not None)

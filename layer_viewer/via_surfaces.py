@@ -31,5 +31,6 @@ def split_cap_surfaces(snapshot, layer_id, copper_geometry):
         return copper_geometry, Polygon()
     disks = shapely.buffer(shapely.points([via.position for via in capped]),
                            [via.drill_mm / 2 for via in capped], quad_segs=CIRCLE_QUAD_SEGS)
-    caps = shapely.intersection(shapely.union_all(disks), copper_geometry)
+    from .meshing import disjoint_union
+    caps = shapely.intersection(disjoint_union(disks), copper_geometry)
     return shapely.difference(copper_geometry, caps), caps

@@ -12,6 +12,9 @@ from layer_viewer import geometry
 from layer_viewer.geometry import SceneData, ScenePart
 from layer_viewer.model import demo_snapshot, load_snapshot, save_snapshot
 
+# These tests pin KiCad's own 3D-viewer material rules.
+pytestmark = pytest.mark.usefixtures("kicad_style")
+
 
 @pytest.fixture
 def cache_setup(tmp_path, monkeypatch):

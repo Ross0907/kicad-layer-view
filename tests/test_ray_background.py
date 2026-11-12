@@ -14,7 +14,7 @@ def test_primary_misses_keep_the_original_dark_gradient(exposure, denoise):
     # Even a bright filtered buffer must not replace the camera background.
     raw = np.full((3, 5, 3), 20., dtype=np.float32)
     alpha = np.zeros((3, 5, 1), dtype=np.float32)
-    tracer._prepare_display = lambda _: (raw, raw * 2 if denoise else None, alpha, None)
+    tracer._prepare_display = lambda _denoise, _fast=False: (raw, raw * 2 if denoise else None, alpha, None)
     pixels = tracer._display_image(denoise, exposure, .35)
     assert pixels.shape == (3, 5, 3) and pixels.dtype == np.uint8
     np.testing.assert_array_equal(pixels[0], np.tile((28, 43, 56), (5, 1)))

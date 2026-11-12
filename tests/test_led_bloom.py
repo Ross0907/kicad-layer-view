@@ -49,7 +49,7 @@ def display_fixture():
     emission = np.zeros_like(raw)
     raw[15, 15] = emission[15, 15] = (8., 0., 0.)
     alpha[15, 15] = 1
-    tracer._prepare_display = lambda _: (raw, None, alpha, emission)
+    tracer._prepare_display = lambda _denoise, _fast=False: (raw, None, alpha, emission)
     return tracer, raw, alpha, emission
 
 

@@ -15,15 +15,19 @@ physical copper, dielectric, solder-mask, silkscreen and paste layers.
 - **Exploded stackup.** Spread every physical layer apart with one slider, or
   animate between assembled and exploded. Copper, dielectric, mask, silk and
   paste are real solids at their stackup thickness and height.
-- **Follows the board stackup like KiCad's 3D viewer.** Mask, silk, dielectric
-  and surface-finish colors are resolved from the stackup with KiCad's own
-  palettes and rules (ENIG/ENEPIG/hard gold → gold, HASL/tin → tin, OSP →
-  copper, unspecified → KiCad's defaults). Custom `#RRGGBB(AA)` colors are kept
-  exactly. Each layer can switch to the PCB editor theme color or a custom one.
+- **Looks like the fabricated board.** Colors come from the board stackup and
+  default to a realistic style referenced to JLCPCB production boards: real
+  resist pigments and opacity (black is a matte, nearly opaque black; green
+  shows the copper pattern), natural FR4 at the edges, white legend ink (black
+  on white resist), bare copper under the resist and the plating finish only on
+  exposed copper — ENIG/ENEPIG gold, OSP copper, immersion silver/tin, and HASL
+  when the stackup names no finish. A **KiCad 3D viewer** style reproduces
+  KiCad's own palettes and rules exactly. Custom `#RRGGBB(AA)` colors are kept
+  exactly; each layer can switch to the PCB editor theme color or a custom one.
 - **KiCad-style rendering.** KiCad's OpenGL material model and light rig, its
   background gradient, smooth shading on round holes, vias and board edges, and
-  fast antialiasing while moving with 16× accumulated antialiasing as soon as the
-  view is still.
+  fast antialiasing while moving and 32× accumulated antialiasing (shown
+  progressively) as soon as the view is still.
 - **Everything at once.** A newly opened board appears complete — every layer
   plus the STEP/VRML footprint models — instead of loading in stages.
 - **Fast.** Copper layers of large boards mesh in parallel worker processes,
@@ -39,8 +43,11 @@ physical copper, dielectric, solder-mask, silkscreen and paste layers.
 - **Inspection tools.** Per-layer visibility, opacity and color; layer search
   and solo; Copper / Stackup / X-ray / Vias presets; X/Y/Z cross-sections;
   point-to-point measurement; KiCad-style arcball rotation and axis snapping.
-- **Optional path tracing.** Progressive GPU ray tracing (Mitsuba, NVIDIA
-  CUDA/OptiX) with denoising, and ray-traced PNG export at any resolution.
+- **Real-time path tracing.** Live GPU ray tracing (Mitsuba, NVIDIA
+  CUDA/OptiX) stays ray traced while you orbit, pan and zoom — denoised frames
+  at an adaptive resolution, about 30 fps on a 3-million-triangle board — and
+  refines progressively at full resolution once the view rests. Ray-traced PNG
+  export at any resolution.
 - **Read-only.** The plugin never saves, refills or edits the board.
 
 | Assembled | X-ray with via barrels |
@@ -93,7 +100,7 @@ Then use **Layer View — Exploded PCB** on the PCB editor toolbar or under
 | Read | Live boards are read over the IPC API; a content-checked cache skips re-reading saved boards. |
 | Mesh | Each copper layer is a union of tracks, pads and zones minus drill holes, triangulated with exact boundary vertices. Large boards mesh copper in worker processes started while the board is being read; dielectrics, mask and silk mesh in parallel threads. |
 | Reuse | Every layer has a geometry signature; unchanged layers keep their meshes and GPU buffers on live edits and are restored from the on-disk cache in later sessions. |
-| Draw | OpenGL with exact transparency (depth peeling), FXAA while moving and accumulated 16× antialiasing when still. |
+| Draw | OpenGL with exact transparency (depth peeling), FXAA while moving and accumulated 32× antialiasing when still; or live path tracing with GPU tone mapping. |
 
 Caches live outside your projects (`%LOCALAPPDATA%/KiCadLayerViewer/` on
 Windows) and are size-bounded. Override them with `LAYER_VIEW_CACHE_DIR`,

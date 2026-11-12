@@ -14,6 +14,9 @@ from layer_viewer.finishes import material_appearance, saved_color_names
 from layer_viewer.geometry import build_scene
 from layer_viewer.model import demo_snapshot, load_snapshot, save_snapshot
 
+# These tests pin KiCad's own 3D-viewer material rules.
+pytestmark = pytest.mark.usefixtures("kicad_style")
+
 
 @pytest.mark.parametrize('kind,name,expected', [
     ('mask', 'Black', (11/255, 11/255, 11/255, .83)),

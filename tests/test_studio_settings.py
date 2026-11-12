@@ -1,3 +1,4 @@
+import pytest
 """Light/material configuration checks: no renderer, window, GPU or ray tracing."""
 from types import SimpleNamespace
 
@@ -5,6 +6,9 @@ import numpy as np
 
 from layer_viewer.finishes import ENIG_COLOR, apply_surface_finish
 from layer_viewer.progressive_raytrace import _material, _studio_environment
+
+# These tests pin KiCad's own 3D-viewer material rules.
+pytestmark = pytest.mark.usefixtures("kicad_style")
 
 
 def test_overhead_studio_keeps_contact_lighting_neutral_and_balanced():

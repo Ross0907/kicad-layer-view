@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.0
+
+Real-time ray tracing
+- Live ray tracing stays ray traced while the view moves: each camera change
+  is path traced at a reduced, adaptive resolution with one denoised sample
+  (about 30 fps on a 3-million-triangle board), keeping the last frame on
+  screen, then refines at full native resolution once the view rests.
+- Camera moves update the sensor in place, reusing the film, the OptiX
+  denoiser and compiled kernels (camera update 17 ms → 1 ms).
+- Tone mapping, compositing and sRGB encoding run on the GPU; only the
+  finished 8-bit image is read back (display 60–90 ms → 7 ms per frame).
+
+Realistic materials (new default; KiCad's exact style remains selectable)
+- Solder resist uses real pigments and opacity referenced to JLCPCB boards:
+  black is a matte, nearly opaque black, green shows the copper pattern,
+  white is dense; matte resists scatter more in the ray tracer.
+- Copper under the resist is bare copper and only exposed copper carries the
+  plating finish, in the viewport (per face, from the exact mask coverage) and
+  in the ray tracer. No finish named in the stackup means HASL.
+- Unspecified board cores are natural FR4 instead of black; legend ink is
+  white, or black on white/yellow resist.
+- "Material colors" in Render settings switches between Realistic and KiCad
+  3D viewer styles without rebuilding any mesh.
+
+Loading and quality
+- The board is read from KiCad while the 3D window starts, and worker
+  processes are only started for boards large enough to benefit.
+- Polygons with many holes (ground pours) are split into tiles for
+  triangulation; seams are re-joined exactly, keeping every mesh watertight.
+  Hole unions skip work when no holes overlap.
+- Still-view antialiasing accumulates 32 jittered frames, starts sooner and
+  shows the partial result after 8.
+
 ## 0.5.0
 
 Loading and meshing

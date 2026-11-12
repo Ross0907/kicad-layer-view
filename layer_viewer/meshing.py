@@ -72,6 +72,22 @@ def polygon_union(geometries):
     return shapely.union_all([p for geom in geometries for p in iter_polygons(geom)])
 
 
+def disjoint_union(geometries):
+    """Union of shapes that usually do not touch (drill holes): exact and fast.
+
+    When no two polygons intersect, their union is simply the MultiPolygon of
+    them, which avoids GEOS's cascaded union entirely. Otherwise fall back.
+    """
+    polygons = [p for geom in geometries for p in iter_polygons(geom)]
+    if len(polygons) < 2:
+        return shapely.union_all(polygons)
+    tree = shapely.STRtree(polygons)
+    first, second = tree.query(polygons, predicate="intersects")
+    if np.any(first != second):
+        return shapely.union_all(polygons)
+    return shapely.multipolygons(polygons)
+
+
 def _triangulate_geos(geom: BaseGeometry) -> Tuple[np.ndarray, np.ndarray]:
     """Constrained Delaunay triangulation of a (multi)polygon.
 
@@ -111,7 +127,7 @@ def _weld(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return ordered[keep], inverse
 
 
-def conform(points, triangles, labels=None, groups=None):
+def conform(points, triangles, labels=None, groups=None, seams=None):
     """Remove T-junctions: split any triangle whose edge passes over a vertex.
 
     Earcut may leave an edge running exactly through a vertex that other
@@ -124,6 +140,8 @@ def conform(points, triangles, labels=None, groups=None):
     Every boundary vertex lying exactly on such an edge splits its triangle, so
     shape and area are unchanged. ``groups`` gives each vertex's polygon/island:
     separate islands may touch at a point and must never be stitched together.
+    ``seams`` marks vertices made by cutting a polygon into tiles: they can
+    sit on any loose edge, short or diagonal, so edges near them are checked too.
     Returns ``(triangles, labels)``; ``labels`` follow their triangle.
     """
     triangles = np.asarray(triangles, dtype=np.int64).reshape(-1, 3).copy()
@@ -132,7 +150,7 @@ def conform(points, triangles, labels=None, groups=None):
     p0, p1, p2 = points[triangles[:, 0]], points[triangles[:, 1]], points[triangles[:, 2]]
     clockwise = ((p1[:, 0]-p0[:, 0])*(p2[:, 1]-p0[:, 1]) - (p1[:, 1]-p0[:, 1])*(p2[:, 0]-p0[:, 0])) < 0
     triangles[clockwise] = triangles[clockwise][:, ::-1]
-    for _ in range(4):
+    for _ in range(64):  # until conforming; each round splits a triangle once
         size = len(triangles)
         if not size:
             break
@@ -153,7 +171,12 @@ def conform(points, triangles, labels=None, groups=None):
         span = b - a
         axis_aligned = (span[:, 0] == 0) | (span[:, 1] == 0)
         # Curves are short facets; only straight artwork edges can hide a vertex.
-        selected = np.flatnonzero(axis_aligned | (np.einsum("ij,ij->i", span, span) > LONG_EDGE_MM ** 2))
+        wanted = axis_aligned | (np.einsum("ij,ij->i", span, span) > LONG_EDGE_MM ** 2)
+        if seams is not None and seams.any():
+            lo, hi = np.minimum(a, b), np.maximum(a, b)
+            boxes = shapely.STRtree(shapely.box(lo[:, 0], lo[:, 1], hi[:, 0], hi[:, 1]))
+            wanted[boxes.query(shapely.points(points[seams]), predicate="intersects")[1]] = True
+        selected = np.flatnonzero(wanted)
         if not len(selected):
             break
         vertices = np.unique(np.concatenate([start, end]))
@@ -165,8 +188,14 @@ def conform(points, triangles, labels=None, groups=None):
         offset = points[hit] - a[edge]
         direction = span[edge]
         along = np.einsum("ij,ij->i", offset, direction)
-        interior = ((direction[:, 0] * offset[:, 1] - direction[:, 1] * offset[:, 0] == 0)
-                    & (along > 0) & (along < np.einsum("ij,ij->i", direction, direction)))
+        cross = direction[:, 0] * offset[:, 1] - direction[:, 1] * offset[:, 0]
+        length2 = np.einsum("ij,ij->i", direction, direction)
+        on_line = cross == 0
+        if seams is not None:
+            # Seam vertices were snapped onto the cut and may sit an ulp off
+            # the edge they split (well under a nanometre).
+            on_line |= seams[hit] & (cross * cross <= 1e-24 * length2 * length2)
+        interior = on_line & (along > 0) & (along < length2)
         # Leave slivers alone: when a triangle's own apex already lies along its
         # loose edge, that edge is the flattened outline, not a hidden junction.
         apex = points[triangles[loose % size].sum(axis=1) - start - end] - a
@@ -223,46 +252,111 @@ def _outline_matches(points, triangles, cross, perimeter):
                         rel_tol=1e-9, abs_tol=1e-9)
 
 
+# Earcut bridges every hole into the outline, which gets slow with hundreds of
+# holes (a ground pour around every via). Larger polygons are split first.
+EARCUT_HOLE_LIMIT = 48
+
+
+def _split_for_earcut(polygon, cuts):
+    """Split a polygon with many holes into pieces with few holes each.
+
+    Cuts are axis-aligned; each is recorded in ``cuts`` as (axis, value) so the
+    seam vertices can be snapped exactly onto the cut line afterwards.
+    """
+    holes = polygon.interiors
+    if len(holes) <= EARCUT_HOLE_LIMIT:
+        return [polygon]
+    minx, miny, maxx, maxy = polygon.bounds
+    centers = np.array([ring.coords[0] for ring in holes])
+    axis = 0 if maxx - minx >= maxy - miny else 1
+    cut = float(np.median(centers[:, axis]))
+    cuts.append((axis, cut))
+    pad = 1. + max(maxx - minx, maxy - miny)
+    half = (shapely.box(minx - pad, miny - pad, cut, maxy + pad) if axis == 0
+            else shapely.box(minx - pad, miny - pad, maxx + pad, cut))
+    parts = [p for side in (shapely.intersection(polygon, half), shapely.difference(polygon, half))
+             for p in iter_polygons(side)]
+    if len(parts) < 2 or any(len(p.interiors) >= len(holes) for p in parts):
+        return [polygon]  # no progress (degenerate cut); earcut copes, just slower
+    return [tile for part in parts for tile in _split_for_earcut(part, cuts)]
+
+
+def _earcut_polygon(polygon):
+    """Earcut one polygon exactly, falling back to GEOS when earcut is unsure."""
+    import mapbox_earcut
+    rings = [np.asarray(ring.coords, dtype=np.float64)[:-1]
+             for ring in (polygon.exterior, *polygon.interiors)]
+    points = np.concatenate(rings)
+    ends = np.cumsum([len(ring) for ring in rings], dtype=np.uint32)
+    triangles = mapbox_earcut.triangulate_float64(points, ends).reshape(-1, 3)
+    points, inverse = _weld(points)
+    triangles = inverse[triangles]
+    a, b, c = points[triangles[:, 0]], points[triangles[:, 1]], points[triangles[:, 2]]
+    cross = (b[:, 0]-a[:, 0])*(c[:, 1]-a[:, 1]) - (b[:, 1]-a[:, 1])*(c[:, 0]-a[:, 0])
+    # A zero-area triangle means earcut met (nearly) collinear vertices;
+    # removing it would leave a T-junction that a float-exact repair cannot
+    # always see, so use the constrained triangulation for that polygon.
+    degenerate = bool((cross == 0).any())
+    triangles = triangles[cross != 0]
+    if not math.isclose(float(np.abs(cross).sum()) / 2, polygon.area, rel_tol=1e-9, abs_tol=1e-9) or (
+            degenerate and not _outline_matches(points, triangles, cross[cross != 0], polygon.length)):
+        points, triangles = _triangulate_geos(polygon)
+    return points, triangles
+
+
 def triangulate(geom: BaseGeometry, conforming: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """Triangulate exact boundary vertices, avoiding costly Delaunay refinement.
 
-    Earcut handles holes using the same full-detail polygon rings. Every result
-    is checked against the polygon area; exceptional shapes use GEOS instead.
-    Vertices are welded exactly, without coordinate rounding or simplification,
-    and the result is conforming: no triangle edge passes over another vertex.
+    Earcut handles holes using the same full-detail polygon rings; polygons
+    with many holes are first split into tiles. Every result is checked
+    against the polygon area; exceptional shapes use GEOS instead. Vertices
+    are welded exactly, without coordinate rounding or simplification, and the
+    result is conforming: no triangle edge passes over another vertex.
     """
-    import mapbox_earcut
-    vertices, indices, offset = [], [], 0
+    points, triangles, seams, groups = triangulate_tiles(geom)
+    if not conforming or not len(triangles):
+        return points, triangles
+    return points, conform(points, triangles, groups=groups, seams=seams)[0]
+
+
+def triangulate_tiles(geom: BaseGeometry):
+    """Non-conforming triangulation: ``(points, triangles, seams, groups)``.
+
+    ``seams`` marks vertices lying on a tile cut, ``groups`` gives each
+    vertex's polygon; both feed :func:`conform`.
+    """
+    vertices, indices, seam_masks, offset = [], [], [], 0
     for polygon in iter_polygons(geom):
-        rings = [np.asarray(ring.coords, dtype=np.float64)[:-1]
-                 for ring in (polygon.exterior, *polygon.interiors)]
-        points = np.concatenate(rings)
-        ends = np.cumsum([len(ring) for ring in rings], dtype=np.uint32)
-        triangles = mapbox_earcut.triangulate_float64(points, ends).reshape(-1, 3)
-        points, inverse = _weld(points)
-        triangles = inverse[triangles]
-        a, b, c = points[triangles[:, 0]], points[triangles[:, 1]], points[triangles[:, 2]]
-        cross = (b[:, 0]-a[:, 0])*(c[:, 1]-a[:, 1]) - (b[:, 1]-a[:, 1])*(c[:, 0]-a[:, 0])
-        # A zero-area triangle means earcut met (nearly) collinear vertices;
-        # removing it would leave a T-junction that a float-exact repair cannot
-        # always see, so use the constrained triangulation for that polygon.
-        degenerate = bool((cross == 0).any())
-        triangles = triangles[cross != 0]
-        if not math.isclose(float(np.abs(cross).sum()) / 2, polygon.area, rel_tol=1e-9, abs_tol=1e-9) or (
-                degenerate and not _outline_matches(points, triangles, cross[cross != 0], polygon.length)):
-            points, triangles = _triangulate_geos(polygon)
-        if not len(triangles):
+        cuts = []
+        tiles = [_earcut_polygon(tile) for tile in _split_for_earcut(polygon, cuts)]
+        tiles = [(p, t) for p, t in tiles if len(t)]
+        for p, _ in tiles:
+            # Intersection points on a seam can differ from the cut value by an
+            # ulp; put them exactly on it so the conforming pass can join the
+            # two sides (the shapes move by at most a nanometre).
+            for axis, value in cuts:
+                near = np.abs(p[:, axis] - value) <= 1e-9 * max(1., abs(value))
+                p[near, axis] = value
+        if not tiles:
             continue
+        if len(tiles) == 1:
+            points, triangles = tiles[0]
+        else:
+            # Weld the tiles of one polygon back together along their seams.
+            starts = np.cumsum([0] + [len(p) for p, _ in tiles[:-1]])
+            points, inverse = _weld(np.concatenate([p for p, _ in tiles]))
+            triangles = inverse[np.concatenate([t + start for (_, t), start in zip(tiles, starts)])]
+        seam = np.zeros(len(points), dtype=bool)
+        for axis, value in cuts:
+            seam |= points[:, axis] == value
         vertices.append(points)
         indices.append(triangles + offset)
+        seam_masks.append(seam)
         offset += len(points)
     if not indices:
-        return np.zeros((0, 2)), np.zeros((0, 3), dtype=np.int64)
-    points = np.concatenate(vertices)
-    if not conforming:
-        return points, np.concatenate(indices)
+        return np.zeros((0, 2)), np.zeros((0, 3), dtype=np.int64), np.zeros(0, dtype=bool), np.zeros(0, dtype=np.int64)
     groups = np.repeat(np.arange(len(vertices)), [len(chunk) for chunk in vertices])
-    return points, conform(points, np.concatenate(indices), groups=groups)[0]
+    return np.concatenate(vertices), np.concatenate(indices), np.concatenate(seam_masks), groups
 
 
 def slab_arrays(pts2: np.ndarray, tris: np.ndarray, z_bottom: float, thickness: float,
@@ -409,15 +503,16 @@ def coated_slab_arrays(geom: BaseGeometry, z_bottom: float, thickness: float,
         probe, hit = shapely.STRtree(islands).query(shapely.point_on_surface(pieces),
                                                      predicate="intersects")
         owner[probe[::-1]] = hit[::-1]  # first match wins for points on a shared vertex
-    points, triangles, labels, owners = [], [], [], []
+    points, triangles, labels, owners, seams = [], [], [], [], []
     offset = 0
     # Pieces of one partitioned island share boundary vertices; the conforming
     # pass after welding ties them together, so fast earcut serves every piece.
     for k in range(len(pieces)):
-        vertices, faces = triangulate(pieces[k], conforming=False)
+        vertices, faces, seam, _ = triangulate_tiles(pieces[k])
         if not len(faces):
             continue
         points.append(vertices)
+        seams.append(seam)
         triangles.append(faces + offset)
         labels.append(np.full(len(faces), piece_flags[k], dtype=np.uint8))
         owners.append(np.full(len(vertices), owner[k], dtype=np.int64))
@@ -435,7 +530,9 @@ def coated_slab_arrays(geom: BaseGeometry, z_bottom: float, thickness: float,
     inverse[order] = np.cumsum(keep) - 1
     faces, flags = inverse[np.concatenate(triangles)], np.concatenate(labels)
     valid = (faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2])
-    faces, flags = conform(ordered[keep], faces[valid], flags[valid], groups=ordered_island[keep])
+    seam = np.zeros(int(keep.sum()), dtype=bool)
+    seam[inverse[np.flatnonzero(np.concatenate(seams))]] = True
+    faces, flags = conform(ordered[keep], faces[valid], flags[valid], groups=ordered_island[keep], seams=seam)
     if not len(faces):
         return None
     points, triangles, normals, _ = slab_arrays(ordered[keep], faces, z_bottom, thickness, smooth)
@@ -491,7 +588,7 @@ def _track_shapes(tracks):
 
 def drilled_pad_holes(snapshot):
     """Union of every drilled pad hole; identical for all copper layers."""
-    return polygon_union(pad_hole(pad) for pad in snapshot.pads if min(pad.drill_mm) > 0)
+    return disjoint_union(pad_hole(pad) for pad in snapshot.pads if min(pad.drill_mm) > 0)
 
 
 def layer_inputs(snapshot, layer_id):
@@ -529,7 +626,7 @@ def copper_layer_geometry(layer_id, tracks, polys, vias, outline, pad_holes):
     if pad_holes is not None and not pad_holes.is_empty:
         holes.append(pad_holes)
     if holes:
-        geom = geom.difference(polygon_union(holes))
+        geom = geom.difference(disjoint_union(holes))
     if outline is not None and not outline.is_empty:
         geom = geom.intersection(outline)
     # Both boolean operations already return a unioned, valid polygonal result.
