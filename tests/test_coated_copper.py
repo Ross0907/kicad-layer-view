@@ -111,3 +111,69 @@ def test_small_scene_marks_outer_copper_and_caps_and_reuses_unchanged_inner_mesh
         if part.layer_id in {layer.id for layer in copper[1:-1]}:
             assert part.mesh is old_parts[part.key].mesh
 
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_tiled_pour_far_from_origin_stays_watertight_with_small_apertures(seed):
+    """Seam vertices sit an ulp off short arc facets at board coordinates."""
+    import shapely
+    from shapely.geometry import Point, box
+    from layer_viewer.meshing import coated_slab_arrays
+    rng = np.random.default_rng(seed)
+    x0, y0 = 283.12, 191.99
+    vias = [Point(x0 + rng.uniform(1, 39), y0 + rng.uniform(1, 29)).buffer(.15, 8) for _ in range(150)]
+    copper = box(x0, y0, x0 + 40, y0 + 30).difference(shapely.union_all(vias))
+    apertures = [Point(x0 + rng.uniform(1, 39), y0 + rng.uniform(1, 29)).buffer(.08, quad_segs=32)
+                 for _ in range(80)]
+    mask = box(x0 - 1, y0 - 1, x0 + 41, y0 + 31).difference(shapely.union_all(apertures))
+    points, triangles, _, _ = coated_slab_arrays(copper, 0., .035, {"F.Mask": mask})
+    # A T-junction still extrudes to a closed solid (with a stray internal
+    # wall), so check the cap triangulation: every open edge of the bottom cap
+    # must lie on the copper outline, and their total length is its perimeter.
+    count = len(points) // 2
+    caps = triangles[(triangles < count).all(axis=1)]
+    edges = np.concatenate([caps[:, [0, 1]], caps[:, [1, 2]], caps[:, [2, 0]]])
+    paired = set(map(tuple, edges.tolist()))
+    loose = np.array([edge for edge in edges.tolist() if (edge[1], edge[0]) not in paired])
+    a, b = points[loose[:, 0], :2], points[loose[:, 1], :2]
+    assert np.hypot(*(b - a).T).sum() == pytest.approx(copper.length, rel=1e-9)
+
+
+def test_tiled_triangulation_welds_seams_where_geos_crossings_differ_by_an_ulp():
+    """Replays a generated pour whose two tile sides disagreed by one ulp."""
+    import shapely
+    from shapely import affinity
+    from shapely.geometry import Point
+    from layer_viewer.meshing import triangulate
+    rng = np.random.default_rng(11)
+    for index in range(29):
+        outer = affinity.rotate(box(0, 0, rng.uniform(5, 30), rng.uniform(5, 30)), rng.uniform(0, 90))
+        holes = []
+        for _ in range(rng.integers(50, 400)):
+            minx, miny, maxx, maxy = outer.bounds
+            c = (rng.uniform(minx, maxx), rng.uniform(miny, maxy))
+            r = rng.uniform(.05, .4)
+            holes.append(Point(c).buffer(r, int(rng.integers(2, 9))) if rng.random() < .6
+                         else affinity.rotate(box(c[0]-r, c[1]-r/2, c[0]+r, c[1]+r/2),
+                                              rng.choice([0, 45, rng.uniform(0, 90)])))
+        geom = outer.difference(shapely.union_all(holes))
+        if rng.random() < .7:
+            minx, miny, maxx, maxy = geom.bounds
+            for _ in range(rng.integers(1, 12)):  # consume the same random stream
+                Point(rng.uniform(minx, maxx), rng.uniform(miny, maxy)).buffer(rng.uniform(.5, 4), 4)
+            continue
+        if index != 28:
+            continue
+        points, triangles = triangulate(geom)
+        a, b, c = points[triangles[:, 0]], points[triangles[:, 1]], points[triangles[:, 2]]
+        flip = ((b[:, 0]-a[:, 0])*(c[:, 1]-a[:, 1]) - (b[:, 1]-a[:, 1])*(c[:, 0]-a[:, 0])) < 0
+        oriented = triangles.copy()
+        oriented[flip] = oriented[flip][:, ::-1]
+        edges = np.concatenate([oriented[:, [0, 1]], oriented[:, [1, 2]], oriented[:, [2, 0]]])
+        paired = set(map(tuple, edges.tolist()))
+        assert len(paired) == len(edges)  # no overlapping duplicate edges
+        loose = np.array([e for e in edges.tolist() if (e[1], e[0]) not in paired])
+        length = np.hypot(*(points[loose[:, 1]] - points[loose[:, 0]]).T).sum()
+        assert length == pytest.approx(geom.length, rel=1e-9)
+        return
+    pytest.fail("generated case 28 was not the plain (unmasked) path")

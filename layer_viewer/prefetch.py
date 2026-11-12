@@ -18,6 +18,9 @@ _EMPTY = object()
 class _Recorder:
     """Progress sink for the background read; messages go to the log."""
 
+    def __init__(self, cancel):
+        self._cancel = cancel
+
     def info(self, message):
         log.info(message)
 
@@ -28,7 +31,8 @@ class _Recorder:
         log.debug(message)
 
     def check_cancel(self):
-        pass
+        if self._cancel.is_set():
+            raise RuntimeError("Early board read cancelled")
 
 
 class PrefetchedSource:
@@ -53,6 +57,7 @@ class PrefetchedSource:
 
 class Prefetch:
     def __init__(self):
+        self._cancel = threading.Event()
         self._thread = threading.Thread(target=self._run, name="layer-view-prefetch", daemon=True)
         self._source = None
         self._result = _EMPTY
@@ -62,9 +67,9 @@ class Prefetch:
         try:
             from .live_source import LiveBoardSource
             self._source = LiveBoardSource()
-            self._result = self._source.poll(progress=_Recorder())
+            self._result = self._source.poll(progress=_Recorder(self._cancel))
             snapshot = self._result
-            if snapshot is not None:
+            if snapshot is not None and not self._cancel.is_set():
                 # Large multi-layer boards mesh in worker processes; start them
                 # now so their start-up overlaps the window creation too.
                 from . import mesh_pool
@@ -76,8 +81,22 @@ class Prefetch:
             self._result = exc
 
     def take(self):
-        """Wait for the early read and return a source for the live worker."""
-        self._thread.join()
+        """Wait for the early read and return a source for the live worker.
+
+        The wait ends early when the calling worker thread is interrupted
+        (window closed, source switched); the read is then cancelled.
+        """
+        try:
+            from qtpy.QtCore import QThread
+            current = QThread.currentThread()
+        except Exception:  # noqa: BLE001 - plain threads simply wait
+            current = None
+        while self._thread.is_alive():
+            self._thread.join(.05)
+            if current is not None and current.isInterruptionRequested():
+                self._cancel.set()
+                from .live_source import LiveBoardSource
+                return LiveBoardSource()  # connects lazily; the worker is exiting
         if self._source is None:
             from .live_source import LiveBoardSource
             return LiveBoardSource()

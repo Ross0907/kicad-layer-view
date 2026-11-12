@@ -81,7 +81,9 @@ def test_viewport_shows_bare_copper_under_the_resist_and_finish_on_pads():
     part = SimpleNamespace(kind="copper", mesh=mesh)
     BoardViewport._apply_coated_copper(actor, part)
     assert actor.GetMapper().GetScalarVisibility()
-    rgb = np.asarray(mesh.cell_data["_layer_view_rgb"])
+    assert "_layer_view_rgb" not in mesh.cell_data  # the shared mesh is never modified
+    shown = pv.wrap(actor.GetMapper().GetInput())
+    rgb = np.asarray(shown.cell_data["_layer_view_rgb"])
     np.testing.assert_array_equal(rgb[:2], np.round(np.array([BARE_COPPER_COLOR] * 2) * 255))
     np.testing.assert_array_equal(rgb[2:], np.round(np.array([HASL_COLOR] * 2) * 255))
     # A custom layer color is uniform again.

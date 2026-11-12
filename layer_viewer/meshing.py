@@ -192,9 +192,11 @@ def conform(points, triangles, labels=None, groups=None, seams=None):
         length2 = np.einsum("ij,ij->i", direction, direction)
         on_line = cross == 0
         if seams is not None:
-            # Seam vertices were snapped onto the cut and may sit an ulp off
-            # the edge they split (well under a nanometre).
-            on_line |= seams[hit] & (cross * cross <= 1e-24 * length2 * length2)
+            # Seam vertices were snapped onto the cut and may sit an ulp of
+            # the board coordinate off the edge they split. Allow 1 nm of
+            # distance (cross / length) whatever the facet length: short arc
+            # facets are exactly where an edge-relative bound is too tight.
+            on_line |= seams[hit] & (cross * cross <= 1e-18 * length2)
         interior = on_line & (along > 0) & (along < length2)
         # Leave slivers alone: when a triangle's own apex already lies along its
         # loose edge, that edge is the flattened outline, not a hidden junction.
@@ -344,8 +346,23 @@ def triangulate_tiles(geom: BaseGeometry):
         else:
             # Weld the tiles of one polygon back together along their seams.
             starts = np.cumsum([0] + [len(p) for p, _ in tiles[:-1]])
-            points, inverse = _weld(np.concatenate([p for p, _ in tiles]))
+            stacked = np.concatenate([p for p, _ in tiles])
+            for axis, value in cuts:
+                # Both sides of a cut get their crossing points from separate
+                # GEOS operations, which can differ by an ulp along the cut.
+                # Merge seam vertices closer than 1 nm so the tiles weld.
+                on = np.flatnonzero(stacked[:, axis] == value)
+                if len(on) < 2:
+                    continue
+                along = stacked[on, 1 - axis]
+                order = np.argsort(along, kind="stable")
+                ordered = along[order]
+                start = np.concatenate([[True], np.diff(ordered) > 1e-9 * np.maximum(1., np.abs(ordered[1:]))])
+                stacked[on[order], 1 - axis] = ordered[start][np.cumsum(start) - 1]
+            points, inverse = _weld(stacked)
             triangles = inverse[np.concatenate([t + start for (_, t), start in zip(tiles, starts)])]
+            triangles = triangles[(triangles[:, 0] != triangles[:, 1]) & (triangles[:, 1] != triangles[:, 2])
+                                  & (triangles[:, 0] != triangles[:, 2])]
         seam = np.zeros(len(points), dtype=bool)
         for axis, value in cuts:
             seam |= points[:, axis] == value

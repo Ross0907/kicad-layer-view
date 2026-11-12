@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 # Fraction of the window resolution traced while the view moves. It adapts
 # between the limits to hold roughly MOTION_FRAME_S per frame on any GPU/board.
 MOTION_SCALE = .5
-MOTION_SCALE_LIMITS = (.25, .75)
+MOTION_SCALE_STEPS = (.25, .35, .5, .625, .75)
 MOTION_FRAME_S = 1 / 30
 MOTION_SAMPLES = 1
 # Refinement at full resolution starts once the view has rested this long.
@@ -362,11 +362,18 @@ class LiveRayController(QObject):
                    if info["denoised"] else "")
         if info.get("motion"):
             # Trade resolution for frame rate: pixel count scales with scale².
+            # Fixed steps with hysteresis: every size change rebuilds the
+            # sensor and denoisers, so the size must not drift frame to frame.
             seconds = float(info.get("seconds", MOTION_FRAME_S))
             if seconds > 0:
-                ratio = (MOTION_FRAME_S / seconds) ** .5
-                low, high = MOTION_SCALE_LIMITS
-                self.motion_scale = min(high, max(low, self.motion_scale * min(1.15, max(.7, ratio))))
+                wanted = self.motion_scale * (MOTION_FRAME_S / seconds) ** .5
+                steps = MOTION_SCALE_STEPS
+                index = min(range(len(steps)), key=lambda k: abs(steps[k] - self.motion_scale))
+                if wanted > steps[index] * 1.2 and index + 1 < len(steps):
+                    index += 1
+                elif wanted < steps[index] / 1.2 and index > 0:
+                    index -= 1
+                self.motion_scale = steps[index]
             self.status.emit(f"Live ray tracing · {info['backend']} · moving · "
                              f"{pixels.shape[1]}×{pixels.shape[0]} · {info['seconds']*1000:.0f} ms/frame")
             return

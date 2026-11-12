@@ -547,6 +547,9 @@ class MainWindow(QMainWindow):
     def loaded(self, snapshot, scene):
         if not self._current_worker_signal():
             return
+        # A worker may have resolved colors before the material style changed.
+        from .finishes import apply_surface_finish
+        scene = apply_surface_finish(scene, snapshot)
         from .live_worker import board_identity
         preserve = (self.snapshot is not None and board_identity(snapshot) == board_identity(self.snapshot)
                     and (self.source[0] == "ipc" or snapshot is self.snapshot))
@@ -708,6 +711,8 @@ class MainWindow(QMainWindow):
                 self._ensure_components()
 
     def _refresh_extra_scene(self, scene):
+        from .finishes import apply_surface_finish
+        scene = apply_surface_finish(scene, self.snapshot)
         previous = self.layer_controls()
         self.scene = scene
         self.viewport.set_scene(scene, self.snapshot,

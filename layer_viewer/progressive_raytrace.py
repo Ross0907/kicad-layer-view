@@ -658,6 +658,10 @@ class ProgressiveRayTracer:
             self._denoiser = None
             self._guides = None
             self._display_buffer = None
+            self._gpu_buffer = None
+            self._fast_denoiser = (None,)
+            self._sensor_params = None
+            self._sensor_kind = None
             self._bloom_buffer = None
             self.sensor = None
             self.scene = None

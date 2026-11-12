@@ -277,6 +277,8 @@ class BoardViewport(QWidget):
                 if self.parts[part.key].mesh is not part.mesh:
                     self.actors[part.key].mapper.dataset = part.mesh
                 self.parts[part.key] = part
+                if part.kind == "copper":
+                    BoardViewport._apply_coated_copper(self.actors[part.key], part)
                 if part.kind in ("barrel", "fill", "plug"):
                     # These have no layer-color row to refresh their actor.
                     # Reuse its geometry while following live finish changes.
@@ -374,6 +376,8 @@ class BoardViewport(QWidget):
         one uniform color. The exact per-face coverage comes from meshing.
         """
         from .finishes import covered_copper_color
+        if not hasattr(actor, "GetMapper"):
+            return
         mapper = actor.GetMapper()
         mesh = part.mesh
         names = [name for name in ("coat:F.Mask", "coat:B.Mask") if name in mesh.cell_data]
@@ -381,6 +385,8 @@ class BoardViewport(QWidget):
         under = covered_copper_color(color)
         if part.kind != "copper" or not names or np.allclose(under, color, atol=1e-6):
             mapper.ScalarVisibilityOff()
+            if mapper.GetInput() is not None and mapper.GetInput() is not mesh:
+                mapper.SetInputData(mesh)
             return
         covered = np.zeros(mesh.n_cells, dtype=bool)
         for name in names:
@@ -391,8 +397,13 @@ class BoardViewport(QWidget):
         from vtkmodules.util.numpy_support import numpy_to_vtk
         array = numpy_to_vtk(rgb, deep=True)
         array.SetName("_layer_view_rgb")
-        # Added, not made active: ray capture and caches read only coat:* tags.
-        mesh.GetCellData().AddArray(array)
+        # Display-only colors live on a per-actor shallow copy: part.mesh is
+        # shared with cache writers and live workers on other threads.
+        display = mapper.GetInput()
+        if display is None or display is mesh or display.GetCellData() is mesh.GetCellData():
+            display = mesh.copy(deep=False)
+            mapper.SetInputData(display)
+        display.GetCellData().AddArray(array)
         mapper.SetScalarModeToUseCellFieldData()
         mapper.SelectColorArray("_layer_view_rgb")
         mapper.SetColorModeToDirectScalars()

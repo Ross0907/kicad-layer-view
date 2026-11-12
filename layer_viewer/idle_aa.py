@@ -160,7 +160,7 @@ class IdleAntialiaser(QObject):
                 # Far-zoomed boards are mostly sub-pixel detail; show the
                 # partial average now instead of waiting for every sample.
                 self._show(np.ascontiguousarray(np.clip(self._sum / self._count + .5, 0, 255)
-                                                .astype(np.uint8)))
+                                                .astype(np.uint8)), final=False)
             self.step_timer.start()
             return
         # Leave the real framebuffer on the unshifted view under the overlay.
@@ -172,10 +172,11 @@ class IdleAntialiaser(QObject):
         self._show(np.ascontiguousarray(np.clip(self._sum / self._count + .5, 0, 255).astype(np.uint8)))
         self._sum = None
 
-    def _show(self, pixels):
+    def _show(self, pixels, final=True):
         height, width, _ = pixels.shape
         picture = QImage(pixels.data, width, height, pixels.strides[0], QImage.Format_RGB888).copy()
-        self.image = picture
+        # Screenshots use self.image as the finished refined frame.
+        self.image = picture if final else None
         rect = self.viewport.plotter.interactor.rect()
         self.overlay.setGeometry(rect)
         pixmap = QPixmap.fromImage(picture)
