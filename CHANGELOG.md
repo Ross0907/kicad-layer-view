@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.3
 
 - Viewport metals (plated copper, gold parts) are lit like KiCad's viewer, by
   the camera-attached lights, instead of a world-fixed reflection map: copper

@@ -1,3 +1,3 @@
 """Layer View: a read-only exploded PCB viewer for KiCad."""
 
-__version__ = "0.7.2"
+__version__ = "0.7.3"
