@@ -69,7 +69,7 @@ physical copper, dielectric, solder-mask, silkscreen and paste layers.
 
 ![Z cross-section sweeping down through the copper layers](docs/zcut.gif)
 
-*Cross-section → Z with Reverse cut, PCB editor colors and the dielectric hidden: the cut peels the
+*Cross-section → Z with Reverse cut, PCB editor colors, and dielectric and vias hidden: the cut peels the
 stack from the top, one copper layer at a time.*
 
 ## Requirements

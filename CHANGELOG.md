@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Ray tracing: the surface finish stays only in the resist openings when the
+  resist is exploded away, hidden or cut, as on a real board; covered copper
+  shows bare instead of fully plated.
+- README: the Z cross-section animation pivots smoothly from one diagonal
+  view to the other about the board centre, at a higher resolution, without
+  the via barrels.
+
 ## 0.7.4
 
 - Capped (POFV) vias are visible, as on real boards: resist over a cap is a

@@ -200,40 +200,20 @@ def _mask_surface(mesh, points, triangles, coverage=None):
     return triangles[keep], bool(np.any(orientation > 1e-15))
 
 
-def _coating_weights(mesh, coverage, masks):
-    """Activate covered-face scattering only under its assembled visible mask.
+def _coating_weights(mesh, coverage, masks=None):
+    """Per-face weight of the bare (unplated) copper under the solder resist.
 
-    Mask visibility, opacity, explosion and Z clipping are scene state, not
-    permanent geometry properties. A peeled mask must reveal ordinary metal.
-    ``masks`` contains the captured mask and whether an outward face survives
-    clipping. Dual-sided single-layer boards carry F/B coverage columns.
+    A fabricated board is plated only in the resist openings, so the finish
+    stays there whether the mask is shown, translucent, exploded away or
+    clipped: hiding the resist reveals bare copper, never a fully plated foil.
+    Dual-sided single-layer boards carry F/B coverage columns. ``masks`` is
+    accepted for callers but no longer changes the result.
     """
     if coverage is None or mesh.kind not in ("copper", "via_patch"):
         return None
     columns = coverage[:, None] if coverage.ndim == 1 else coverage
-    names = (mesh.coating_mask,) if coverage.ndim == 1 else ("F.Mask", "B.Mask")
-    weights = np.zeros(len(columns), dtype=np.float32)
-    inverse = np.linalg.inv(np.asarray(mesh.transform))
-    for index, name in enumerate(names):
-        if name not in masks:
-            continue
-        mask, outward_visible = masks[name]
-        if not outward_visible or mask.opacity <= 0:
-            continue
-        relative = inverse @ np.asarray(mask.transform)
-        if (not np.allclose(relative[:3, :3], np.eye(3), rtol=0, atol=1e-9)
-                or not np.allclose(relative[:2, 3], 0, rtol=0, atol=1e-6)):
-            continue
-        front = name == "F.Mask"
-        extreme = np.max if front else np.min
-        separation = float(extreme(mask.points[:, 2]) + relative[2, 3]
-                           - extreme(mesh.points[:, 2])) * (1 if front else -1)
-        # Kept local to this helper to avoid loading VTK in a render process.
-        # Geometry puts the 15 µm mask 1 µm beyond the outer copper face.
-        if not np.isclose(separation, .016, rtol=0, atol=1e-6):
-            continue
-        weights += columns[:, index] * min(1., max(0., mask.opacity) / .5)
-    return np.minimum(weights, 1.) if np.any(weights) else None
+    weights = np.minimum(np.asarray(columns, dtype=np.float32).sum(axis=1), 1.)
+    return weights if np.any(weights) else None
 
 
 def _studio_environment():

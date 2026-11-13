@@ -55,7 +55,7 @@ def _build(*parts):
 @pytest.mark.parametrize("state", (
     "assembled", "exploded", "hidden", "transparent", "quarter-opacity", "z-clipped",
 ))
-def test_coated_faces_activate_only_for_assembled_visible_optical_mask(side, state):
+def test_covered_faces_stay_unplated_in_every_mask_state(side, state):
     copper, mask = _board_side(side)
     if state == "exploded":
         transform = np.eye(4)
@@ -75,22 +75,19 @@ def test_coated_faces_activate_only_for_assembled_visible_optical_mask(side, sta
     assert np.array_equal(shape.parameters["faces"], copper.triangles.ravel())
     assert np.allclose(shape.parameters["vertex_positions"].reshape(-1, 3),
                        (copper.points - tracer.center) * tracer.scale)
-    if state in ("assembled", "quarter-opacity"):
-        arity, weights = shape.attributes["face_resist_coverage"]
-        strength = 1. if state == "assembled" else .5
-        assert arity == 1
-        assert np.array_equal(weights, copper.covered_faces * strength)
-        blend = shape.properties["bsdf"]["bsdf"]
-        assert blend["type"] == "blendbsdf"
-        assert blend["weight"] == {"type": "mesh_attribute", "name": "face_resist_coverage"}
-        assert blend["bsdf_0"] == _material(copper)["bsdf"]
-        assert blend["bsdf_0"]["metallic"] == 1.
-        assert blend["bsdf_0"]["roughness"] == .18
-        assert blend["bsdf_1"]["type"] == "diffuse"
-        assert blend["bsdf_1"]["reflectance"] == blend["bsdf_0"]["base_color"]
-    else:
-        assert not shape.attributes
-        assert shape.properties["bsdf"] == _material(copper)
+    # Plating follows the resist openings in every mask state: a peeled,
+    # exploded or hidden resist reveals bare copper, never a plated foil.
+    arity, weights = shape.attributes["face_resist_coverage"]
+    assert arity == 1
+    assert np.array_equal(weights, copper.covered_faces)
+    blend = shape.properties["bsdf"]["bsdf"]
+    assert blend["type"] == "blendbsdf"
+    assert blend["weight"] == {"type": "mesh_attribute", "name": "face_resist_coverage"}
+    assert blend["bsdf_0"] == _material(copper)["bsdf"]
+    assert blend["bsdf_0"]["metallic"] == 1.
+    assert blend["bsdf_0"]["roughness"] == .18
+    assert blend["bsdf_1"]["type"] == "diffuse"
+    assert blend["bsdf_1"]["reflectance"] == blend["bsdf_0"]["base_color"]
 
 
 @pytest.mark.parametrize("side", ("F.Mask", "B.Mask"))
@@ -113,23 +110,19 @@ def test_dual_coating_uploads_independent_front_and_back_strength_on_one_slab():
     tracer = _build(copper, front, back)
     shape = tracer.scene["part_0"]
     weights = shape.attributes["face_resist_coverage"][1]
-    assert np.array_equal(weights, .5 * copper.covered_faces + copper.back_covered_faces)
+    # Plating follows the resist openings, not the resist's display opacity.
+    assert np.array_equal(weights, np.minimum(copper.covered_faces + copper.back_covered_faces, 1))
     assert shape.triangle_count == 12
     assert sum(key.startswith("part_") for key in tracer.scene) == 3
 
 
-def test_common_world_transform_preserves_coating_but_relative_xy_shift_peels_it():
+def test_exploded_or_hidden_resist_still_leaves_covered_copper_unplated():
     copper, mask = _board_side("F.Mask")
-    transform = np.asarray(((0., 0., 1., 2.), (0., 1., 0., 3.),
-                            (-1., 0., 0., 4.), (0., 0., 0., 1.)))
-    copper = replace(copper, transform=tuple(map(tuple, transform)))
-    mask = replace(mask, transform=copper.transform)
-    assert np.array_equal(_coating_weights(copper, copper.covered_faces, {mask.name: (mask, True)}),
-                          copper.covered_faces)
-    shifted = transform @ np.asarray(((1., 0., 0., 1.), (0., 1., 0., 0.),
-                                      (0., 0., 1., 0.), (0., 0., 0., 1.)))
-    mask = replace(mask, transform=tuple(map(tuple, shifted)))
-    assert _coating_weights(copper, copper.covered_faces, {mask.name: (mask, True)}) is None
+    shifted = np.asarray(copper.transform) @ np.asarray(((1., 0., 0., 0.), (0., 1., 0., 0.),
+                                                       (0., 0., 1., 3.), (0., 0., 0., 1.)))
+    exploded = replace(mask, transform=tuple(map(tuple, shifted)))
+    for masks in ({mask.name: (mask, True)}, {exploded.name: (exploded, True)}, {}):
+        assert np.array_equal(_coating_weights(copper, copper.covered_faces, masks), copper.covered_faces)
 
 
 def test_component_gold_and_native_sensor_dimensions_are_preserved():
