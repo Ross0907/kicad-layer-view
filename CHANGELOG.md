@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.2
 
 - Realistic style: inner copper layers are bare copper, the same color as
   copper under the outer resist; only exposed outer copper shows the plated
