@@ -92,6 +92,9 @@ HASL_COLOR = _rgb(0xea, 0xea, 0xe5)         # pcb2blender HASL
 # pcb2blender's ENIG #efdfbb reads as pale cream under image-based lighting;
 # immersion gold is a saturated warm yellow (gold F0 ~ (1, .77, .34) linear).
 REAL_ENIG_COLOR = _rgb(0xe8, 0xc4, 0x6c)
+# Gold/brass model parts (SMA bodies, gold pins): a deeper gold, since a
+# lighter swatch washes out to beige as an environment-lit metal.
+GOLD_PART_COLOR = _rgb(0xd9, 0xae, 0x55)
 REAL_SILVER_COLOR = _rgb(0xe7, 0xe5, 0xe1)
 REAL_TIN_COLOR = _rgb(0xcb, 0xca, 0xc0)
 SOLDER_COLOR = _rgb(0xaa, 0xaa, 0xa6)       # pcb2blender solder
@@ -262,7 +265,14 @@ def finish_appearance(name, style=None):
     return DEFAULT_FINISH_COLOR, .26
 
 
-_REALISTIC_FINISHES = (HASL_COLOR, REAL_ENIG_COLOR, REAL_SILVER_COLOR, REAL_TIN_COLOR, BARE_COPPER_COLOR)
+# Bare copper (inner foils) is the same environment-lit metal as the outer
+# copper, so every layer of the stack shows one consistent copper.
+_REALISTIC_FINISHES = (HASL_COLOR, REAL_ENIG_COLOR, REAL_SILVER_COLOR, REAL_TIN_COLOR, BARE_COPPER_COLOR,
+                       COVERED_COPPER_COLOR)
+
+
+def _same(rgb, swatch):
+    return tuple(round(float(v), 6) for v in rgb[:3]) == tuple(round(v, 6) for v in swatch)
 
 
 def is_realistic_metal(rgb):
@@ -278,7 +288,7 @@ def covered_copper_color(rgb):
     plated where copper is exposed). KiCad finishes and custom colors stay.
     Decided from the color itself, so separate render processes agree.
     """
-    if is_realistic_metal(rgb):
+    if is_realistic_metal(rgb) or _same(rgb, COVERED_COPPER_COLOR):
         return COVERED_COPPER_COLOR
     return tuple(float(v) for v in rgb[:3])
 
@@ -295,8 +305,10 @@ def ray_metal_color(rgb):
 def apply_surface_finish(scene, snapshot, style=None):
     """Re-derive every material color from the stackup on new or reused meshes.
 
-    All conductors (foils, barrels, cap patches) use the board finish, as one
-    consistent viewing convention for the exploded stack. Every dielectric slab
+    Conductors (foils, barrels, cap patches) use the board finish. In the
+    realistic style inner foils are bare copper, the same color as copper
+    under the outer resist: only exposed outer copper is plated, so every
+    layer of the exploded stack shows one consistent copper. Every dielectric slab
     shows KiCad's blended board-body color. UI custom/editor colors live on
     actors and remain separate. Part records are replaced so an earlier scene
     stays immutable.
@@ -307,9 +319,14 @@ def apply_surface_finish(scene, snapshot, style=None):
     stackup_colors = getattr(stackup, "colors", {})
     body = board_body_color((getattr(layer, "color", "") for layer in getattr(stackup, "dielectrics", ())),
                             style)
+    copper_ids = [layer.id for layer in getattr(stackup, "copper", ())]
+    outer_ids = {copper_ids[0], copper_ids[-1]} if copper_ids else set()
+    inner_bare = style == "realistic"
     parts = []
     for part in scene.parts:
-        if part.kind == "dielectric":
+        if part.kind == "copper" and inner_bare and outer_ids and part.layer_id not in outer_ids:
+            parts.append(replace(part, color=COVERED_COPPER_COLOR, metallic=1., roughness=plated_roughness))
+        elif part.kind == "dielectric":
             parts.append(replace(part, color=body[:3], opacity=body[3]))
         elif part.kind in STACKUP_KINDS:
             context = None

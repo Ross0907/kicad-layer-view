@@ -81,7 +81,13 @@ def _material(mesh, *, coated=False):
         opaque = {"type": "principled", "base_color": metal, "metallic": 1.,
                   "roughness": mesh.roughness if mesh.roughness is not None else
                               (.32 if mesh.kind == "via_patch" else .22)}
-        if coated:
+        from .finishes import COVERED_COPPER_COLOR
+        if tuple(round(float(v), 6) for v in mesh.color[:3]) == tuple(round(v, 6) for v in COVERED_COPPER_COLOR):
+            # Inner foils are bare copper laminated in the board: shade them
+            # exactly like resist-covered outer copper so all layers match.
+            opaque = {"type": "diffuse", "reflectance": {"type": "rgb",
+                      "value": _linear(COVERED_COPPER_COLOR).tolist()}}
+        elif coated:
             # The exact covered faces use an effective scattering substrate.
             # A polished conductor under our straight-through pigment filter
             # reflected dark component silhouettes as detached "shadows".

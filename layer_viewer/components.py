@@ -90,7 +90,13 @@ def metal_display_color(color):
 
     KiCad library material colors (PIN-01 tin, PIN-02 gold, MET-*) were
     authored as linear reflectance; shown as sRGB they read as dull paint.
+    Gold/brass parts (SMA bodies, gold pins) keep the plated gold of the board
+    finish: the sRGB lift turned them pale cream, which reads as silver once
+    lit as metal.
     """
+    if _is_gold(color):
+        from .finishes import GOLD_PART_COLOR
+        return tuple(float(v) for v in GOLD_PART_COLOR)
     return tuple(float(1.055 * max(0., v) ** (1 / 2.4) - .055 if v > .0031308 else 12.92 * v)
                  for v in color[:3])
 

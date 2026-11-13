@@ -17,11 +17,12 @@ def test_plated_connector_grey_is_metal_but_dark_and_tinted_bodies_are_not():
 
 
 def test_metal_colors_are_shown_like_pcb2blender_library_pins():
-    # KiCad PIN-01 / PIN-02 as pcb2blender's pins_silver #eaeae5 / pins_gold #efdfbb.
+    # KiCad PIN-01 as pcb2blender's pins_silver #eaeae5; PIN-02 gold (SMA bodies,
+    # gold pins) as the board's plated gold, not a pale cream that reads silver.
     silver = np.round(np.array(metal_display_color((.824, .820, .781))) * 255)
     gold = np.round(np.array(metal_display_color((.859, .738, .496))) * 255)
     np.testing.assert_allclose(silver, (0xea, 0xea, 0xe5), atol=1)
-    np.testing.assert_allclose(gold, (0xef, 0xdf, 0xbb), atol=1)
+    np.testing.assert_allclose(gold, (0xd9, 0xae, 0x55), atol=1)
 
 
 def _snapshot(models, mounting="smd", dnp=False, pos=False, side="top"):

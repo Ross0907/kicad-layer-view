@@ -57,11 +57,15 @@ physical copper, dielectric, solder-mask, silkscreen and paste layers.
 
 ![Ray-traced render](docs/raytraced.png)
 
-*Ray-traced export: ENIG pads, two-tone green resist, metal SMA connectors.*
+*Ray-traced export: ENIG pads, two-tone green resist, gold SMA connectors.*
 
-| Assembled | X-ray, vias extended through the layers |
+| Exploded, from the side | Assembled |
 |---|---|
-| ![Assembled](docs/assembled.png) | ![X-ray](docs/xray.png) |
+| ![Exploded side view](docs/exploded_side.png) | ![Assembled](docs/assembled.png) |
+
+![X-ray, vias extended through the layers](docs/xray.png)
+
+*X-ray: copper and barrels only, with via connections extended through the layer gaps.*
 
 ## Requirements
 

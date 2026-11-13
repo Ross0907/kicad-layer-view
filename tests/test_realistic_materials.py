@@ -85,7 +85,14 @@ def test_switching_style_recolors_without_remeshing():
             assert before.mesh is after.mesh
         masks = [p for p in real.parts if p.kind == "mask"]
         assert masks and all(p.roughness is not None for p in masks)
-        assert {p.color for p in real.parts if p.kind == "copper"} == {HASL_COLOR}
+        ids = [layer.id for layer in snapshot.stackup.copper]
+        outer = {ids[0], ids[-1]}
+        copper = [p for p in real.parts if p.kind == "copper"]
+        assert {p.color for p in copper if p.layer_id in outer} == {HASL_COLOR}
+        # Only exposed outer copper is plated: inner foils are bare copper,
+        # matching copper under the outer resist.
+        inner = {p.color for p in copper if p.layer_id not in outer}
+        assert inner <= {COVERED_COPPER_COLOR}
     finally:
         finishes.set_style("realistic")
 
