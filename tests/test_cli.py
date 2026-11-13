@@ -127,3 +127,14 @@ print(json.dumps(dict(clean_exit=True,close_seconds=time.monotonic()-closed[0],h
     details = json.loads(result.stdout.strip().splitlines()[-1])
     assert details['clean_exit'] and details['close_seconds'] < 3
     assert 'QThread: Destroyed' not in result.stderr
+
+
+def test_pyvista_start_up_defers_pyplot_until_it_is_used():
+    code = ("import sys; from layer_viewer.__main__ import defer_pyplot; defer_pyplot(); "
+            "import pyvista; assert 'matplotlib.figure' not in sys.modules; "
+            "import matplotlib.pyplot as plt; assert plt.rcParams['axes.prop_cycle']; "
+            "assert 'matplotlib.figure' in sys.modules")
+    environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    result = subprocess.run([sys.executable, "-c", code], env=environment, capture_output=True, text=True,
+                            timeout=120)
+    assert result.returncode == 0, result.stderr

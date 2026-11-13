@@ -463,7 +463,8 @@ def main(argv=None):
     if before != after:
         raise RuntimeError("Board changed while it was being read; retry after saving the editor")
     output.parent.mkdir(parents=True, exist_ok=True)
-    save_snapshot(snapshot, output)
+    # A hand-over file for the viewer (and its source cache): favor speed.
+    save_snapshot(snapshot, output, compresslevel=1)
     print(json.dumps({"output": str(output), "source_sha256": before,
                       "source_unchanged": before == after,
                       "seconds": round(time.monotonic()-started, 2),

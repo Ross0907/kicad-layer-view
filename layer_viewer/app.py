@@ -149,10 +149,18 @@ class LoadWorker(QThread):
                 snapshot = extract_from_kicad(progress=self)
             self.check_cancel()
             self.info("Checking cached geometry…")
+
+            def preview(stale):
+                # The board changed since its last view: show that view now.
+                self.elapsed = time.perf_counter() - started
+                self.cache_hit, self.reused_count = False, 0
+                log.info("Last view shown in %.2fs while changed layers rebuild", self.elapsed)
+                self.ready.emit(snapshot, stale)
+
             # One complete scene: all layers and 3D models appear together.
             scene, cached = load_complete_scene(
                 snapshot, via_details=self.via_details, components=self.components, progress=self,
-                known_component_signature=self.known_component_signature)
+                known_component_signature=self.known_component_signature, preview=preview)
             self.check_cancel()
             self.elapsed = time.perf_counter() - started
             self.cache_hit = cached
@@ -628,7 +636,9 @@ class MainWindow(QMainWindow):
             source = f"{getattr(self.worker, 'reused_count', 0)}/{len(scene.parts)} meshes reused"
         self.statusBar().showMessage(f"Ready in {elapsed:.1f}s · {source} geometry · "
                                      "Drag: orbit · Middle/right: pan · Wheel: zoom · XYZ: snap")
-        if self._board_preview:
+        if getattr(scene, "_stale", False):
+            self.statusBar().showMessage(f"Last view shown in {elapsed:.1f}s · updating changed layers…")
+        elif self._board_preview:
             self.statusBar().showMessage(f"Board surface ready in {elapsed:.1f}s · preparing inner layers…")
         self._ensure_components()
         self.scene_ready.emit()
@@ -692,6 +702,10 @@ class MainWindow(QMainWindow):
             return
         if self._component_signature == self._component_loaded_signature:
             return
+        worker = self.worker
+        if (getattr(self.scene, "_stale", False) and worker is not None and worker.isRunning()
+                and getattr(worker, "components", False)):
+            return  # the load behind this stale preview is building these models
         if not any(footprint.models for footprint in self.snapshot.footprints):
             self._component_loaded_signature = self._component_signature
             return

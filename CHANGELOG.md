@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Faster loading. When a board has changed since it was last shown, its last
+  view (layers and 3D models) appears at once and the changed layers are
+  swapped in when they are rebuilt; the camera and layer controls stay put.
+- Opening a saved `.kicad_pcb` is quicker: the reader hands the board over
+  without deep-copying it and with fast compression (about 3 s less on a
+  10-layer board).
+- Outer copper, the longest mesh job, meshes its copper islands in parallel
+  (identical triangles), and large STEP models collect their faces faster.
+- PyVista's unused `matplotlib.pyplot` import is deferred at start-up.
+
 ## 0.7.3
 
 - Viewport metals (plated copper, gold parts) are lit like KiCad's viewer, by

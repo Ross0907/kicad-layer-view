@@ -1,6 +1,7 @@
 """Surface-first loading uses exact tiny CPU meshes, never a viewer or renderer."""
 from collections import Counter
 from copy import deepcopy
+from dataclasses import replace
 import json
 from threading import Lock
 
@@ -215,6 +216,67 @@ def test_complete_load_skips_models_already_shown_and_never_waits_for_them_on_er
         load_complete_scene(snapshot)
     assert time.monotonic() - begin < 2
     release.set()
+
+
+def test_edited_board_shows_last_cached_view_then_reuses_its_unchanged_meshes(cached_demo, monkeypatch):
+    from layer_viewer.loading import load_complete_scene
+    snapshot, full, _, file_keys = cached_demo
+    changed = deepcopy(snapshot)
+    changed.tracks[0].end = (13., 2.)
+    reference = geometry.build_scene(changed)
+    dirty = {f"copper:{changed.tracks[0].layer}", _side_mask(changed, changed.tracks[0].layer)}
+    reads, _ = track_reads(monkeypatch, file_keys)
+    monkeypatch.setattr(geometry, "dielectric_geometry", forbid_rebuild)
+    previews = []
+
+    def preview(stale):
+        # Shown before anything is meshed: exactly the old cached view.
+        assert stale._stale and stale._preview
+        assert_matches_requested(stale, full, set(full._geometry_signatures))
+        previews.append((stale, Counter(reads)))
+
+    final, hit = load_complete_scene(changed, via_details=True, components=False, preview=preview)
+    assert not hit and not getattr(final, "_stale", False)
+    assert len(previews) == 1
+    stale, reads_at_preview = previews[0]
+    assert reads_at_preview == Counter({key: 1 for key in parts(full)})
+    # The rebuild reads nothing again and reuses the preview's mesh objects.
+    assert Counter(reads) == reads_at_preview
+    assert_matches_requested(final, reference, set(reference._geometry_signatures))
+    for key, part in parts(final).items():
+        if key not in dirty:
+            assert part.mesh is parts(stale)[key].mesh
+
+
+def test_no_stale_preview_on_exact_hit_or_for_another_stackup(cached_demo, monkeypatch):
+    from layer_viewer.loading import load_complete_scene
+    snapshot, _, _, _ = cached_demo
+    calls = []
+    _, hit = load_complete_scene(snapshot, via_details=True, components=False, preview=calls.append)
+    assert hit and not calls
+    fewer = deepcopy(snapshot)
+    fewer.stackup.copper = fewer.stackup.copper[:2]
+    assert cache.load_stale_scene(fewer) is None
+    other = deepcopy(snapshot)
+    other.board_name = "Another PCB"
+    assert cache.load_stale_scene(other) is None
+
+
+def test_stale_preview_carries_models_that_are_ready_in_time(cached_demo, monkeypatch):
+    from layer_viewer import components
+    from layer_viewer.loading import load_complete_scene
+    from layer_viewer.model import Footprint, Model3D
+    snapshot, full, _, _ = cached_demo
+    changed = deepcopy(snapshot)
+    changed.tracks[0].end = (13., 2.)
+    changed.footprints = [Footprint("f", "U1", "IC", (5, 5), "top", models=[Model3D("part.step")])]
+    model = replace(full.parts[0], key="component:U1", kind="component")
+    monkeypatch.setattr(components, "build_component_parts", lambda *a, **k: ([model], ["note"]))
+    previews = []
+    final, _ = load_complete_scene(changed, via_details=True, preview=previews.append)
+    signature = components.component_signature(changed)
+    assert previews[0]._components == ([model], ["note"], signature)
+    assert final._components == ([model], ["note"], signature)
 
 
 def _side_mask(snapshot, layer):

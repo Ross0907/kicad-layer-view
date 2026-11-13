@@ -297,6 +297,56 @@ def load_cached_scene(snapshot, requested_keys=None, *, previous_scene=None):
         return None
 
 
+def _board_entries(snapshot):
+    """Compatible cache entries of this board as ``(directory, manifest)``, newest first."""
+    root = cache_root()
+    if not root.is_dir():
+        return []
+    identity = _board_identity(snapshot)
+    candidates = []
+    for directory in root.iterdir():
+        if not re.fullmatch(r"[0-9a-f]{64}", directory.name) or not _inside_root(directory, root):
+            continue
+        try:
+            data = _manifest(directory)
+            if (data.get("engine") == ENGINE_VERSION and data.get("key") == directory.name
+                    and data.get("geometry_profile") == list(_profile())
+                    and data.get("board_identity") == identity and _signatures(data)):
+                candidates.append((directory.stat().st_mtime_ns, directory, data))
+        except (OSError, ValueError, TypeError):
+            continue
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [(directory, data) for _, directory, data in candidates]
+
+
+def load_stale_scene(snapshot):
+    """The newest complete cached view of this board, even if the board changed since.
+
+    Shown at once while the changed layers are rebuilt, the way an editor
+    shows the last frame. It is marked ``_stale``/``_preview``, is never saved,
+    and keeps the signatures of the board it was built from, so handing it to
+    ``load_previous_scene``/``build_scene`` reuses only its truly unchanged meshes.
+    """
+    try:
+        slots = max(1, 2 * len(snapshot.stackup.copper) - 1)
+        for directory, data in _board_entries(snapshot):
+            if data.get("slot_count") != slots:
+                continue  # a different stackup would explode into the wrong slots
+            try:
+                scene = _read_scene(directory, data)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError, OverflowError):
+                log.debug("Stale scene cache is invalid", exc_info=True)
+                continue
+            scene = apply_surface_finish(scene, snapshot)
+            scene._stale = scene._preview = True
+            scene.reused_keys = frozenset()
+            return scene
+        return None
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, OverflowError):
+        log.debug("Stale scene cache unavailable", exc_info=True)
+        return None
+
+
 def load_previous_scene(snapshot, requested_keys=None, *, previous_scene=None):
     """Load unchanged parts from the newest compatible cache of this board.
 
@@ -307,27 +357,12 @@ def load_previous_scene(snapshot, requested_keys=None, *, previous_scene=None):
     objects from their surface preview instead of reading those files twice.
     """
     try:
-        root = cache_root()
-        if not root.is_dir():
-            return None
-        identity = _board_identity(snapshot)
-        candidates = []
-        for directory in root.iterdir():
-            if not re.fullmatch(r"[0-9a-f]{64}", directory.name) or not _inside_root(directory, root):
-                continue
-            try:
-                data = _manifest(directory)
-                if (data.get("engine") == ENGINE_VERSION and data.get("key") == directory.name
-                        and data.get("geometry_profile") == list(_profile())
-                        and data.get("board_identity") == identity and _signatures(data)):
-                    candidates.append((directory.stat().st_mtime_ns, directory, data))
-            except (OSError, ValueError, TypeError):
-                continue
+        candidates = _board_entries(snapshot)
         if not candidates:
             return None
         current = geometry._scene_signatures(snapshot)
         requested = set(current) if requested_keys is None else set(requested_keys)
-        for _, directory, data in sorted(candidates, key=lambda item: item[0], reverse=True):
+        for directory, data in candidates:
             matching = {key: value for key, value in _signatures(data).items()
                         if key in requested and current.get(key) == value}
             if not matching:

@@ -473,6 +473,35 @@ def test_component_completion_during_staged_load_preserves_board_and_controls(wi
         release.set()
 
 
+def test_stale_preview_leaves_models_to_the_running_load_and_keeps_the_view(window, monkeypatch):
+    from copy import deepcopy
+    from dataclasses import replace
+    from layer_viewer.model import Footprint, Model3D
+
+    class RunningLoad:
+        components = True
+
+        def isRunning(self):
+            return True
+
+    snapshot = deepcopy(window.snapshot)
+    snapshot.board_name = "Edited board"
+    snapshot.footprints = [Footprint("test", "U1", "Fixture", (0, 0), "top",
+                                     models=[Model3D("fixture.step")])]
+    stale = replace(window.scene)
+    stale._stale = stale._preview = True
+    monkeypatch.setattr(window, "worker", RunningLoad())
+    window.loaded(snapshot, stale)
+    assert window._board_preview and window._component_worker is None
+    assert "Last view shown" in window.statusBar().currentMessage()
+    copper_key = next(key for key in window.rows if key.startswith("copper:"))
+    actor = window.viewport.actors[copper_key]
+    window.loaded(snapshot, replace(stale))  # the rebuilt scene keeps the camera and actors
+    assert not window._board_preview
+    assert window.viewport.actors[copper_key] is actor
+    window.worker = None
+
+
 def test_supersampling_is_never_applied_to_a_large_board(window, monkeypatch):
     """Supersampling a multi-million-triangle board can exhaust GPU memory."""
     from layer_viewer import viewer as viewer_module

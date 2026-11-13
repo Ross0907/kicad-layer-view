@@ -107,10 +107,21 @@ class LiveWorker(QThread):
                             # A newly opened board arrives complete: every
                             # layer and its 3D models in a single scene.
                             from .loading import load_complete_scene
+
+                            def preview(stale, snapshot=snapshot, started=started):
+                                # Edited since its last view: show that view
+                                # while the changed layers are rebuilt.
+                                self.elapsed = time.perf_counter() - started
+                                self.cache_hit, self.reused_count = False, 0
+                                log.info("Last view shown in %.2fs while changed layers rebuild",
+                                         self.elapsed)
+                                self.ready.emit(snapshot, stale)
+
                             scene, self.cache_hit = load_complete_scene(
                                 snapshot, via_details=self.via_details,
                                 components=self.components, progress=self,
-                                known_component_signature=self.known_component_signature)
+                                known_component_signature=self.known_component_signature,
+                                preview=preview)
                         self.check_cancel()
                         acknowledge = getattr(source, "acknowledge", None)
                         if acknowledge is not None and source_update:

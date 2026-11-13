@@ -37,3 +37,10 @@ def kicad_style(monkeypatch):
     """Resolve materials exactly like KiCad's 3D viewer (not the realistic default)."""
     from layer_viewer import finishes
     monkeypatch.setattr(finishes, "STYLE", "kicad")
+
+
+@pytest.fixture(autouse=True)
+def _private_mesh_cache(tmp_path_factory, monkeypatch):
+    """Never read or write the user's real scene cache: a stale cached view of
+    the demo board there would otherwise be shown as a load preview."""
+    monkeypatch.setenv("LAYER_VIEW_CACHE_DIR", str(tmp_path_factory.mktemp("mesh-cache")))

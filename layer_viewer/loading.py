@@ -70,8 +70,13 @@ class _ModelProgress:
             self.progress.info(message)
 
 
+# A stale preview waits this long for 3D models that come from the cache, so
+# it usually shows them too; uncached models arrive with the final scene.
+STALE_PREVIEW_MODEL_WAIT_S = 2.0
+
+
 def load_complete_scene(snapshot, *, via_details=False, components=True, progress=None,
-                        known_component_signature=None):
+                        known_component_signature=None, preview=None):
     """Return ``(scene, cache_hit)`` with every layer and the 3D models at once.
 
     Component models load on their own thread while the board is read from the
@@ -79,17 +84,42 @@ def load_complete_scene(snapshot, *, via_details=False, components=True, progres
     models ride along as ``scene._components = (parts, warnings, signature)``.
     Models whose signature equals ``known_component_signature`` (already shown)
     are not rebuilt. Cancellation or a board error never waits for a model.
+
+    When the board changed since it was last cached and ``preview`` is given,
+    ``preview(scene)`` first receives the last cached view of this board
+    (``scene._stale``), with its models when they are ready in time. Its
+    unchanged meshes are then reused, never read twice.
     """
     import threading
+    import time
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-    from .cache import load_cached_scene, load_previous_scene
+    from .cache import load_cached_scene, load_previous_scene, load_stale_scene
     from .geometry import build_scene, scene_keys
 
+    started = time.monotonic()
     requested = scene_keys(snapshot, via_details=via_details)
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pcb-models")
     stop = threading.Event()
     models = signature = None
     finished = False
+
+    def check_cancel():
+        if progress is not None and hasattr(progress, "check_cancel"):
+            progress.check_cancel()
+
+    def model_result(deadline=None):
+        """``(parts, warnings)``; None once ``deadline`` passes first."""
+        while True:
+            try:
+                return models.result(timeout=.1)
+            except FuturesTimeout:
+                check_cancel()
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
+            except Exception as exc:  # noqa: BLE001 - the board must still open without models
+                check_cancel()
+                return [], [f"3D components: {exc}"]
+
     try:
         if components and any(footprint.models for footprint in snapshot.footprints):
             from .components import build_component_parts, component_signature
@@ -103,22 +133,19 @@ def load_complete_scene(snapshot, *, via_details=False, components=True, progres
         scene = load_cached_scene(snapshot, requested_keys=requested)
         cached = scene is not None
         if scene is None:
-            previous = load_previous_scene(snapshot, requested_keys=requested)
+            stale = load_stale_scene(snapshot) if preview is not None else None
+            if stale is not None:
+                if models is not None:
+                    ready = model_result(started + STALE_PREVIEW_MODEL_WAIT_S)
+                    if ready is not None:
+                        stale._components = (*ready, signature)
+                check_cancel()
+                preview(stale)
+            previous = load_previous_scene(snapshot, requested_keys=requested, previous_scene=stale)
             scene = build_scene(snapshot, progress=progress, previous_scene=previous,
                                 requested_keys=requested)
         if models is not None:
-            while True:
-                try:
-                    parts, warnings = models.result(timeout=.1)
-                    break
-                except FuturesTimeout:
-                    if progress is not None and hasattr(progress, "check_cancel"):
-                        progress.check_cancel()
-                except Exception as exc:  # noqa: BLE001 - the board must still open without models
-                    if progress is not None and hasattr(progress, "check_cancel"):
-                        progress.check_cancel()
-                    parts, warnings = [], [f"3D components: {exc}"]
-                    break
+            parts, warnings = model_result()
             scene._components = (parts, warnings, signature)
         finished = True
         return scene, cached

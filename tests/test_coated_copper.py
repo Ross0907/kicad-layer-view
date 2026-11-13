@@ -139,6 +139,34 @@ def test_tiled_pour_far_from_origin_stays_watertight_with_small_apertures(seed):
     assert np.hypot(*(b - a).T).sum() == pytest.approx(copper.length, rel=1e-9)
 
 
+def _triangle_set(points, triangles, coverage):
+    corners = np.sort(points[triangles].view([("x", float), ("y", float), ("z", float)])
+                      .reshape(len(triangles), 3), axis=1).view(float).reshape(len(triangles), 9)
+    rows = np.hstack([corners] + [coverage[name][:, None] for name in sorted(coverage)])
+    return rows[np.lexsort(rows.T[::-1])]
+
+
+def test_large_foil_meshed_in_island_groups_equals_one_pass(monkeypatch):
+    """Parallel island groups give exactly the same solid and resist coverage."""
+    import shapely
+    from shapely.geometry import Point
+    from layer_viewer import meshing
+    rng = np.random.default_rng(3)
+    pads = [box(x, y, x + 1.2, y + .8) for x in range(0, 30, 2) for y in range(0, 20, 2)]
+    pour = box(-5, 25, 40, 45).difference(shapely.union_all(
+        [Point(rng.uniform(-4, 39), rng.uniform(26, 44)).buffer(.2) for _ in range(120)]))
+    copper = shapely.union_all(pads + [pour])
+    mask = box(-6, -6, 41, 46).difference(shapely.union_all(
+        [Point(rng.uniform(-4, 39), rng.uniform(-4, 44)).buffer(.6) for _ in range(150)]))
+    shapely.prepare(mask)
+    single = meshing.coated_slab_arrays(copper, 1., .035, {"F.Mask": mask})
+    monkeypatch.setattr(meshing, "COATED_SPLIT_VERTICES", 0)
+    split = meshing.coated_slab_arrays(copper, 1., .035, {"F.Mask": mask})
+    assert len(split[1]) == len(single[1]) and len(split[0]) == len(single[0])
+    np.testing.assert_array_equal(_triangle_set(*split[:2], split[3]), _triangle_set(*single[:2], single[3]))
+    assert split[3]["F.Mask"].any() and not split[3]["F.Mask"].all()
+
+
 def test_tiled_triangulation_welds_seams_where_geos_crossings_differ_by_an_ulp():
     """Replays a generated pour whose two tile sides disagreed by one ulp."""
     import shapely

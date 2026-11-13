@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 import hashlib
+from itertools import chain
 import json
 import logging
 import math
@@ -571,15 +572,22 @@ def _read_step(path, *, previous=None):
         triangulation = BRep_Tool.Triangulation_s(face, location)
         if triangulation is None:
             return
-        points = np.array([triangulation.Node(i).Coord()
-                           for i in range(1, triangulation.NbNodes()+1)])
-        triangles = np.array([triangulation.Triangle(i).Get()
-                              for i in range(1, triangulation.NbTriangles()+1)], dtype=np.int32) - 1
+        # OCP has no bulk node/triangle access; fromiter avoids a list of tuples.
+        node, triangle = triangulation.Node, triangulation.Triangle
+        count, faces = triangulation.NbNodes(), triangulation.NbTriangles()
+        points = np.fromiter(chain.from_iterable(node(i).Coord() for i in range(1, count + 1)),
+                             dtype=float, count=3 * count).reshape(count, 3)
+        triangles = np.fromiter(chain.from_iterable(triangle(i).Get() for i in range(1, faces + 1)),
+                                dtype=np.int32, count=3 * faces).reshape(faces, 3) - 1
         if face.Orientation() == TopAbs_REVERSED:
             triangles = triangles[:, [0, 2, 1]]
+        material = tuple(round(value, 6) for value in color)
+        if location.IsIdentity():
+            # Most faces carry no own location: transform them per entry, at once.
+            pending.setdefault(material, []).append((points, triangles))
+            return
         matrix = transform @ location_matrix(location)
         points = points @ matrix[:3, :3].T + matrix[:3, 3]
-        material = tuple(round(value, 6) for value in color)
         groups.setdefault(material, []).append((points, triangles))
 
     def changed_face_colors(shape, inherited, root_color, depth=0):
@@ -635,7 +643,12 @@ def _read_step(path, *, previous=None):
         builder.Add(compound, shape)
     BRepMesh_IncrementalMesh(compound, .01, False, .2, True)
     for shape, transform, color in entries:
+        pending = {}
         collect_faces(shape, transform, color)
+        for material, chunks in pending.items():
+            points, triangles = _merge_arrays(chunks, dtype=float)
+            groups.setdefault(material, []).append(
+                (points @ transform[:3, :3].T + transform[:3, 3], triangles))
     result = []
     for material, chunks in groups.items():
         points, triangles = _merge_arrays(chunks)
@@ -644,14 +657,14 @@ def _read_step(path, *, previous=None):
     return result
 
 
-def _merge_arrays(chunks):
+def _merge_arrays(chunks, dtype=np.float32):
     count = 0
     vertices, indices = [], []
     for points, triangles in chunks:
         vertices.append(points)
         indices.append(triangles + count)
         count += len(points)
-    return np.concatenate(vertices).astype(np.float32), np.concatenate(indices).astype(np.int32)
+    return np.concatenate(vertices).astype(dtype), np.concatenate(indices).astype(np.int32)
 
 
 def led_lens(footprint, model, mesh):

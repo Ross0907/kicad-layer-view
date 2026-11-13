@@ -7,7 +7,35 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
+import types
+
+
+class _DeferredPyplot(types.ModuleType):
+    """Stands in for ``matplotlib.pyplot`` until something actually uses it.
+
+    PyVista imports pyplot at start-up only for color-cycler helpers that
+    Layer View never calls, which costs about 0.1-0.2 s before the window
+    can open. The first attribute access imports the real module.
+    """
+
+    _lock = threading.Lock()
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        import importlib
+        with self._lock:
+            if sys.modules.get(self.__name__) is self:
+                del sys.modules[self.__name__]
+            real = importlib.import_module(self.__name__)
+        return getattr(real, name)
+
+
+def defer_pyplot():
+    if "matplotlib.pyplot" not in sys.modules:
+        sys.modules["matplotlib.pyplot"] = _DeferredPyplot("matplotlib.pyplot")
 
 
 def main(plugin=False):
@@ -21,6 +49,7 @@ def main(plugin=False):
     parser.add_argument("--window-screenshot", type=Path, help="Save full window when --render completes")
     args = parser.parse_args()
     os.environ.setdefault("QT_API", "pyside6")
+    defer_pyplot()  # before the early board read or the window import PyVista
     log_dir = Path(tempfile.gettempdir()) / "kicad-layer-viewer"
     log_dir.mkdir(exist_ok=True)
     log_path = log_dir / f"viewer-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"

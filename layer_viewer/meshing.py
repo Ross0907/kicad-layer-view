@@ -23,6 +23,12 @@ CIRCLE_QUAD_SEGS = 16
 SMOOTH_WALL_COS = math.cos(math.radians(40.))
 # Non-axis-aligned edges shorter than this are curve facets, never artwork edges.
 LONG_EDGE_MM = .25
+# An outer foil (resist-coated) is the longest mesh job of a board. Above this
+# many vertices its copper islands are meshed in up to COATED_THREADS groups at
+# once; GEOS, earcut and most NumPy work release the GIL. Islands never share
+# vertices, so the groups' meshes simply concatenate.
+COATED_SPLIT_VERTICES = 40_000
+COATED_THREADS = 4
 
 
 def iter_polygons(geometry):
@@ -475,6 +481,17 @@ def slab_arrays(pts2: np.ndarray, tris: np.ndarray, z_bottom: float, thickness: 
     return pts, allf, normals, source
 
 
+def _island_groups(islands, count):
+    """Split islands into at most ``count`` groups of similar vertex count."""
+    weights = shapely.get_num_coordinates(islands)
+    groups, loads = [[] for _ in range(count)], [0] * count
+    for index in np.argsort(-weights, kind="stable"):
+        target = loads.index(min(loads))
+        groups[target].append(islands[index])
+        loads[target] += int(weights[index])
+    return [shapely.multipolygons(group) for group in groups if group]
+
+
 def coated_slab_arrays(geom: BaseGeometry, z_bottom: float, thickness: float,
                        coatings: dict, check_cancel=None, smooth: bool = False):
     """One copper solid with exact resist coverage on its outward faces.
@@ -483,11 +500,59 @@ def coated_slab_arrays(geom: BaseGeometry, z_bottom: float, thickness: float,
     welding the shared boundary so the partition never becomes an internal
     wall or an overlapping cap. Opposite faces remain ordinary metal. Keeping
     this on cells preserves full-detail edges without a sampled material map.
+    Large multi-island foils are meshed as island groups in parallel threads.
     """
-    names = tuple(coatings)
     islands = list(iter_polygons(geom))
     if not islands:
         return None
+    if len(islands) < 2 or shapely.get_num_coordinates(geom) < COATED_SPLIT_VERTICES:
+        return _coated_slab_arrays(geom, islands, z_bottom, thickness, coatings, check_cancel, smooth)
+    from concurrent.futures import ThreadPoolExecutor
+    groups = _island_groups(islands, COATED_THREADS)
+    # GEOS builds a prepared geometry's indexes lazily and not thread-safely:
+    # every further thread gets its own exact (WKB round-trip) prepared copy.
+    encoded = {name: shapely.to_wkb(mask) for name, mask in coatings.items()}
+
+    def own_coatings(index):
+        if index == 0:
+            return coatings
+        copies = {name: shapely.from_wkb(data) for name, data in encoded.items()}
+        shapely.prepare(list(copies.values()))
+        return copies
+
+    def mesh_group(index):
+        group = groups[index]
+        return _coated_slab_arrays(group, list(iter_polygons(group)), z_bottom, thickness,
+                                   own_coatings(index), check_cancel, smooth)
+
+    with ThreadPoolExecutor(len(groups), thread_name_prefix="coated-foil") as pool:
+        results = [r for r in pool.map(mesh_group, range(len(groups))) if r is not None]
+    if not results:
+        return None
+    offsets = np.cumsum([0] + [len(r[0]) for r in results[:-1]])
+    points = np.concatenate([r[0] for r in results])
+    triangles = np.concatenate([r[1] + offset for r, offset in zip(results, offsets)])
+    normals = None if results[0][2] is None else np.concatenate([r[2] for r in results])
+    coverage = {name: np.concatenate([r[3][name] for r in results]) for name in coatings}
+    return points, triangles, normals, coverage
+
+
+def _piece_tiles(pieces):
+    """``triangulate_tiles`` of every piece, in order; threads for many pieces."""
+    if len(pieces) < 64:
+        return [triangulate_tiles(piece) for piece in pieces]
+    from concurrent.futures import ThreadPoolExecutor
+    chunks = [pieces[i::COATED_THREADS] for i in range(COATED_THREADS)]
+    with ThreadPoolExecutor(COATED_THREADS, thread_name_prefix="coated-tiles") as pool:
+        done = list(pool.map(lambda chunk: [triangulate_tiles(piece) for piece in chunk], chunks))
+    result = [None] * len(pieces)
+    for start, chunk in enumerate(done):
+        result[start::COATED_THREADS] = chunk
+    return result
+
+
+def _coated_slab_arrays(geom, islands, z_bottom, thickness, coatings, check_cancel, smooth):
+    names = tuple(coatings)
     # Partition the whole layer once per coating. Two overlays of the complete
     # foil are far cheaper than hundreds of per-island overlays against the
     # board-sized mask, and they node shared boundaries identically.
@@ -524,8 +589,7 @@ def coated_slab_arrays(geom: BaseGeometry, z_bottom: float, thickness: float,
     offset = 0
     # Pieces of one partitioned island share boundary vertices; the conforming
     # pass after welding ties them together, so fast earcut serves every piece.
-    for k in range(len(pieces)):
-        vertices, faces, seam, _ = triangulate_tiles(pieces[k])
+    for k, (vertices, faces, seam, _) in enumerate(_piece_tiles(pieces)):
         if not len(faces):
             continue
         points.append(vertices)

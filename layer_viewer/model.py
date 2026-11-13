@@ -248,18 +248,38 @@ class BoardSnapshot:
         self.__dict__.pop("_net_index", None)
 
 
-def save_snapshot(snapshot: BoardSnapshot, path):
-    """Save a portable JSON snapshot, optionally gzip-compressed."""
+def _snapshot_fields(value):
+    """``json.dumps`` hook: a dataclass as its field dict, like ``dataclasses.asdict``.
+
+    The C encoder walks the (large) point lists itself, so nothing is deep
+    copied first; on a 10-layer board this is several seconds faster.
+    """
     import dataclasses
-    import gzip
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def snapshot_json(snapshot: BoardSnapshot) -> str:
+    """The snapshot as compact JSON text (the file format of ``save_snapshot``)."""
     import json
+    data = _snapshot_fields(snapshot)
+    data["format_version"] = 2
+    return json.dumps(data, separators=(",", ":"), default=_snapshot_fields)
+
+
+def save_snapshot(snapshot: BoardSnapshot, path, *, compresslevel=9):
+    """Save a portable JSON snapshot, optionally gzip-compressed.
+
+    ``compresslevel`` 1 suits temporary hand-over files: about ten times
+    faster than 9 for a slightly larger file.
+    """
+    import gzip
     from pathlib import Path
     path = Path(path)
-    data = dataclasses.asdict(snapshot)
-    data["format_version"] = 2
-    raw = json.dumps(data, separators=(",", ":"))
+    raw = snapshot_json(snapshot)
     if path.suffix == ".gz":
-        with gzip.open(path, "wt", encoding="utf-8") as stream:
+        with gzip.open(path, "wt", encoding="utf-8", compresslevel=compresslevel) as stream:
             stream.write(raw)
     else:
         path.write_text(raw, encoding="utf-8")
