@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Capped (POFV) vias are visible, as on real boards: resist over a cap is a
+  step lighter than over copper (the plated cap stands proud, so the resist is
+  thinner), in the viewport and the ray tracer, even inside a pour. Exposed
+  caps are a slightly duller satin disc. "POFV contrast" now strengthens this
+  instead of hiding the caps.
+- ENIG is a satin plate instead of a near-mirror.
+- Exploded, the 3D models ride with the silkscreen of their side, so the
+  resist and legend no longer float over the parts.
+- The layer panel sits on the right and is narrower, like KiCad's 3D viewer.
+- README: a Z cross-section animation through the copper layers.
 - Faster loading. When a board has changed since it was last shown, its last
   view (layers and 3D models) appears at once and the changed layers are
   swapped in when they are rebuilt; the camera and layer controls stay put.

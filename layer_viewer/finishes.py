@@ -152,6 +152,21 @@ def resist_light_color(rgb):
     return _RESIST_LIGHT.get(tuple(round(float(v), 6) for v in rgb[:3]))
 
 
+def resist_cap_color(rgb, strong=False):
+    """Resist tone over a capped (POFV) via: a step lighter than over copper.
+
+    The plating over the fill stands a little proud of the foil, so the resist
+    over it is thinner, the same reason resist over traces is lighter. On real
+    boards tented POFV vias show as faint light dots, even inside a pour.
+    ``strong`` is the inspection contrast. None outside the realistic palette.
+    """
+    light = resist_light_color(rgb)
+    if light is None:
+        return None
+    lift = 2. if strong else 1.
+    return tuple(min(1., lit + lift * (lit - float(dark))) for lit, dark in zip(light, rgb[:3]))
+
+
 def set_style(style):
     """Select ``"realistic"`` or ``"kicad"`` material colors."""
     global STYLE
@@ -253,7 +268,8 @@ def finish_appearance(name, style=None):
         if "osp" in lower or "entek" in lower:
             return BARE_COPPER_COLOR, .1
         if "gold" in lower or lower.endswith("ig") or "enig" in lower or "enepig" in lower:
-            return REAL_ENIG_COLOR, .1
+            # Immersion gold is a satin plate, not a mirror.
+            return REAL_ENIG_COLOR, .3
         if "silver" in lower:
             return REAL_SILVER_COLOR, .15
         if "tin" in lower and "hasl" not in lower:
@@ -349,7 +365,7 @@ def apply_surface_finish(scene, snapshot, style=None):
             # A capped-via patch is the same plated metal, but the plated-over
             # fill is a satin disc (real POFV caps show a faint circle). The
             # optional inspection contrast is applied by the viewer.
-            roughness = (max(.35, 3 * plated_roughness) if part.kind == "via_patch" and style == "realistic"
+            roughness = (min(.6, plated_roughness + .2) if part.kind == "via_patch" and style == "realistic"
                          else plated_roughness)
             parts.append(replace(part, color=plated_color, metallic=1., roughness=roughness))
         else:

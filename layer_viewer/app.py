@@ -10,7 +10,7 @@ from qtpy.QtCore import Qt, QThread, Signal, QTimer, QVariantAnimation, QEasingC
 from qtpy.QtGui import QAction, QColor, QIcon
 from qtpy.QtWidgets import (
     QAbstractSpinBox, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
+    QFormLayout, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QFrame, QSlider, QSplitter, QTableWidget,
     QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
@@ -211,17 +211,18 @@ class MainWindow(QMainWindow):
         self._toolbar()
         self.splitter = splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(8)
-        self._sidebar_width = 510
+        # Narrow and on the right, like KiCad's 3D viewer appearance panel.
+        self._sidebar_width = 340
         self.setCentralWidget(splitter)
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(18, 20, 18, 14)
+        layout.setContentsMargins(12, 14, 12, 12)
         eyebrow = QLabel("LAYER VIEW  /  3D INSPECTOR")
         eyebrow.setObjectName("section")
         panel_header = QHBoxLayout()
         panel_header.addWidget(eyebrow, 1)
         collapse = QToolButton()
-        collapse.setText("‹")
+        collapse.setText("›")
         collapse.setAccessibleName("Collapse layer sidebar")
         collapse.setToolTip("Collapse sidebar · Ctrl+Shift+L to reopen")
         collapse.clicked.connect(lambda: self.set_sidebar_visible(False))
@@ -264,62 +265,63 @@ class MainWindow(QMainWindow):
         self.animation.setDuration(450)
         self.animation.setEasingCurve(QEasingCurve.InOutCubic)
         self.animation.valueChanged.connect(lambda value: self.gap.setValue(float(value)))
-        preset_row = QHBoxLayout()
-        for label, mode in (("Copper", "copper"), ("Stackup", "stackup"), ("X-ray", "xray"), ("Vias", "vias")):
+        # Grids keep every control inside the narrow right-hand panel.
+        preset_row = QGridLayout()
+        for i, (label, mode) in enumerate((("Copper", "copper"), ("Stackup", "stackup"),
+                                           ("X-ray", "xray"), ("Vias", "vias"))):
             button = QPushButton(label)
             button.clicked.connect(lambda _=False, mode=mode: self.apply_preset(mode))
-            preset_row.addWidget(button)
+            preset_row.addWidget(button, i // 2, i % 2)
         layout.addLayout(preset_row)
         layout.addSpacing(8)
         self.kind_boxes = {}
-        category_row = QHBoxLayout()
-        for kind, title, checked in (("dielectric", "Dielectric", True),
+        category_row = QGridLayout()
+        for i, (kind, title, checked) in enumerate((("dielectric", "Dielectric", True),
                                       ("mask", "Mask", True),
                                       ("silk", "Silk", True),
                                       ("barrel", "Barrels", False),
-                                      ("fill", "Fill / plugs", False)):
+                                      ("fill", "Fill / plugs", False))):
             box = QCheckBox(title)
             box.setChecked(checked)
             box.toggled.connect(self.apply_visibility)
             self.kind_boxes[kind] = box
-            category_row.addWidget(box)
+            category_row.addWidget(box, i // 3, i % 3)
         layout.addLayout(category_row)
-        detail_row = QHBoxLayout()
-        for kind, title in (("component", "3D components"), ("via_patch", "POFV finish contrast"),
-                            ("paste", "Solder paste")):
+        detail_row = QGridLayout()
+        for i, (kind, title) in enumerate((("component", "3D components"), ("paste", "Solder paste"),
+                                           ("via_patch", "POFV contrast"))):
             box = QCheckBox(title)
             # KiCad shows capped vias in the plain finish; contrast is opt-in.
             box.setChecked(kind not in ("paste", "via_patch"))
             box.toggled.connect(self.apply_visibility)
             self.kind_boxes[kind] = box
-            detail_row.addWidget(box)
+            detail_row.addWidget(box, i // 2, i % 2)
         self.kind_boxes["via_patch"].setToolTip(
             "Show a contrasting finish over capped via bores. This is a visual inspection aid; "
             "KiCad does not record a measured surface finish.")
         layout.addLayout(detail_row)
         # KiCad 3D viewer model filters (Appearance > Objects), plus board side.
         self.model_filters = {}
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("Models:"))
-        for key, title, tip in (
+        layout.addWidget(QLabel("Models"))
+        model_row = QGridLayout()
+        for i, (key, title, tip) in enumerate((
                 ("tht", "THT", "Through-hole footprints"),
                 ("smd", "SMD", "Surface-mount footprints"),
                 ("virtual", "Virtual", "Footprints that are neither through-hole nor SMD"),
                 ("not_in_pos", "Not in POS", "Footprints excluded from position files"),
                 ("dnp", "DNP", "Footprints marked Do not populate"),
                 ("top", "Top", "Models on the top side"),
-                ("bottom", "Bottom", "Models on the bottom side")):
+                ("bottom", "Bottom", "Models on the bottom side"))):
             box = QCheckBox(title)
             box.setChecked(True)
             box.setToolTip(tip)
             box.toggled.connect(self.apply_visibility)
             self.model_filters[key] = box
-            model_row.addWidget(box)
-        model_row.addStretch(1)
+            model_row.addWidget(box, i // 3, i % 3)
         layout.addLayout(model_row)
         self.kind_boxes["paste"].setToolTip("Front/back stencil deposits from the PCB paste artwork; "
                                            "illustrative 0.08 mm thickness, not reflowed joints.")
-        self.extend_vias = QCheckBox("Extend via connections across layer gaps")
+        self.extend_vias = QCheckBox("Extend vias across gaps")
         self.extend_vias.setChecked(False)
         self.extend_vias.setToolTip(
             "Extend plated barrels and filling between their real copper endpoints. "
@@ -328,7 +330,8 @@ class MainWindow(QMainWindow):
             lambda enabled: self.viewport.set_extended_connections(enabled))
         layout.addWidget(self.extend_vias)
         layout.addSpacing(10)
-        self.all_colors = QCheckBox("Use PCB editor colors for copper, mask, silk and paste")
+        self.all_colors = QCheckBox("PCB editor colors")
+        self.all_colors.setToolTip("Use the PCB editor colors for copper, mask, silk and paste")
         self.all_colors.setChecked(False)
         self.all_colors.toggled.connect(self.set_all_colors)
         layout.addWidget(self.all_colors)
@@ -360,8 +363,8 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.Fixed)
         header.setSectionResizeMode(3, QHeaderView.Fixed)
-        self.table.setColumnWidth(2, 160)
-        self.table.setColumnWidth(3, 65)
+        self.table.setColumnWidth(2, 128)
+        self.table.setColumnWidth(3, 58)
         self.table.verticalHeader().setDefaultSectionSize(42)
         layout.addWidget(self.table, 1)
         clip_form = QFormLayout()
@@ -387,13 +390,14 @@ class MainWindow(QMainWindow):
         self.sidebar.setFrameShape(QFrame.NoFrame)
         self.sidebar.setMinimumWidth(240)
         self.sidebar.setWidget(panel)
-        splitter.addWidget(self.sidebar)
         self.viewport = BoardViewport()
         splitter.addWidget(self.viewport)
-        splitter.setCollapsible(0, True)
-        splitter.setCollapsible(1, False)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([510, 950])
+        splitter.addWidget(self.sidebar)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, True)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([1120, 340])
         splitter.splitterMoved.connect(self._sidebar_moved)
         self.viewport.picked.connect(self.statusBar().showMessage)
         self.viewport.live_ray.status.connect(self.statusBar().showMessage)
@@ -409,7 +413,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Drag: orbit · Middle/right drag: pan · Wheel: zoom · Click XYZ: snap view")
 
     def _sidebar_moved(self, *_):
-        width = self.splitter.sizes()[0]
+        width = self.splitter.sizes()[1]
         if width > 0:
             self._sidebar_width = width
         self.sidebar_action.blockSignals(True)
@@ -422,10 +426,10 @@ class MainWindow(QMainWindow):
             self.sidebar.show()
             total = max(480, self.splitter.width() - self.splitter.handleWidth())
             width = min(max(240, self._sidebar_width), total - 240)
-            self.splitter.setSizes([width, total - width])
+            self.splitter.setSizes([total - width, width])
         else:
-            if sizes[0] > 0:
-                self._sidebar_width = sizes[0]
+            if sizes[1] > 0:
+                self._sidebar_width = sizes[1]
             self.sidebar.hide()
         self.sidebar_action.blockSignals(True)
         self.sidebar_action.setChecked(bool(visible))

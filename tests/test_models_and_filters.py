@@ -116,3 +116,18 @@ def test_realistic_metals_are_camera_lit_phong_in_the_viewport():
     assert prop.GetInterpolation() != 3 and prop.GetSpecularColor() != metal_specular
     apply_material(prop, "component", (.74, .74, .74), metallic=1., roughness=.26)
     assert prop.GetInterpolation() != 3 and prop.GetSpecular() == 1.
+
+
+def test_mask_faces_over_capped_vias_are_tagged():
+    import shapely
+    from types import SimpleNamespace
+    from shapely.geometry import box
+    from layer_viewer.meshing import mesh_mask_layer
+    via = SimpleNamespace(capped=True, layers=("F.Cu", "B.Cu"), drill_mm=.3, position=(5., 5.),
+                          copper_layers=None, diameters_mm={}, diameter_mm=.6)
+    task = {"layer_id": "F.Cu", "tracks": [], "polys": [], "vias": [via],
+            "outline": box(0, 0, 10, 10), "pad_holes": shapely.Polygon(), "mask": box(0, 0, 10, 10),
+            "front": True, "z_bottom": 1.6, "thickness": .015}
+    points, triangles, normals, coverage = mesh_mask_layer(task)
+    assert coverage["Cap"].any() and coverage["Cu"].sum() > coverage["Cap"].sum()
+    assert not (coverage["Cap"].astype(bool) & ~coverage["Cu"].astype(bool)).any()

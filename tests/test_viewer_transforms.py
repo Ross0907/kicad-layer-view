@@ -167,3 +167,13 @@ def test_viewport_clip_is_shared_world_plane_for_rigid_and_stretched_actors(axis
     viewport.update_clip()
     assert all(actor.GetMapper().GetNumberOfClippingPlanes() == 0
                for actor in viewport.actors.values())
+
+
+def test_exploded_models_ride_above_the_resist_and_legend():
+    from types import SimpleNamespace
+    from layer_viewer.viewer import layer_offset
+    top = SimpleNamespace(kind="component", stack_index=0, model_class=("top",), mesh=None)
+    bottom = SimpleNamespace(kind="component", stack_index=6, model_class=("bottom",), mesh=None)
+    assert part_transform(top, 4, 2., False) == (1.0, layer_offset(-2, 4, 2.))  # F.SilkS slot
+    assert part_transform(bottom, 4, 2., False) == (1.0, layer_offset(8, 4, 2.))  # B.SilkS slot
+    assert part_transform(top, 4, 0., False) == (1.0, 0.)

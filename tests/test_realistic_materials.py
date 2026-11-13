@@ -134,3 +134,31 @@ def test_viewport_resist_is_lighter_over_copper():
     rgb = np.asarray(pv.wrap(actor.GetMapper().GetInput()).cell_data["_layer_view_rgb"])
     np.testing.assert_array_equal(rgb[[0, 3]], np.round(np.array([resist_light_color(dark)] * 2) * 255))
     np.testing.assert_array_equal(rgb[[1, 2]], np.round(np.array([dark] * 2) * 255))
+
+
+def test_resist_over_pofv_caps_is_a_step_lighter_than_over_copper():
+    from layer_viewer.finishes import resist_cap_color, resist_light_color
+    green = material_appearance("mask", "Green")[:3]
+    light, cap = resist_light_color(green), resist_cap_color(green)
+    assert all(c > lt > d for c, lt, d in zip(cap, light, green))
+    assert all(s >= c for s, c in zip(resist_cap_color(green, strong=True), cap))
+    assert resist_cap_color(material_appearance("mask", "Green", style="kicad")[:3]) is None
+
+
+def test_enig_is_satin_not_a_mirror():
+    assert finish_appearance("ENIG")[1] >= .25
+
+
+def test_viewport_resist_shows_capped_vias_lighter():
+    import pyvista as pv
+    from layer_viewer.finishes import resist_cap_color
+    from layer_viewer.viewer import BoardViewport
+    mesh = pv.Plane(i_resolution=2, j_resolution=1).triangulate()
+    mesh.cell_data["coat:Cu"] = np.array([1, 1, 0, 0], dtype=np.uint8)
+    mesh.cell_data["coat:Cap"] = np.array([1, 0, 0, 0], dtype=np.uint8)
+    dark = material_appearance("mask", "Green")[:3]
+    actor = pv.Actor(mapper=pv.DataSetMapper(mesh))
+    actor.GetProperty().SetDiffuseColor(*dark)
+    BoardViewport._apply_coated_copper(actor, SimpleNamespace(kind="mask", mesh=mesh))
+    rgb = np.asarray(pv.wrap(actor.GetMapper().GetInput()).cell_data["_layer_view_rgb"])
+    np.testing.assert_array_equal(rgb[0], np.round(np.array(resist_cap_color(dark)) * 255))

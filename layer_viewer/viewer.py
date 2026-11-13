@@ -125,6 +125,9 @@ def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None
         # KiCad's viewer, every side now looks the same. The path tracer keeps
         # the physically based metals.
         ambient, diffuse, specular, power = metal_phong(rgb, roughness)
+        if kind == "via_patch":
+            # Plating over the cured fill is a slightly duller satin disc.
+            ambient, diffuse = .85 * ambient, .85 * diffuse
         prop.SetAmbient(ambient)
         prop.SetAmbientColor(*(float(v) for v in rgb[:3]))
         prop.SetDiffuse(diffuse)
@@ -161,7 +164,14 @@ def part_transform(part, copper_count, gap_mm, extend_connections):
     Odd stack slots lie between copper layers. Stretch each interval separately so
     blind and buried vias stop at their actual endpoints. No duplicate tube is drawn.
     """
-    offset = layer_offset(part.stack_index, copper_count, gap_mm)
+    stack_index = part.stack_index
+    if part.kind == "component":
+        # Exploded, models ride with the outermost (silkscreen) layer of their
+        # side, so the resist and legend never float over the parts.
+        side = part.model_class[0] if getattr(part, "model_class", ()) else (
+            "top" if stack_index <= 0 else "bottom")
+        stack_index = -2 if side == "top" else 2 * (copper_count - 1) + 2
+    offset = layer_offset(stack_index, copper_count, gap_mm)
     if (extend_connections and part.kind in ("barrel", "fill")
             and part.stack_index % 2 == 1 and gap_mm > 0):
         bottom, top = part.mesh.bounds[4:6]
@@ -398,26 +408,34 @@ class BoardViewport(QWidget):
                            metallic=getattr(part, "metallic", None), roughness=getattr(part, "roughness", None))
         if opacity is not None:
             actor.GetProperty().SetOpacity(opacity)
+        strong = getattr(self, "show_via_patches", False)
         if part.kind == "mask":
-            self._apply_coated_copper(actor, part)
+            self._apply_coated_copper(actor, part, strong_caps=strong)
         if part.kind == "copper":
             self._apply_coated_copper(actor, part)
-            patch = self.actors.get(f"via-patch:{part.layer_id}")
+            key = f"via-patch:{part.layer_id}"
+            patch = self.actors.get(key)
             if patch is not None:
-                # Capped vias carry the same finish as the copper (KiCad shows no
-                # difference); the contrast is an optional inspection aid.
+                # A plated-over cap is a faint, slightly duller disc in the pad
+                # (real POFV); the contrast option makes it an inspection aid.
                 from .via_surfaces import via_patch_color
-                color = actor.GetProperty().GetDiffuseColor()
+                color = tuple(actor.GetProperty().GetDiffuseColor())
                 base = part.color
-                if getattr(self, "show_via_patches", False):
+                if strong:
                     color, base = via_patch_color(color), via_patch_color(part.color)
-                apply_material(patch.GetProperty(), "via_patch", color, base_rgb=base)
+                apply_material(patch.GetProperty(), "via_patch", color, base_rgb=base,
+                               roughness=getattr(self.parts.get(key), "roughness", None))
                 patch.GetProperty().SetOpacity(actor.GetProperty().GetOpacity())
+                patch_part = self.parts.get(key)
+                if patch_part is not None:
+                    # Under the resist the cap is bare copper like the foil.
+                    from types import SimpleNamespace
+                    self._apply_coated_copper(patch, SimpleNamespace(kind="copper", mesh=patch_part.mesh))
         if render:
             self.refresh()
 
     @staticmethod
-    def _apply_coated_copper(actor, part):
+    def _apply_coated_copper(actor, part, strong_caps=False):
         """Show bare copper where the resist covers a realistic-finish foil.
 
         Fabricated boards are plated only where copper is exposed, so pads
@@ -425,7 +443,7 @@ class BoardViewport(QWidget):
         green resist yellow-green). KiCad-style, editor and custom colors keep
         one uniform color. The exact per-face coverage comes from meshing.
         """
-        from .finishes import covered_copper_color, resist_light_color
+        from .finishes import covered_copper_color, resist_cap_color, resist_light_color
         if not hasattr(actor, "GetMapper"):
             return
         mapper = actor.GetMapper()
@@ -449,6 +467,10 @@ class BoardViewport(QWidget):
         rgb = np.empty((mesh.n_cells, 3), dtype=np.uint8)
         rgb[:] = np.round(np.asarray(color) * 255)
         rgb[covered] = np.round(np.asarray(under) * 255)
+        cap = resist_cap_color(color, strong_caps) if part.kind == "mask" else None
+        if cap is not None and "coat:Cap" in mesh.cell_data:
+            capped = np.asarray(mesh.cell_data["coat:Cap"]).reshape(mesh.n_cells, -1)[:, 0] > .5
+            rgb[capped] = np.round(np.asarray(cap) * 255)
         from vtkmodules.util.numpy_support import numpy_to_vtk
         array = numpy_to_vtk(rgb, deep=True)
         array.SetName("_layer_view_rgb")

@@ -72,7 +72,7 @@ def display_radiance(pixels, exposure_ev=0.):
     return values
 
 
-def _material(mesh, *, coated=False):
+def _material(mesh, *, coated=False, capped=False):
     rgb = {"type": "rgb", "value": _linear(mesh.color).tolist()}
     if mesh.kind in ("copper", "barrel", "via_patch"):
         from .finishes import covered_copper_color, ray_metal_color
@@ -81,7 +81,7 @@ def _material(mesh, *, coated=False):
         if mesh.kind == "via_patch":
             # Plating over the cured fill is slightly duller than the pad around
             # it, so capped vias show as faint satin discs, as on real boards.
-            f0 = f0 * .86
+            f0 = f0 * .8
         metal = {"type": "rgb", "value": np.asarray(f0).tolist()}
         opaque = {"type": "principled", "base_color": metal, "metallic": 1.,
                   "roughness": mesh.roughness if mesh.roughness is not None else
@@ -126,6 +126,16 @@ def _material(mesh, *, coated=False):
                       "bsdf_1": {"type": "principled", "metallic": 0., "eta": 1.48,
                                  "base_color": {"type": "rgb", "value": _linear(light).tolist()},
                                  "roughness": roughness * .8}}
+            from .finishes import resist_cap_color
+            if capped:
+                # Tented POFV caps: thinner resist again, a faint light dot.
+                opaque = {"type": "blendbsdf",
+                          "weight": {"type": "mesh_attribute", "name": "face_resist_cap"},
+                          "bsdf_0": opaque,
+                          "bsdf_1": {"type": "principled", "metallic": 0., "eta": 1.48,
+                                     "base_color": {"type": "rgb",
+                                                    "value": _linear(resist_cap_color(mesh.color)).tolist()},
+                                     "roughness": roughness * .7}}
     elif mesh.kind == "component":
         opaque = {"type": "principled", "base_color": rgb,
                   "metallic": mesh.metallic if mesh.metallic is not None else 0.,
@@ -391,7 +401,7 @@ class ProgressiveRayTracer:
             if mesh.kind == "mask" and mesh.name in ("F.Mask", "B.Mask"):
                 self._check_cancel()
                 points, triangles, over_copper = _world_mesh(mesh, include_coating=True)
-                if over_copper is not None and over_copper.ndim == 1:
+                if over_copper is not None:  # (faces,) or (faces, 2) with the cap column
                     triangles, outward_visible, over_copper = _mask_surface(mesh, points, triangles,
                                                                             over_copper)
                 else:
@@ -415,10 +425,15 @@ class ProgressiveRayTracer:
             if not len(triangles):
                 continue
             weights = _coating_weights(mesh, coverage, masks)
+            caps = None
             if over_copper is not None:
-                weights = np.asarray(over_copper, dtype=np.float32)
+                over_copper = np.asarray(over_copper, dtype=np.float32)
+                if over_copper.ndim == 2:
+                    caps = over_copper[:, 1] if np.any(over_copper[:, 1]) else None
+                    over_copper = over_copper[:, 0]
+                weights = over_copper
             props = mi.Properties()
-            props["bsdf"] = mi.load_dict(_material(mesh, coated=weights is not None))
+            props["bsdf"] = mi.load_dict(_material(mesh, coated=weights is not None, capped=caps is not None))
             if any(mesh.emission):
                 props["emitter"] = mi.load_dict({"type": "area", "radiance": {
                     "type": "rgb", "value": list(mesh.emission)}})
@@ -428,6 +443,8 @@ class ProgressiveRayTracer:
                 # Per-face lookup keeps aperture edges exact, with no texture
                 # sampling, duplicate copper surfaces or extra draw objects.
                 shape.add_attribute("face_resist_coverage", 1, weights)
+            if caps is not None:
+                shape.add_attribute("face_resist_cap", 1, np.ascontiguousarray(caps))
             params = mi.traverse(shape)
             params["vertex_positions"] = ((points - self.center) * self.scale).astype(np.float32).ravel()
             params["faces"] = np.asarray(triangles, dtype=np.uint32).ravel()

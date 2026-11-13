@@ -57,7 +57,7 @@ def test_led_accepts_stronger_emission_and_keeps_zero_as_off():
 
 def test_sidebar_restores_last_width_and_clamps_it_after_window_resize():
     from layer_viewer.app import MainWindow
-    sizes, visible, checked = [720, 800], [True], []
+    sizes, visible, checked = [800, 720], [True], []
     splitter = SimpleNamespace(sizes=lambda: list(sizes), width=lambda: 1000, handleWidth=lambda: 8,
                                setSizes=lambda values: sizes.__setitem__(slice(None), values))
     window = SimpleNamespace(splitter=splitter, _sidebar_width=510,
@@ -67,10 +67,10 @@ def test_sidebar_restores_last_width_and_clamps_it_after_window_resize():
     MainWindow.set_sidebar_visible(window, False)
     assert not visible[0] and window._sidebar_width == 720
     MainWindow.set_sidebar_visible(window, True)
-    assert visible[0] and sizes == [720, 272] and checked[-1]
+    assert visible[0] and sizes == [272, 720] and checked[-1]
     splitter.width = lambda: 700
     MainWindow.set_sidebar_visible(window, True)
-    assert sizes == [452, 240]
-    sizes[:] = [0, 692]
+    assert sizes == [240, 452]
+    sizes[:] = [692, 0]
     MainWindow._sidebar_moved(window)
     assert not checked[-1] and window._sidebar_width == 720

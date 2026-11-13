@@ -621,7 +621,7 @@ def _coated_slab_arrays(geom, islands, z_bottom, thickness, coatings, check_canc
     coverage = {}
     for index, name in enumerate(names):
         values = np.zeros(len(triangles), dtype=np.uint8)
-        start = count if name == "F.Mask" else 0
+        start = count if name.startswith("F.") else 0
         values[start:start + count] = (flags & (1 << index)) != 0
         coverage[name] = values
     return points, triangles, normals, coverage
@@ -739,13 +739,20 @@ def mesh_mask_layer(task):
     mask = task["mask"]
     if mask.is_empty or task["thickness"] <= 0:
         return None
-    shapely.prepare(copper)
-    side = "F.Mask" if task["front"] else "B.Mask"  # tags the outward face
-    result = coated_slab_arrays(mask, task["z_bottom"], task["thickness"], {side: copper})
+    from types import SimpleNamespace
+    from .via_surfaces import split_cap_surfaces
+    # Capped (POFV) vias: the plating over the fill is a little proud of the
+    # foil, so the resist over it is thinner and lighter still.
+    caps = split_cap_surfaces(SimpleNamespace(vias=task["vias"]), task["layer_id"], copper)[1]
+    shapely.prepare([copper, caps])
+    prefix = "F." if task["front"] else "B."  # tags the outward face
+    result = coated_slab_arrays(mask, task["z_bottom"], task["thickness"],
+                                {prefix + "Mask": copper, prefix + "Cap": caps})
     if result is None:
         return None
     points, triangles, normals, coverage = result
-    return points, triangles.astype(np.int32), normals, {"Cu": coverage[side]}
+    return points, triangles.astype(np.int32), normals, {"Cu": coverage[prefix + "Mask"],
+                                                         "Cap": coverage[prefix + "Cap"]}
 
 
 def mesh_copper_layer(task):

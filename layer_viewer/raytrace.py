@@ -107,13 +107,14 @@ def capture_from_viewport(viewport) -> RenderCapture:
         clipping = tuple(ClipPlane(tuple(planes.GetItem(i).GetOrigin()),
                                    tuple(planes.GetItem(i).GetNormal()))
                          for i in range(mapper.GetNumberOfClippingPlanes())) if planes else ()
-        coatings = [name for name in (("Cu",) if part.kind == "mask" else ("F.Mask", "B.Mask"))
+        # Masks: over-copper and over-cap (POFV) tags; copper: F/B coverage.
+        coatings = [name for name in (("Cu", "Cap") if part.kind == "mask" else ("F.Mask", "B.Mask"))
                     if f"coat:{name}" in mesh.cell_data]
         coating_mask = coatings[0] if coatings else ""
         covered_faces = (_readonly(_coating_values(mesh.cell_data[f"coat:{coating_mask}"],
                                                    mesh.n_cells), np.float32)
                          if coating_mask else None)
-        back_covered_faces = (_readonly(_coating_values(mesh.cell_data["coat:B.Mask"],
+        back_covered_faces = (_readonly(_coating_values(mesh.cell_data[f"coat:{coatings[1]}"],
                                                         mesh.n_cells), np.float32)
                               if len(coatings) == 2 else None)
         led_color = getattr(viewport, "led_color", None)
