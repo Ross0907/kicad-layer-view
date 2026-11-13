@@ -123,6 +123,44 @@ def test_relative_and_absolute_snapshot_paths_share_cache(tmp_path, monkeypatch)
     assert cache.cache_key(relative) == cache.cache_key(absolute)
 
 
+def test_polygon_digest_is_exact_and_independent_of_point_containers():
+    from layer_viewer.model import Poly
+
+    base = Poly([(0., 0.), (1.5, 0.), (1.5, 2.)], [[(.1, .1), (.2, .1), (.2, .2)]])
+    digest = cache._poly_digest(base)
+    assert digest.startswith("P:")
+    assert cache._poly_digest(Poly([[0, 0], [1.5, 0], [1.5, 2]], [((.1, .1), (.2, .1), (.2, .2))])) == digest
+    variants = [
+        Poly([(0., 0.), (1.5, 0.), (1.5, 2. + 1e-15)], base.holes),  # one ulp-scale edit
+        Poly([(-0., 0.), (1.5, 0.), (1.5, 2.)], base.holes),  # signed zero is distinct
+        Poly(base.outline + [(.1, .1)], [[(.2, .1), (.2, .2)]]),  # point moved between rings
+        Poly(base.outline, base.holes + [[]]),  # an extra empty ring
+        Poly(base.outline, []),
+    ]
+    assert len({digest, *(cache._poly_digest(p) for p in variants)}) == len(variants) + 1
+    hole = deepcopy(base)
+    before = cache._poly_digest(hole)
+    hole.holes[0][1] = (.25, .1)  # in-place edits must never hit a memoized digest
+    assert cache._poly_digest(hole) != before
+
+
+def test_cache_key_is_deterministic_across_processes_and_tracks_holes(cache_setup):
+    import subprocess
+    import sys
+
+    _, snapshot, _ = cache_setup
+    script = ("from layer_viewer import cache; from layer_viewer.model import demo_snapshot; "
+              "print(cache.cache_key(demo_snapshot()))")
+    env = {**os.environ, "PYTHONHASHSEED": "12345"}
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True,
+                         cwd=os.path.dirname(os.path.dirname(cache.__file__)), env=env).stdout.strip()
+    assert out == cache.cache_key(snapshot)
+    modified = deepcopy(snapshot)
+    poly = next(p for zone in modified.zones for polys in zone.filled.values() for p in polys)
+    poly.holes.append([(1., 1.), (1.1, 1.), (1.1, 1.1)])
+    assert cache.cache_key(modified) != cache.cache_key(snapshot)
+
+
 def test_corrupt_mesh_falls_back_to_rebuild(cache_setup):
     root, snapshot, scene = cache_setup
     assert cache.save_cached_scene(snapshot, scene)

@@ -151,6 +151,14 @@ def _arc_points(start, mid, end, include_start: bool = False) -> List[tuple]:
 
 
 def _polyline_points(polyline) -> List[tuple]:
+    """Points (mm) of a kipy ``PolyLine`` wrapper or a raw ``types.PolyLine`` proto.
+
+    Protobuf messages are decoded directly; kipy's wrappers allocate a node and a
+    ``Vector2`` copy per vertex, which dominates live zone-fill extraction.
+    """
+    pl = getattr(polyline, "_proto", polyline)
+    if hasattr(pl, "DESCRIPTOR"):
+        return _proto_polyline_points(pl)
     pts: List[tuple] = []
     for node in polyline.nodes:
         if node.has_point:
@@ -166,9 +174,33 @@ def _polyline_points(polyline) -> List[tuple]:
     return pts
 
 
+def _proto_polyline_points(pl) -> List[tuple]:
+    pts: List[tuple] = []
+    append = pts.append
+    for node in pl.nodes:
+        if node.HasField("point"):
+            q = node.point
+            append((q.x_nm / NM_PER_MM, q.y_nm / NM_PER_MM))
+        elif node.HasField("arc"):
+            a = node.arc
+            s = (a.start.x_nm / NM_PER_MM, a.start.y_nm / NM_PER_MM)
+            m = (a.mid.x_nm / NM_PER_MM, a.mid.y_nm / NM_PER_MM)
+            e = (a.end.x_nm / NM_PER_MM, a.end.y_nm / NM_PER_MM)
+            if not pts or pts[-1] != s:
+                append(s)
+            pts.extend(_arc_points(s, m, e))
+    if len(pts) > 1 and pts[0] == pts[-1]:
+        pts.pop()
+    return pts
+
+
 def _poly(pwh) -> Poly:
-    return Poly(outline=_polyline_points(pwh.outline),
-                holes=[_polyline_points(h) for h in pwh.holes])
+    """Convert a kipy ``PolygonWithHoles`` wrapper or raw proto to a :class:`Poly`."""
+    p = getattr(pwh, "_proto", pwh)
+    if not hasattr(p, "DESCRIPTOR"):
+        p = pwh
+    return Poly(outline=_polyline_points(p.outline),
+                holes=[_polyline_points(h) for h in p.holes])
 
 
 # ---------------------------------------------------------------------------
@@ -542,9 +574,8 @@ def _pad_shapes(board, pads, layer_ids: Iterable[int], progress, cache=None) -> 
             cmd.layer = lid
             cmd.pads.extend([p.id for p in needed])
             resp = board.client.send(cmd, board_commands_pb2.PadShapeAsPolygonResponse)
-            from kipy.geometry import PolygonWithHoles
             for pid, poly in zip(resp.pads, resp.polygons):
-                p = _poly(PolygonWithHoles(poly))
+                p = _poly(poly)  # raw proto: skips the per-pad wrapper CopyFrom
                 raw_shapes[pid.value] = [p] if len(p.outline) >= 3 else []
             if cache is not None:
                 for pad in needed:

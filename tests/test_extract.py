@@ -173,3 +173,79 @@ def test_custom_editor_theme(tmp_path):
     assert colors["In2.Cu"] == (22/255,44/255,66/255)
     assert colors["F.Mask"] == (17/255,34/255,51/255)
     assert source.endswith("custom.json") and not notices
+
+
+def _wrapper_polyline_points(polyline):
+    """The pre-optimisation decode through kipy's per-node wrappers (reference)."""
+    pts = []
+    for node in polyline.nodes:
+        if node.has_point:
+            pts.append(extract._pt(node.point))
+        elif node.has_arc:
+            arc = node.arc
+            s, m, e = extract._pt(arc.start), extract._pt(arc.mid), extract._pt(arc.end)
+            if not pts or pts[-1] != s:
+                pts.append(s)
+            pts.extend(extract._arc_points(s, m, e))
+    if len(pts) > 1 and pts[0] == pts[-1]:
+        pts.pop()
+    return pts
+
+
+def _polygon_with_holes_proto():
+    from kipy.proto.common import types
+
+    def point(line, x, y):
+        p = line.nodes.add().point
+        p.x_nm, p.y_nm = x, y
+
+    def arc(line, s, m, e):
+        a = line.nodes.add().arc
+        a.start.x_nm, a.start.y_nm = s
+        a.mid.x_nm, a.mid.y_nm = m
+        a.end.x_nm, a.end.y_nm = e
+
+    proto = types.PolygonWithHoles()
+    outline = proto.outline
+    point(outline, 0, 0)
+    point(outline, 10_123_457, -3)
+    arc(outline, (10_123_457, -3), (15_000_001, 5_000_000), (10_000_000, 10_000_000))
+    arc(outline, (9_000_000, 10_000_000), (4_500_000, 12_345_678), (0, 10_000_000))
+    point(outline, 0, 0)  # closed ring: the duplicate closing point must be popped
+    hole = proto.holes.add()
+    point(hole, 2_000_000, 2_000_000)
+    point(hole, 3_000_000, 2_000_000)
+    arc(hole, (3_000_000, 2_000_000), (3_500_000, 2_500_000), (3_000_000, 3_000_000))
+    point(hole, 2_000_000, 2_000_000)
+    hole2 = proto.holes.add()
+    arc(hole2, (5_000_000, 5_000_000), (5_000_000, 5_000_000), (5_000_001, 5_000_002))  # degenerate
+    return proto
+
+
+def test_protobuf_polygon_decode_matches_kipy_wrapper_path():
+    from kipy.geometry import PolygonWithHoles
+
+    proto = _polygon_with_holes_proto()
+    wrapper = PolygonWithHoles(proto)
+    expected_outline = _wrapper_polyline_points(wrapper.outline)
+    expected_holes = [_wrapper_polyline_points(h) for h in wrapper.holes]
+    assert len(expected_outline) > 10 and len(expected_holes) == 2
+
+    for source in (wrapper, proto):  # kipy wrapper and raw proto both decode the proto directly
+        poly = extract._poly(source)
+        assert poly.outline == expected_outline
+        assert poly.holes == expected_holes
+        assert all(type(v) is float for pt in poly.outline for v in pt)
+    assert extract._polyline_points(wrapper.outline) == expected_outline
+    assert extract._polyline_points(proto.outline) == expected_outline
+
+
+def test_polygon_decode_keeps_duck_typed_wrapper_fallback():
+    def pnode(x, y):
+        return SimpleNamespace(has_point=True, has_arc=False, point=SimpleNamespace(x=x, y=y))
+
+    line = SimpleNamespace(nodes=[pnode(0, 0), pnode(1_000_000, 0), pnode(1_000_000, 1_000_000),
+                                  pnode(0, 0)])
+    poly = extract._poly(SimpleNamespace(outline=line, holes=[]))
+    assert poly.outline == [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+    assert poly.holes == []

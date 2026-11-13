@@ -279,6 +279,134 @@ def test_stale_preview_carries_models_that_are_ready_in_time(cached_demo, monkey
     assert final._components == ([model], ["note"], signature)
 
 
+def _edited_with_models(cached_demo):
+    from layer_viewer.model import Footprint, Model3D
+    snapshot, full, _, _ = cached_demo
+    changed = deepcopy(snapshot)
+    changed.tracks[0].end = (13., 2.)
+    changed.footprints = [Footprint("f", "U1", "IC", (5, 5), "top", models=[Model3D("part.step")])]
+    return changed, replace(full.parts[0], key="component:U1", kind="component")
+
+
+def test_changed_board_load_computes_part_signatures_once(cached_demo, monkeypatch):
+    from layer_viewer.loading import load_complete_scene
+    snapshot, _, _, _ = cached_demo
+    changed = deepcopy(snapshot)
+    changed.tracks[0].end = (13., 2.)
+    reference = geometry.build_scene(changed)
+    calls = []
+    original = geometry._scene_signatures
+
+    def counted(board):
+        calls.append(board)
+        return original(board)
+    monkeypatch.setattr(geometry, "_scene_signatures", counted)
+    final, hit = load_complete_scene(changed, via_details=True, components=False, preview=lambda s: None)
+    assert not hit and len(calls) == 1 and calls[0] is changed
+    assert_matches_requested(final, reference, set(reference._geometry_signatures))
+    assert getattr(final, "_mask_shape_signatures", None) == reference._mask_shape_signatures
+
+
+def test_rebuild_starts_behind_stale_preview_while_models_load(cached_demo, monkeypatch):
+    import threading
+    from layer_viewer import components
+    from layer_viewer.loading import load_complete_scene
+    changed, model = _edited_with_models(cached_demo)
+    reference = geometry.build_scene(changed)
+    build_started, previewed = threading.Event(), threading.Event()
+    seen = {}
+    real_build = geometry.build_scene
+
+    def models(*args, **kwargs):
+        seen["build_before_models"] = build_started.wait(5)
+        return [model], ["note"]
+
+    def build(*args, **kwargs):
+        seen["build_thread"] = threading.current_thread().name
+        build_started.set()
+        seen["preview_before_build_done"] = previewed.wait(5)
+        return real_build(*args, **kwargs)
+
+    def preview(stale):
+        seen["preview_thread"] = threading.current_thread().name
+        seen["preview_components"] = getattr(stale, "_components", None)
+        previewed.set()
+    monkeypatch.setattr(components, "build_component_parts", models)
+    monkeypatch.setattr(geometry, "build_scene", build)
+    final, hit = load_complete_scene(changed, via_details=True, preview=preview)
+    signature = components.component_signature(changed)
+    assert not hit and seen["build_before_models"] and seen["preview_before_build_done"]
+    assert seen["build_thread"].startswith("pcb-build")
+    assert seen["preview_thread"] == threading.current_thread().name
+    assert seen["preview_components"] == ([model], ["note"], signature)
+    assert final._components == ([model], ["note"], signature)
+    assert_matches_requested(final, reference, set(reference._geometry_signatures))
+
+
+def test_stale_preview_is_skipped_once_the_rebuild_finished_first(cached_demo, monkeypatch):
+    import threading
+    import time
+    from layer_viewer import components
+    from layer_viewer.loading import load_complete_scene
+    changed, model = _edited_with_models(cached_demo)
+    built = threading.Event()
+    real_build = geometry.build_scene
+
+    def models(*args, **kwargs):
+        built.wait(5)
+        time.sleep(.4)  # still loading when the load thread sees the build finish
+        return [model], []
+
+    def build(*args, **kwargs):
+        try:
+            return real_build(*args, **kwargs)
+        finally:
+            built.set()
+    monkeypatch.setattr(components, "build_component_parts", models)
+    monkeypatch.setattr(geometry, "build_scene", build)
+    previews = []
+    final, _ = load_complete_scene(changed, via_details=True, preview=previews.append)
+    assert previews == []
+    assert final._components[0] == [model]
+
+
+def test_failed_stale_preview_stops_the_background_rebuild(cached_demo, monkeypatch):
+    import threading
+    import time
+    from layer_viewer import components
+    from layer_viewer.loading import load_complete_scene
+    changed, model = _edited_with_models(cached_demo)
+    previewed, release, cancelled = threading.Event(), threading.Event(), threading.Event()
+
+    def models(*args, **kwargs):
+        release.wait(5)
+        return [model], []
+
+    def build(snapshot, progress=None, **kwargs):
+        previewed.wait(5)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                progress.check_cancel()
+            except RuntimeError:
+                cancelled.set()
+                raise
+            time.sleep(.01)
+        raise AssertionError("build was never stopped")
+
+    def preview(stale):
+        previewed.set()
+        raise KeyError("viewer gone")
+    monkeypatch.setattr(components, "build_component_parts", models)
+    monkeypatch.setattr(geometry, "build_scene", build)
+    begin = time.monotonic()
+    with pytest.raises(KeyError):
+        load_complete_scene(changed, via_details=True, preview=preview)
+    assert time.monotonic() - begin < 4.5
+    assert cancelled.wait(2)
+    release.set()
+
+
 def _side_mask(snapshot, layer):
     """The resist whose over-copper faces depend on this copper layer, if any."""
     copper = snapshot.stackup.copper
