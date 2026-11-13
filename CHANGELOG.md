@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.4
 
 - Capped (POFV) vias are visible, as on real boards: resist over a cap is a
   step lighter than over copper (the plated cap stands proud, so the resist is
