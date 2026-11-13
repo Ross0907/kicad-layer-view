@@ -8,7 +8,9 @@ A KiCad 10 IPC plugin that opens a separate 3D window following the active PCB
 editor — including unsaved edits — and lets you pull the board apart into its
 physical copper, dielectric, solder-mask, silkscreen and paste layers.
 
-![Exploded demo board](docs/exploded.png)
+![Exploded 10-layer SDR board](docs/exploded.png)
+
+*A 10-layer software-defined-radio board, exploded into its physical layers.*
 
 ## Features
 
@@ -53,7 +55,11 @@ physical copper, dielectric, solder-mask, silkscreen and paste layers.
   export at any resolution.
 - **Read-only.** The plugin never saves, refills or edits the board.
 
-| Assembled | X-ray with via barrels |
+![Ray-traced render](docs/raytraced.png)
+
+*Ray-traced export: ENIG pads, two-tone green resist, metal SMA connectors.*
+
+| Assembled | X-ray, vias extended through the layers |
 |---|---|
 | ![Assembled](docs/assembled.png) | ![X-ray](docs/xray.png) |
 
