@@ -63,11 +63,11 @@ physical copper, dielectric, solder-mask, silkscreen and paste layers.
 |---|---|
 | ![Exploded side view](docs/exploded_side.png) | ![Assembled](docs/assembled.png) |
 
-![X-ray, vias extended through the layers](docs/xray.png)
+<img src="docs/xray.png" width="70%" alt="X-ray, vias extended through the layers">
 
 *X-ray: copper and barrels only, with via connections extended through the layer gaps.*
 
-![Z cross-section sweeping down through the copper layers](docs/zcut.gif)
+<img src="docs/zcut.gif" width="70%" alt="Z cross-section sweeping down through the copper layers">
 
 *Cross-section → Z with Reverse cut, PCB editor colors, and dielectric and vias hidden: the cut peels the
 stack from the top, one copper layer at a time.*
