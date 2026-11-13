@@ -196,7 +196,7 @@ class BoardViewport(QWidget):
         # refiner accumulates jittered frames for still views.
         self.plotter = QtInteractor(self, auto_update=False, multi_samples=0)
         layout.addWidget(self.plotter.interactor)
-        self.background = "kicad"
+        self.background = "dark"  # matches the ray tracer and the dark UI
         self.set_background(self.background, render=False)
         self.plotter.enable_anti_aliasing("fxaa")
         self._configure_fxaa(True)

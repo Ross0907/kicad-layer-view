@@ -2,13 +2,16 @@
 
 ## 0.7.2
 
+- The viewport opens on the dark background, matching the ray tracer and the
+  window; the KiCad gradient stays under Render settings → Background.
 - Realistic style: inner copper layers are bare copper, the same color as
   copper under the outer resist; only exposed outer copper shows the plated
   finish, so every layer of the exploded stack matches.
 - Gold/brass model parts (SMA connectors, gold pins) show a deeper plated
   gold instead of a pale cream that read as silver.
-- README screenshots: the 10-layer custom SDR board in orthographic views,
-  including a side view of the exploded stack and a ray-traced render.
+- README screenshots: the 10-layer custom SDR board in orthographic views on
+  the dark background, including a side view of the exploded stack and a
+  ray-traced render.
 
 ## 0.7.1
 
