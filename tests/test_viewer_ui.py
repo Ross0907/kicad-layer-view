@@ -347,6 +347,10 @@ def test_live_layer_removal_releases_solo_and_keeps_selected_layer(window):
     assert any(actor.GetVisibility() for actor in window.viewport.actors.values())
 
 
+def test_solder_paste_shows_by_default(window):
+    assert window.kind_boxes["paste"].isChecked()
+
+
 def test_via_details_start_disabled_and_finish_toggle_keeps_caps_closed(window):
     assert not window.kind_boxes["barrel"].isChecked()
     assert not window.kind_boxes["fill"].isChecked()

@@ -292,7 +292,7 @@ class MainWindow(QMainWindow):
                                            ("via_patch", "POFV contrast"))):
             box = QCheckBox(title)
             # KiCad shows capped vias in the plain finish; contrast is opt-in.
-            box.setChecked(kind not in ("paste", "via_patch"))
+            box.setChecked(kind != "via_patch")
             box.toggled.connect(self.apply_visibility)
             self.kind_boxes[kind] = box
             detail_row.addWidget(box, i // 2, i % 2)
@@ -320,7 +320,7 @@ class MainWindow(QMainWindow):
             model_row.addWidget(box, i // 3, i % 3)
         layout.addLayout(model_row)
         self.kind_boxes["paste"].setToolTip("Front/back stencil deposits from the PCB paste artwork; "
-                                           "illustrative 0.08 mm thickness, not reflowed joints.")
+                                           "illustrative 0.04 mm thickness, not reflowed joints.")
         self.extend_vias = QCheckBox("Extend vias across gaps")
         self.extend_vias.setChecked(False)
         self.extend_vias.setToolTip(
