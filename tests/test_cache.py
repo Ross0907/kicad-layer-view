@@ -230,9 +230,10 @@ def test_reopening_edited_board_loads_only_unchanged_meshes(reusable_cache, monk
     monkeypatch.setattr(pv, "read", read)
     previous = cache.load_previous_scene(changed)
     assert previous is not None
-    assert len(reads) == len(scene.parts) - 1
+    dependent = {dirty, _side_mask(changed, changed.tracks[0].layer)} - {None}
+    assert len(reads) == len(scene.parts) - len(dependent)
     assert dirty not in previous._geometry_signatures
-    assert {part.key for part in previous.parts} == {part.key for part in scene.parts} - {dirty}
+    assert {part.key for part in previous.parts} == {part.key for part in scene.parts} - dependent
     expected_signatures = geometry._scene_signatures(changed)
     assert previous._geometry_signatures == {
         key: value for key, value in scene._geometry_signatures.items()
@@ -427,3 +428,9 @@ def test_cache_rejects_malformed_completeness(cache_setup):
     data["is_complete"] = "false"
     path.write_text(json.dumps(data))
     assert cache.load_cached_scene(snapshot) is None
+
+
+def _side_mask(snapshot, layer):
+    """The resist whose over-copper faces depend on this copper layer, if any."""
+    copper = snapshot.stackup.copper
+    return {copper[0].id: "mask:F.Mask", copper[-1].id: "mask:B.Mask"}.get(layer)

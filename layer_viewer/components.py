@@ -9,12 +9,14 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import re
 import threading
 import tempfile
+import time
 import uuid
 import zipfile
 
@@ -33,9 +35,10 @@ class ModelMesh:
     roughness: float = .48
 
 
+log = logging.getLogger(__name__)
 _MEMORY = OrderedDict()
 _LOCK = threading.RLock()
-_CACHE_VERSION = "component-step-vrml-3-inherited-colors"
+_CACHE_VERSION = "component-step-vrml-4-neutral-metals"
 
 
 def component_surface(color, opacity=1.0, *, name="", specular=None, specular_power=None):
@@ -56,7 +59,9 @@ def component_surface(color, opacity=1.0, *, name="", specular=None, specular_po
     # A broad "near white" range incorrectly made warm ivory ceramic bodies
     # conductive. Keep the color-only inference close to neutral plated metal.
     neutral_tolerance = .06 if specular is None else .105
-    neutral = .55 <= high <= .94 and high - low <= neutral_tolerance
+    # pcb2blender treats any near-neutral, not dark color as metal; plated
+    # connector shells (BNC, USB, shields) are mid greys around 0.5.
+    neutral = .42 <= high <= .94 and high - low <= neutral_tolerance
     # STEP exporters also use a slightly blue silver finish for lids and pins.
     # Limit this fallback to bright, weakly tinted surfaces without authored
     # specular metadata; saturated blue bodies and warm ceramics stay dielectric.
@@ -73,6 +78,21 @@ def component_surface(color, opacity=1.0, *, name="", specular=None, specular_po
     if specular_power is not None and specular is not None and max(specular) > .01:
         roughness = max(.18, min(.65, math.sqrt(2.0 / (float(specular_power) + 2.0))))
     return (1.0 if metal else 0.0), roughness
+
+
+def _is_gold(color):
+    r, g, b = map(float, color[:3])
+    return r >= .64 and .64 <= g / max(r, 1e-6) <= .94 and b < g * .8 and r - b >= .22
+
+
+def metal_display_color(color):
+    """Display color of a metal model part, as pcb2blender renders it.
+
+    KiCad library material colors (PIN-01 tin, PIN-02 gold, MET-*) were
+    authored as linear reflectance; shown as sRGB they read as dull paint.
+    """
+    return tuple(float(1.055 * max(0., v) ** (1 / 2.4) - .055 if v > .0031308 else 12.92 * v)
+                 for v in color[:3])
 
 
 def _version_key(path):
@@ -179,7 +199,10 @@ def component_signature(snapshot):
         if not footprint.models:
             continue
         footprints.append((footprint.id, footprint.reference, footprint.value, footprint.position, footprint.angle_deg,
-                           footprint.side, [asdict(model) for model in footprint.models]))
+                           footprint.side, getattr(footprint, "mounting", ""),
+                           bool(getattr(footprint, "dnp", False)),
+                           bool(getattr(footprint, "exclude_from_pos", False)),
+                           [asdict(model) for model in footprint.models]))
         for model in footprint.models:
             if model.filename not in files:
                 path = resolve_model_path(model.filename, snapshot.project_dir, environment)
@@ -244,6 +267,13 @@ def _write_cache(path, meshes):
         with temp.open("wb") as stream:
             np.savez_compressed(stream, **arrays)
         os.replace(temp, path)
+        now = time.time()
+        for stale in path.parent.glob(".*.npz.*.tmp"):
+            try:
+                if now - stale.stat().st_mtime > 3600:
+                    stale.unlink(missing_ok=True)
+            except OSError:
+                pass
         files = sorted(path.parent.glob("*.npz"), key=lambda f: f.stat().st_mtime, reverse=True)
         total = 0
         for i, cached in enumerate(files):
@@ -304,6 +334,87 @@ def load_model(path, *, cache_dir=None):
         while len(_MEMORY) > 128:
             _MEMORY.popitem(last=False)
         return meshes
+
+
+def _model_cached(path):
+    key = _cache_key(path)
+    with _LOCK:
+        if key in _MEMORY:
+            return True
+    return (_cache_root() / f"{key}.npz").is_file()
+
+
+def _initialize_model_worker():
+    try:
+        if os.name == "nt":
+            import ctypes
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)
+        else:
+            os.nice(5)
+    except Exception:  # noqa: BLE001 - priority is a courtesy only
+        pass
+
+
+def _parse_model_worker(path):
+    """Worker process: parse one model and store it in the shared disk cache."""
+    load_model(path)
+    return path
+
+
+# Parsing a STEP file is single-threaded CPU work (OpenCascade holds the GIL);
+# a board's first load of 30+ distinct models took 20 s one after another.
+MIN_PARALLEL_MODELS = 3
+
+
+def preload_models(paths, progress=None):
+    """Parse uncached models in parallel worker processes (best effort).
+
+    Workers write the normal disk cache, so the in-process loader afterwards
+    only reads compressed arrays. Any failure leaves those models to be
+    parsed in-process as before. ``LAYER_VIEW_MESH_PROCESSES=0`` disables it.
+    """
+    from . import mesh_pool
+    missing = []
+    for path in dict.fromkeys(Path(p).resolve() for p in paths):
+        try:
+            if path.suffix.lower() in (".step", ".stp", ".wrl", ".vrml") and not _model_cached(path):
+                missing.append(path)
+        except OSError:
+            continue
+    if len(missing) < MIN_PARALLEL_MODELS or not mesh_pool.available():
+        return 0
+    import multiprocessing
+    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+    missing.sort(key=lambda path: path.stat().st_size, reverse=True)  # longest first
+    workers = max(2, min(len(missing), mesh_pool.process_count()))
+    try:
+        executor = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                                       initializer=_initialize_model_worker)
+    except Exception:  # noqa: BLE001 - parse in-process instead
+        log.warning("Model worker processes unavailable", exc_info=True)
+        return 0
+    done_count = 0
+    try:
+        pending = {executor.submit(_parse_model_worker, str(path)) for path in missing}
+        while pending:
+            if progress is not None and hasattr(progress, "check_cancel"):
+                progress.check_cancel()
+            finished, pending = wait(pending, timeout=.1, return_when=FIRST_COMPLETED)
+            for future in finished:
+                if future.exception() is None:
+                    done_count += 1
+            if finished and progress is not None and hasattr(progress, "info"):
+                progress.info(f"Loading 3D models · {done_count}/{len(missing)} parsed in parallel")
+    finally:
+        processes = list((getattr(executor, "_processes", None) or {}).values())
+        executor.shutdown(wait=False, cancel_futures=True)
+        if pending:
+            for process in processes:  # cancelled: do not leave OpenCascade busy
+                try:
+                    process.terminate()
+                except Exception:  # noqa: BLE001
+                    pass
+    return done_count
 
 
 def _vrml_material_appearances(source):
@@ -493,10 +604,18 @@ def _read_step(path, *, previous=None):
     if previous is not None and entries and not any(
             changed_face_colors(shape, color, color) for shape, _, color in entries):
         return previous
+    # Absolute 10 um surface tolerance, 0.2 rad angular tolerance. This is
+    # independent of viewport resolution and never decimates model faces.
+    # One compound lets OpenCascade tessellate all faces in parallel; meshing
+    # each of thousands of small shapes separately ran on one core.
+    from OCP.BRep import BRep_Builder
+    from OCP.TopoDS import TopoDS_Compound
+    compound, builder = TopoDS_Compound(), BRep_Builder()
+    builder.MakeCompound(compound)
+    for shape, _, _ in entries:
+        builder.Add(compound, shape)
+    BRepMesh_IncrementalMesh(compound, .01, False, .2, True)
     for shape, transform, color in entries:
-        # Absolute 10 um surface tolerance, 0.2 rad angular tolerance. This is
-        # independent of viewport resolution and never decimates model faces.
-        BRepMesh_IncrementalMesh(shape, .01, False, .2, False)
         collect_faces(shape, transform, color)
     result = []
     for material, chunks in groups.items():
@@ -540,6 +659,11 @@ def build_component_parts(snapshot, slot_count, progress=None):
     groups, warnings = {}, []
     resolved, loaded = {}, {}
     for footprint in snapshot.footprints:
+        for model in footprint.models:
+            if model.visible and model.opacity > 0 and model.filename not in resolved:
+                resolved[model.filename] = resolve_model_path(model.filename, snapshot.project_dir, environment)
+    preload_models([path for path in resolved.values() if path is not None], progress)
+    for footprint in snapshot.footprints:
         if progress is not None and hasattr(progress, "check_cancel"):
             progress.check_cancel()
         for model in footprint.models:
@@ -562,16 +686,28 @@ def build_component_parts(snapshot, slot_count, progress=None):
                     loaded[path] = []
                     warnings.append(f"3D model {path.name}: {exc}")
             transform = model_transform(footprint, model, snapshot.stackup.board_thickness_mm)
-            for mesh in loaded[path]:
-                material = (footprint.side, mesh.color, round(mesh.opacity * model.opacity, 6),
-                            mesh.metallic, mesh.roughness, led_lens(footprint, model, mesh))
+            model_class = (footprint.side, getattr(footprint, "mounting", ""),
+                           bool(getattr(footprint, "dnp", False)),
+                           bool(getattr(footprint, "exclude_from_pos", False)))
+            meshes = loaded[path]
+            for mesh in meshes:
+                metallic = mesh.metallic
+                if len(meshes) == 1 and metallic >= .5 and not _is_gold(mesh.color):
+                    # A one-color model (a whole module or a placeholder export)
+                    # carries no material intent; a grey body is not plated metal.
+                    metallic = 0.
+                color = metal_display_color(mesh.color) if metallic >= .5 else mesh.color
+                material = (model_class, color, round(mesh.opacity * model.opacity, 6),
+                            metallic, mesh.roughness if metallic == mesh.metallic else .48,
+                            led_lens(footprint, model, mesh))
                 points = mesh.points @ transform[:3, :3].T + transform[:3, 3]
                 triangles = mesh.triangles
                 if np.linalg.det(transform[:3, :3]) < 0:
                     triangles = triangles[:, [0, 2, 1]]
                 groups.setdefault(material, []).append((points, triangles))
     parts = []
-    for index, ((side, color, opacity, metallic, roughness, led), chunks) in enumerate(sorted(groups.items())):
+    for index, ((model_class, color, opacity, metallic, roughness, led), chunks) in enumerate(sorted(groups.items())):
+        side = model_class[0]
         points, triangles = _merge_arrays(chunks)
         faces = np.column_stack((np.full(len(triangles), 3), triangles)).ravel()
         part = ScenePart(f"component:{side}:{index}", f"Components ({side})", "component", None,
@@ -579,5 +715,6 @@ def build_component_parts(snapshot, slot_count, progress=None):
         part.opacity = opacity
         part.metallic, part.roughness = metallic, roughness
         part.led = led
+        part.model_class = model_class
         parts.append(part)
     return parts, warnings

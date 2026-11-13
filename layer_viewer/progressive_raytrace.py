@@ -101,8 +101,19 @@ def _material(mesh, *, coated=False):
         # Solder resist is dielectric; sharp restrained highlights distinguish
         # it from the underlying conductor without an oily clearcoat lobe.
         # Matte resists (black, white) carry a higher roughness.
+        roughness = getattr(mesh, "roughness", None) or .36
         opaque = {"type": "principled", "base_color": rgb, "metallic": 0.,
-                  "roughness": getattr(mesh, "roughness", None) or .36, "eta": 1.48}
+                  "roughness": roughness, "eta": 1.48}
+        from .finishes import resist_light_color
+        light = resist_light_color(mesh.color)
+        if coated and light is not None:
+            # pcb2blender: lighter and glossier (half roughness) over copper.
+            opaque = {"type": "blendbsdf",
+                      "weight": {"type": "mesh_attribute", "name": "face_resist_coverage"},
+                      "bsdf_0": opaque,
+                      "bsdf_1": {"type": "principled", "metallic": 0., "eta": 1.48,
+                                 "base_color": {"type": "rgb", "value": _linear(light).tolist()},
+                                 "roughness": roughness * .5}}
     elif mesh.kind == "component":
         opaque = {"type": "principled", "base_color": rgb,
                   "metallic": mesh.metallic if mesh.metallic is not None else 0.,
@@ -136,15 +147,25 @@ def _material(mesh, *, coated=False):
         # (1-opacity), rather than (1-opacity)^2 (only 2.9% at alpha=.83).
         transmission_weight = float(np.sqrt(transmission_weight))
         tint = np.asarray(mesh.color, dtype=float)
-        tint = np.clip(tint / max(.15, float(tint.max())), .04, 1.) ** (opacity / 2)
+        peak = float(tint.max())
+        if peak - float(tint.min()) < .03:
+            # Neutral (black/grey) resist absorbs evenly by its own darkness;
+            # normalizing it to a bright tint let a brown copper cast through.
+            tint = np.clip(tint / max(.5, peak), 0., 1.) ** (opacity / 2)
+        else:
+            tint = np.clip(tint / max(.15, peak), .04, 1.) ** (opacity / 2)
         transmission = {"type": "thindielectric", "int_ior": 1., "ext_ior": 1.,
                         "specular_transmittance": {"type": "rgb", "value": tint.tolist()}}
     return {"type": "blendbsdf", "weight": transmission_weight,
             "bsdf_0": opaque, "bsdf_1": transmission}
 
 
-def _mask_surface(mesh, points, triangles):
-    """Keep one optical coating and report whether its outward face survives."""
+def _mask_surface(mesh, points, triangles, coverage=None):
+    """Keep one optical coating and report whether its outward face survives.
+
+    With ``coverage`` (per-face over-copper tags) the kept faces' tags are
+    returned as a third value.
+    """
     matrix = np.asarray(mesh.transform)
     normal = np.linalg.inv(matrix[:3, :3]).T @ np.array((0., 0., 1.))
     if mesh.name == "B.Mask":
@@ -152,7 +173,10 @@ def _mask_surface(mesh, points, triangles):
     vertices = points[triangles]
     orientation = np.cross(vertices[:, 1] - vertices[:, 0],
                            vertices[:, 2] - vertices[:, 0]) @ normal
-    return triangles[orientation >= -1e-15], bool(np.any(orientation > 1e-15))
+    keep = orientation >= -1e-15
+    if coverage is not None:
+        return triangles[keep], bool(np.any(orientation > 1e-15)), np.asarray(coverage)[keep]
+    return triangles[keep], bool(np.any(orientation > 1e-15))
 
 
 def _coating_weights(mesh, coverage, masks):
@@ -355,10 +379,15 @@ class ProgressiveRayTracer:
         for index, mesh in enumerate(capture.meshes):
             if mesh.kind == "mask" and mesh.name in ("F.Mask", "B.Mask"):
                 self._check_cancel()
-                points, triangles = _world_mesh(mesh)
-                triangles, outward_visible = _mask_surface(mesh, points, triangles)
+                points, triangles, over_copper = _world_mesh(mesh, include_coating=True)
+                if over_copper is not None and over_copper.ndim == 1:
+                    triangles, outward_visible, over_copper = _mask_surface(mesh, points, triangles,
+                                                                            over_copper)
+                else:
+                    triangles, outward_visible = _mask_surface(mesh, points, triangles)
+                    over_copper = None
                 masks[mesh.name] = (mesh, outward_visible)
-                mask_geometry[index] = (points, triangles)
+                mask_geometry[index] = (points, triangles, over_copper)
         for index, mesh in enumerate(capture.meshes):
             self._report(f"Uploading {index + 1}/{len(capture.meshes)}: {mesh.name}")
             if index in mask_geometry:
@@ -367,13 +396,16 @@ class ProgressiveRayTracer:
                 # PCB scale. Tracing that interface can skip the copper face and
                 # scatter the coating twice. Keep the exact outer surface and
                 # aperture walls; the two-sided BSDF also shows its underside.
-                points, triangles = mask_geometry.pop(index)
+                points, triangles, over_copper = mask_geometry.pop(index)
                 coverage = None
             else:
+                over_copper = None
                 points, triangles, coverage = _world_mesh(mesh, include_coating=True)
             if not len(triangles):
                 continue
             weights = _coating_weights(mesh, coverage, masks)
+            if over_copper is not None:
+                weights = np.asarray(over_copper, dtype=np.float32)
             props = mi.Properties()
             props["bsdf"] = mi.load_dict(_material(mesh, coated=weights is not None))
             if any(mesh.emission):

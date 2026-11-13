@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.7.0
+
+Every board shows its stackup
+- Edge.Cuts outlines whose segment ends miss by a few microns are chained like
+  KiCad does (0.02 mm), instead of leaving the board without a substrate,
+  solder mask and silkscreen. An outline that is really open falls back to the
+  hull of the drawing, with a warning.
+
+Real metal
+- Plated finishes and metal model parts are physically based metals in the
+  OpenGL viewport, reflecting a studio environment, instead of flat paint.
+- Finish colors follow measured metal reflectance and KiCad's library pin
+  materials (as pcb2blender uses them): HASL, ENIG gold, bare copper/OSP,
+  immersion silver and tin. Copper under the resist keeps its own warm color.
+- 3D models: plated parts (connector shells, shields, pins) are detected like
+  pcb2blender and shown in their real metal color in both renderers; one-color
+  placeholder models stay as they are.
+- Black solder resist is nearly opaque, without the brown copper cast, in
+  both the viewport and the ray tracer.
+
+KiCad 3D viewer model filters
+- THT, SMD, Virtual, Not in POS and DNP model filters with KiCad's exact
+  rules, plus top/bottom side. Filters apply instantly, without reloading.
+
+Loading
+- Uncached STEP/VRML models are parsed in parallel worker processes, and each
+  model is tessellated in parallel (first load of a 33-model board: 20 s → 10 s).
+
 ## 0.6.0
 
 Real-time ray tracing

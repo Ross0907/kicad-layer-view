@@ -81,43 +81,65 @@ DEFAULT_BOARD_BODY = (.43, .45, .30, .90)
 DEFAULT_PASTE = (.50, .50, .50, 1.)
 STACKUP_KINDS = ("mask", "silk", "paste", "dielectric")
 
-# Realistic fabrication colors (sRGB), referenced to JLCPCB production boards.
-# Bare copper is what the resist covers; exposed copper carries the finish.
-BARE_COPPER_COLOR = _rgb(196, 122, 70)
-HASL_COLOR = _rgb(204, 205, 209)
-REAL_ENIG_COLOR = _rgb(214, 176, 72)
-REAL_SILVER_COLOR = _rgb(222, 222, 224)
-REAL_TIN_COLOR = _rgb(178, 178, 182)
+# Realistic plated metals (sRGB), shared by the viewport and the path tracer:
+# the ray tracer uses each swatch, decoded to linear, as the metal's F0.
+# Values follow measured metal reflectance (physicallybased.info) and the
+# pcb2blender / KiCad library pin materials (PIN-01 tin, PIN-02 gold).
+# pcb2blender's PCB surface-finish shader colors (materials.py), the KiCad
+# library PIN-01/PIN-02 materials; silver/tin from mat4cad METAL_COLORS.
+BARE_COPPER_COLOR = _rgb(0xe1, 0xbb, 0xac)  # pcb2blender NONE (bare copper / OSP)
+HASL_COLOR = _rgb(0xea, 0xea, 0xe5)         # pcb2blender HASL
+REAL_ENIG_COLOR = _rgb(0xef, 0xdf, 0xbb)    # pcb2blender ENIG
+REAL_SILVER_COLOR = _rgb(0xe7, 0xe5, 0xe1)
+REAL_TIN_COLOR = _rgb(0xcb, 0xca, 0xc0)
+SOLDER_COLOR = _rgb(0xaa, 0xaa, 0xa6)       # pcb2blender solder
+# Copper seen through solder resist: the warm, partly diffuse color that tints
+# green resist yellow-green over traces (not a mirror-like metal).
+COVERED_COPPER_COLOR = _rgb(196, 122, 70)
 STYLES = ("realistic", "kicad")
 STYLE = "realistic"
-_RAY_METAL.update({
-    BARE_COPPER_COLOR: _srgb_reflectance((.955, .637, .538)),
-    HASL_COLOR: _srgb_reflectance((.84, .84, .86)),
-    REAL_ENIG_COLOR: _srgb_reflectance((1., .766, .336)),
-    REAL_SILVER_COLOR: _srgb_reflectance((.972, .960, .915)),
-    REAL_TIN_COLOR: _srgb_reflectance((.78, .78, .80)),
-})
 # Resist pigment and opacity per KiCad color name. Opacity is how much of the
 # copper pattern is hidden: green and blue show traces clearly, black hides
 # almost everything, white is dense.
-_REAL_MASK = {NOT_SPECIFIED: ((28, 112, 62), .74), "Green": ((28, 112, 62), .74),
-              "Light Green": ((88, 160, 52), .80), "Saturated Green": ((12, 112, 34), .80),
-              "Red": ((172, 26, 30), .86), "Light Red": ((204, 52, 40), .86),
-              "Red/Orange": ((226, 72, 38), .86), "Blue": ((16, 58, 150), .84),
-              "Light Blue 1": ((58, 98, 168), .84), "Light Blue 2": ((70, 112, 182), .84),
-              "Green/Blue": ((18, 84, 94), .82), "Black": ((20, 20, 22), .97),
-              "White": ((238, 238, 233), .95), "Purple": ((74, 30, 112), .86),
-              "Light Purple": ((128, 62, 140), .86), "Yellow": ((228, 192, 32), .88)}
-# Matte resists scatter more; black and white production resists are matte.
-MASK_ROUGHNESS = {"Black": .55, "White": .45}
-_REAL_SILK = {NOT_SPECIFIED: (240, 240, 236), "White": (240, 240, 236), "Black": (24, 24, 24)}
+# pcb2blender's solder-mask shader (MASK_COLOR_MAP): each resist has a
+# "light" color where copper lies beneath and a "dark" color elsewhere. The
+# dark color is the layer color; faces over copper are tagged when meshing.
+_P2B_MASK = {"GREEN": ((0x43, 0xa1, 0x42), (0x22, 0x52, 0x1f)),
+             "RED": ((0xde, 0x54, 0x4c), (0x73, 0x3a, 0x38)),
+             "YELLOW": ((0xda, 0xcb, 0x57), (0x6a, 0x7c, 0x30)),
+             "BLUE": ((0x3b, 0x69, 0xaa), (0x1c, 0x36, 0x59)),
+             "PURPLE": ((0x74, 0x48, 0xaa), (0x3b, 0x23, 0x59)),
+             "WHITE": ((0xd3, 0xcf, 0xc9), (0xe1, 0xdd, 0xdc)),
+             "BLACK": ((0x10, 0x10, 0x0f), (0x00, 0x00, 0x00))}
+_MASK_FAMILY = {NOT_SPECIFIED: "GREEN", "Green": "GREEN", "Light Green": "GREEN",
+                "Saturated Green": "GREEN", "Red": "RED", "Light Red": "RED", "Red/Orange": "RED",
+                "Blue": "BLUE", "Light Blue 1": "BLUE", "Light Blue 2": "BLUE", "Green/Blue": "BLUE",
+                "Black": "BLACK", "White": "WHITE", "Purple": "PURPLE", "Light Purple": "PURPLE",
+                "Yellow": "YELLOW"}
+# The two-tone color already shows the copper pattern, so the resist is nearly
+# opaque (a little translucency keeps exploded and X-ray views readable).
+_MASK_OPACITY = {"BLACK": .99, "WHITE": .97}
+_REAL_MASK = {name: (_P2B_MASK[family][1], _MASK_OPACITY.get(family, .94))
+              for name, family in _MASK_FAMILY.items()}
+_RESIST_LIGHT = {tuple(round(v / 255, 6) for v in dark): tuple(v / 255 for v in light)
+                 for light, dark in _P2B_MASK.values()}
+# pcb2blender MASK_ROUGHNESS_MAP (default 0.45); over copper it is halved.
+MASK_ROUGHNESS = {"White": .4}
+# pcb2blender silkscreen: white ink, or black ink on light resist.
+_REAL_SILK = {NOT_SPECIFIED: (0xf3, 0xf1, 0xf0), "White": (0xf3, 0xf1, 0xf0), "Black": (0x10, 0x0f, 0x0f)}
 # Natural FR4 is a pale, slightly green tan at a routed edge.
 REAL_FR4 = ((178, 168, 112), 1.)
 _REAL_BOARD = {"FR4 natural": REAL_FR4, "FR4 natural, dark": ((116, 100, 58), 1.)}
 
 # Every color this module can assign to a conductor, for legacy-cache checks.
 _PRESETS = (COPPER_COLOR, ENIG_COLOR, SILVER_COLOR, TIN_COLOR, DEFAULT_FINISH_COLOR,
-            BARE_COPPER_COLOR, HASL_COLOR, REAL_ENIG_COLOR, REAL_SILVER_COLOR, REAL_TIN_COLOR)
+            BARE_COPPER_COLOR, HASL_COLOR, REAL_ENIG_COLOR, REAL_SILVER_COLOR, REAL_TIN_COLOR,
+            COVERED_COPPER_COLOR)
+
+
+def resist_light_color(rgb):
+    """pcb2blender's over-copper color for a realistic resist color, else None."""
+    return _RESIST_LIGHT.get(tuple(round(float(v), 6) for v in rgb[:3]))
 
 
 def set_style(style):
@@ -134,7 +156,7 @@ def _style(style):
 
 def under_mask_copper(style=None):
     """Display color of resist-covered copper, or None when it keeps the finish."""
-    return BARE_COPPER_COLOR if _style(style) == "realistic" else None
+    return COVERED_COPPER_COLOR if _style(style) == "realistic" else None
 
 
 def is_named_stackup_color(value):
@@ -151,7 +173,7 @@ def material_appearance(kind, value="", style=None, context=None):
     ``context`` may give the resist color name, which picks legible legend ink.
     """
     if kind == "paste":
-        return DEFAULT_PASTE
+        return (*SOLDER_COLOR, 1.) if _style(style) == "realistic" else DEFAULT_PASTE
     if isinstance(value, (list, tuple)) and len(value) in (3, 4):
         if all(isinstance(v, (int, float)) and math.isfinite(v) and 0 <= v <= 1 for v in value):
             return tuple(float(v) for v in value) if len(value) == 4 else (*map(float, value), 1.)
@@ -219,14 +241,14 @@ def finish_appearance(name, style=None):
         # Fabricators' names vary in case and wording; no finish means HASL.
         lower = raw.lower()
         if "osp" in lower or "entek" in lower:
-            return BARE_COPPER_COLOR, .30
+            return BARE_COPPER_COLOR, .1
         if "gold" in lower or lower.endswith("ig") or "enig" in lower or "enepig" in lower:
-            return REAL_ENIG_COLOR, .22
+            return REAL_ENIG_COLOR, .1
         if "silver" in lower:
-            return REAL_SILVER_COLOR, .20
+            return REAL_SILVER_COLOR, .15
         if "tin" in lower and "hasl" not in lower:
-            return REAL_TIN_COLOR, .40
-        return HASL_COLOR, .30
+            return REAL_TIN_COLOR, .25
+        return HASL_COLOR, .15
     if raw.endswith("OSP"):
         return COPPER_COLOR, .28
     if raw.endswith(("IG", "gold")):
@@ -241,6 +263,12 @@ def finish_appearance(name, style=None):
 _REALISTIC_FINISHES = (HASL_COLOR, REAL_ENIG_COLOR, REAL_SILVER_COLOR, REAL_TIN_COLOR, BARE_COPPER_COLOR)
 
 
+def is_realistic_metal(rgb):
+    """True for a realistic-style plated finish swatch (shaded as real metal)."""
+    key = tuple(round(float(v), 6) for v in rgb[:3])
+    return any(key == tuple(round(v, 6) for v in swatch) for swatch in _REALISTIC_FINISHES)
+
+
 def covered_copper_color(rgb):
     """Color of resist-covered copper for a conductor shown in ``rgb``.
 
@@ -248,9 +276,8 @@ def covered_copper_color(rgb):
     plated where copper is exposed). KiCad finishes and custom colors stay.
     Decided from the color itself, so separate render processes agree.
     """
-    key = tuple(round(float(v), 6) for v in rgb[:3])
-    if any(key == tuple(round(v, 6) for v in swatch) for swatch in _REALISTIC_FINISHES):
-        return BARE_COPPER_COLOR
+    if is_realistic_metal(rgb):
+        return COVERED_COPPER_COLOR
     return tuple(float(v) for v in rgb[:3])
 
 
@@ -290,7 +317,7 @@ def apply_surface_finish(scene, snapshot, style=None):
             rgba = material_appearance(part.kind, value, style, context)
             changes = {"color": rgba[:3], "opacity": rgba[3] if part.kind == "mask" else 1.}
             if part.kind == "mask" and hasattr(part, "roughness"):
-                changes["roughness"] = (MASK_ROUGHNESS.get(str(value), .36)
+                changes["roughness"] = (MASK_ROUGHNESS.get(str(value), .45)
                                         if style == "realistic" else None)
             # KiCad builds silk and paste materials from RGB only: always opaque.
             parts.append(replace(part, **changes))

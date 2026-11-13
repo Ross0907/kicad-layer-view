@@ -289,6 +289,26 @@ class MainWindow(QMainWindow):
             "Show a contrasting finish over capped via bores. This is a visual inspection aid; "
             "KiCad does not record a measured surface finish.")
         layout.addLayout(detail_row)
+        # KiCad 3D viewer model filters (Appearance > Objects), plus board side.
+        self.model_filters = {}
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Models:"))
+        for key, title, tip in (
+                ("tht", "THT", "Through-hole footprints"),
+                ("smd", "SMD", "Surface-mount footprints"),
+                ("virtual", "Virtual", "Footprints that are neither through-hole nor SMD"),
+                ("not_in_pos", "Not in POS", "Footprints excluded from position files"),
+                ("dnp", "DNP", "Footprints marked Do not populate"),
+                ("top", "Top", "Models on the top side"),
+                ("bottom", "Bottom", "Models on the bottom side")):
+            box = QCheckBox(title)
+            box.setChecked(True)
+            box.setToolTip(tip)
+            box.toggled.connect(self.apply_visibility)
+            self.model_filters[key] = box
+            model_row.addWidget(box)
+        model_row.addStretch(1)
+        layout.addLayout(model_row)
         self.kind_boxes["paste"].setToolTip("Front/back stencil deposits from the PCB paste artwork; "
                                            "illustrative 0.08 mm thickness, not reflowed joints.")
         self.extend_vias = QCheckBox("Extend via connections across layer gaps")
@@ -797,6 +817,23 @@ class MainWindow(QMainWindow):
             self.worker.components = self.kind_boxes["component"].isChecked()
             self.worker.known_component_signature = self._component_loaded_signature
 
+    def model_shown(self, model_class):
+        """KiCad's BOARD_ADAPTER::IsFootprintShown rules, plus the board side."""
+        if not model_class:
+            return True
+        filters = getattr(self, "model_filters", {})
+        checked = lambda key: filters[key].isChecked() if key in filters else True  # noqa: E731
+        side, mounting, dnp, not_in_pos = model_class
+        if not checked(side):
+            return False
+        if not_in_pos and not checked("not_in_pos"):
+            return False
+        if dnp and not checked("dnp"):
+            return False
+        if mounting in ("smd", "tht", "virtual"):
+            return checked(mounting)
+        return True
+
     def apply_visibility(self, *_):
         self._sync_worker_flags()
         if self.scene is None:
@@ -807,6 +844,8 @@ class MainWindow(QMainWindow):
             enabled = self.kind_boxes[category].isChecked() if category in self.kind_boxes else True
             if part.key in self.rows:
                 enabled = enabled and self.rows[part.key][0].isChecked()
+            if part.kind == "component":
+                enabled = enabled and self.model_shown(getattr(part, "model_class", ()))
             if part.kind == "via_patch":
                 parent = self.rows.get(f"copper:{part.layer_id}")
                 # Contrast is optional, but a capped bore remains physically

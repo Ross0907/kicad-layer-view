@@ -663,6 +663,27 @@ def copper_geometry(snapshot, layer_id, *, outline=None, pad_holes=None):
         drilled_pad_holes(snapshot) if pad_holes is None else pad_holes)
 
 
+def mesh_mask_layer(task):
+    """Worker entry point: one outer solder mask with its over-copper faces tagged.
+
+    pcb2blender colors resist lighter where copper lies beneath it. The mask is
+    partitioned by the copper of its side so its outward faces carry an exact
+    ``Cu`` coverage tag. Returns ``(points, triangles, normals, coverage)``.
+    """
+    copper = copper_layer_geometry(task["layer_id"], task["tracks"], task["polys"], task["vias"],
+                                   task["outline"], task["pad_holes"])
+    mask = task["mask"]
+    if mask.is_empty or task["thickness"] <= 0:
+        return None
+    shapely.prepare(copper)
+    side = "F.Mask" if task["front"] else "B.Mask"  # tags the outward face
+    result = coated_slab_arrays(mask, task["z_bottom"], task["thickness"], {side: copper})
+    if result is None:
+        return None
+    points, triangles, normals, coverage = result
+    return points, triangles.astype(np.int32), normals, {"Cu": coverage[side]}
+
+
 def mesh_copper_layer(task):
     """Worker entry point: one copper foil and its cap patch, as plain arrays.
 

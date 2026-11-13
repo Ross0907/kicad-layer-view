@@ -27,7 +27,7 @@ from .finishes import DEFAULT_FINISH_COLOR, apply_surface_finish
 from .meshing import (  # noqa: F401 - re-exported public geometry API
     CIRCLE_QUAD_SEGS, SMOOTH_WALL_COS, _circles, _track_shapes, _triangulate_geos, _weld, disjoint_union,
     board_outline, circle, coated_slab_arrays, copper_geometry, drilled_pad_holes,
-    iter_polygons, layer_inputs, mesh_copper_layer, pad_hole, poly_to_shapely, polygon_union,
+    iter_polygons, layer_inputs, mesh_copper_layer, mesh_mask_layer, pad_hole, poly_to_shapely, polygon_union,
     polys_to_shapely, slab_arrays, triangulate,
 )
 
@@ -156,6 +156,8 @@ class ScenePart:
     metallic: Optional[float] = None
     roughness: Optional[float] = None
     led: bool = False
+    # Components: (side, mounting, dnp, exclude_from_pos) for KiCad's filters.
+    model_class: Tuple = ()
 
 
 @dataclass
@@ -384,6 +386,12 @@ def _clipped_plug_profiles(snapshot, intervals, bottom, thickness):
     return profiles
 
 
+class _Signatures(dict):
+    """Per-part signatures, plus each outer mask's outline-only signature."""
+
+    mask_shapes: dict
+
+
 def _scene_signatures(snapshot):
     """Exact per-part dependencies for safe mesh reuse, including empty parts.
 
@@ -391,7 +399,8 @@ def _scene_signatures(snapshot):
     not invalidate geometry. Explicit native mask apertures include pad, via,
     exposed-track, graphic and zone openings independently of copper geometry.
     """
-    result = {}
+    result = _Signatures()
+    result.mask_shapes = {}
     outline = _polygon_signature(snapshot.outline)
     drill_pads = [pad for pad in snapshot.pads if min(pad.drill_mm) > 0]
     holes = [(pad.position, pad.drill_mm, pad.angle_deg or 0) for pad in drill_pads]
@@ -457,16 +466,18 @@ def _scene_signatures(snapshot):
                     [(via.position, via.drill_mm, via.diameters_mm.get(copper.id, via.diameter_mm),
                       via.mask_margin_mm) for via in snapshot.vias if copper.id in via.layers
                      and not (via.front_tented if front else via.back_tented)])
-            result[f"mask:{name}"] = _signature((outline, openings, copper.z_bottom_mm,
-                                                 copper.thickness_mm, len(snapshot.stackup.copper),
-                                                 snapshot.stackup.mask_thickness(name)))
+            mask_shape = _signature((outline, openings, copper.z_bottom_mm,
+                                     copper.thickness_mm, len(snapshot.stackup.copper),
+                                     snapshot.stackup.mask_thickness(name)))
+            result.mask_shapes[name] = mask_shape
+            result[f"mask:{name}"] = _signature((mask_shape, "over-copper-1",
+                                                 result[f"copper:{copper.id}"]))
             for kind in ("copper", "via-patch"):
                 key = f"{kind}:{copper.id}"
-                result[key] = _signature((result[key], "exact-mask-coverage-1", name,
-                                          result[f"mask:{name}"]))
+                result[key] = _signature((result[key], "exact-mask-coverage-1", name, mask_shape))
             silk_name = "F.SilkS" if front else "B.SilkS"
             if snapshot.silkscreen is not None:
-                result[f"silk:{silk_name}"] = _signature((result[f"mask:{name}"],
+                result[f"silk:{silk_name}"] = _signature((mask_shape,
                     _polygon_signature(snapshot.silkscreen.get(silk_name, [])), SILK_THICKNESS_MM,
                     SILK_OFFSET_MM))
             paste_name = "F.Paste" if front else "B.Paste"
@@ -615,9 +626,12 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
     # Compute each needed outer mask once on the owning thread, then share its
     # immutable geometry with copper workers and the later mask/silk slabs.
     copper = snapshot.stackup.copper
+    # The mask outline is reused whenever only the copper beneath it changed.
+    previous_shapes = getattr(previous_scene, "_mask_shape_signatures", {})
     mask_profiles = {name: profile for name, profile in
                      getattr(previous_scene, "_mask_profiles", {}).items()
-                     if f"mask:{name}" in unchanged}
+                     if previous_shapes.get(name) is not None
+                     and previous_shapes.get(name) == getattr(all_signatures, "mask_shapes", {}).get(name)}
     outer_coatings = {}
     for front in (True, False) if copper else ():
         cu = copper[0 if front else -1]
@@ -632,6 +646,7 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
             shapely.prepare(mask_profiles[name])
             outer_coatings.setdefault(cu.id, {})[name] = mask_profiles[name]
     scene._mask_profiles = mask_profiles
+    scene._mask_shape_signatures = dict(getattr(all_signatures, "mask_shapes", {}))
     shared = {}
 
     def shared_outline():
@@ -700,6 +715,26 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
             for future in remote.values():
                 future.cancel()
             remote.clear()
+    def mask_task(front):
+        name = "F.Mask" if front else "B.Mask"
+        cu = copper[0 if front else -1]
+        mask_t = snapshot.stackup.mask_thickness(name)
+        tracks, polys, vias = layer_inputs(snapshot, cu.id)
+        if "pad_holes" not in shared:
+            shared["pad_holes"] = drilled_pad_holes(snapshot)
+        return {"layer_id": cu.id, "tracks": tracks, "polys": polys, "vias": vias,
+                "outline": shared_outline(), "pad_holes": shared["pad_holes"],
+                "mask": mask_profiles.get(name) or mask_geometry(snapshot, front), "front": front,
+                "z_bottom": cu.z_top_mm + CONTACT_INSET_MM if front else cu.z_bottom_mm - mask_t - CONTACT_INSET_MM,
+                "thickness": mask_t}
+
+    mask_futures = {}
+    for front in (True, False) if copper else ():
+        name = "F.Mask" if front else "B.Mask"
+        if f"mask:{name}" in requested and f"mask:{name}" not in unchanged:
+            task = mask_task(front)
+            future = mesh_pool.submit(mesh_mask_layer, task) if remote else None
+            mask_futures[name] = future if future is not None else pool.submit(mesh_mask_layer, task)
     local_copper = [index for index in dirty_copper if index not in remote]
     in_flight = max(workers, 2)
     pending = {index: pool.submit(prepare_copper, copper[index]) for index in local_copper[:in_flight]}
@@ -841,8 +876,23 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
             if not reuse(f"mask:{name}", name, editor):
                 report(f"Meshing {name}")
                 mask = mask_geometry(snapshot, front) if mask is None else mask
-                add(f"mask:{name}", name, "mask", None, slot, mask,
-                    z, mask_t, (.06,.30,.17), editor)
+                arrays = None
+                future = mask_futures.pop(name, None)
+                if future is not None:
+                    try:
+                        arrays = future.result()
+                    except Exception:  # noqa: BLE001 - an untagged mask is still correct
+                        logging.getLogger(__name__).warning("Over-copper mask tagging failed", exc_info=True)
+                if arrays is not None:
+                    points, triangles, normals, coverage = arrays
+                    scene.parts.append(ScenePart(
+                        f"mask:{name}", name, "mask", None, slot,
+                        polydata(points, triangles, normals,
+                                 {f"coat:{key}": values for key, values in coverage.items()}),
+                        (.06, .30, .17), editor, mask.area))
+                else:
+                    add(f"mask:{name}", name, "mask", None, slot, mask,
+                        z, mask_t, (.06,.30,.17), editor)
             silk_name = "F.SilkS" if front else "B.SilkS"
             silk_editor = snapshot.editor_colors.get(silk_name, default_colors()[silk_name])
             if snapshot.silkscreen is not None and not reuse(f"silk:{silk_name}", silk_name, silk_editor):

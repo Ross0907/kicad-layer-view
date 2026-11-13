@@ -24,7 +24,7 @@ from .model import load_snapshot
 from .helper_process import run_cancellable
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "3-kicad-stackup"
+VERSION = "4-footprint-attributes"
 FORMAT = "kicad-layer-viewer-source-cache"
 MAX_ENTRIES = 3
 MAX_BYTES = 256 * 1024 * 1024

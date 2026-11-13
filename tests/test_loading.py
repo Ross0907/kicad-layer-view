@@ -125,7 +125,7 @@ def test_edited_board_defers_inner_reads_and_reuses_them_after_surface_preview(c
     assert not final_hit and list(stages) == []
     assert_matches_requested(final, reference, requested)
     assert meshed_layers == [changed.tracks[0].layer]
-    expected_reused = (set(parts(full)) & requested) - {dirty}
+    expected_reused = (set(parts(full)) & requested) - {dirty, _side_mask(changed, changed.tracks[0].layer)}
     assert Counter(reads) == Counter({key: 1 for key in expected_reused})
     assert Counter(checksums) == Counter(reads)
     assert set(parts(final)) - {dirty} <= final.reused_keys
@@ -215,3 +215,9 @@ def test_complete_load_skips_models_already_shown_and_never_waits_for_them_on_er
         load_complete_scene(snapshot)
     assert time.monotonic() - begin < 2
     release.set()
+
+
+def _side_mask(snapshot, layer):
+    """The resist whose over-copper faces depend on this copper layer, if any."""
+    copper = snapshot.stackup.copper
+    return {copper[0].id: "mask:F.Mask", copper[-1].id: "mask:B.Mask"}.get(layer)

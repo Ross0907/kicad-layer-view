@@ -23,6 +23,14 @@ from layer_viewer.model import (BoardSnapshot, CopperLayer, DielectricLayer,
                                 Zone, read_board_stackup, read_board_surface_finish, save_snapshot)
 
 
+
+def _filter_attributes(footprint):
+    """KiCad's 3D model filter attributes (FOOTPRINT_ATTR_T bits)."""
+    attributes = footprint.GetAttributes()
+    mounting = "tht" if attributes & 0x1 else "smd" if attributes & 0x2 else "virtual"
+    return {"mounting": mounting, "dnp": bool(attributes & 0x40),
+            "exclude_from_pos": bool(attributes & 0x4)}
+
 def sha256(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -383,7 +391,8 @@ def extract_saved_board(path):
                                         rotation_deg=(model.m_Rotation.x, model.m_Rotation.y, model.m_Rotation.z),
                                         offset_mm=(model.m_Offset.x, model.m_Offset.y, model.m_Offset.z),
                                         visible=model.m_Show, opacity=model.m_Opacity)
-                                     for model in footprint.Models()]))
+                                     for model in footprint.Models()],
+                                    **_filter_attributes(footprint)))
     print(f"Extracting saved filled polygons for {len(board.Zones())} zones", file=sys.stderr, flush=True)
     zones = []
     empty_zones = 0

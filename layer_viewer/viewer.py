@@ -82,7 +82,43 @@ def kicad_material(kind, rgb):
     return (r, g, b), (.25, .25, .25), 32.
 
 
-def apply_material(prop, kind, rgb, base_rgb=None):
+def studio_environment(height=128, width=256):
+    """Equirectangular studio for metal reflections in the OpenGL viewport.
+
+    A soft bright overhead, a light horizon band and two softbox panels, so
+    plated finishes and metal model parts reflect something, as a real board
+    under studio light does. Only physically based (metal) surfaces use it.
+    """
+    import pyvista as pv
+    theta = (np.arange(height) + .5)[:, None] / height * np.pi
+    phi = (np.arange(width) + .5)[None, :] / width * 2 * np.pi
+    up = np.cos(theta)
+    light = np.where(up >= 0, .55 + .45 * np.sqrt(np.maximum(up, 0)), .32 + .23 * (1 + up)) * np.ones_like(phi)
+    for center in (np.pi * .5, np.pi * 1.5):
+        light = light + 1.2 * np.exp(-((phi - center) ** 2) / .1 - ((theta - .95) ** 2) / .06)
+    rgb = np.clip(np.stack([light, light, light * .985], -1), 0, 1)
+    texture = pv.Texture((rgb * 255).astype(np.uint8))
+    texture.SetMipmap(True)
+    texture.SetInterpolate(True)
+    return texture
+
+
+def metal_phong(rgb, roughness=.25):
+    """Phong terms that read as polished metal: (ambient, diffuse, specular, power).
+
+    A metal has almost no diffuse; its color is a tinted reflection. Without an
+    environment map that is approximated by a dim diffuse, a strong specular
+    tinted by the metal color and a highlight sharpness taken from roughness.
+    """
+    color = tuple(float(v) for v in rgb[:3])
+    roughness = min(.8, max(.05, float(roughness if roughness is not None else .25)))
+    power = max(10., min(128., 2. / (roughness * roughness) - 2.))
+    # (ambient color, diffuse weight, specular color, power). The diffuse
+    # color itself stays the swatch: captures and per-face colors read it.
+    return tuple(.32 * v for v in color), .62, tuple(.35 + .65 * v for v in color), power
+
+
+def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None):
     """Set a VTK property to KiCad's material for ``kind`` in color ``rgb``.
 
     For conductors, ``base_rgb`` is the finish color that defines KiCad's
@@ -90,6 +126,22 @@ def apply_material(prop, kind, rgb, base_rgb=None):
     swaps only the diffuse color and keeps the finish-derived highlights.
     """
     terms_rgb = base_rgb if base_rgb is not None and kind in ("copper", "barrel", "via_patch") else rgb
+    from .finishes import is_realistic_metal
+    if (kind in ("copper", "barrel", "via_patch") and is_realistic_metal(rgb)) or (
+            kind == "component" and metallic is not None and metallic >= .5):
+        # Realistic plated finishes and metal model parts are physically
+        # based metals reflecting the viewport's studio environment.
+        prop.SetInterpolationToPBR()
+        prop.SetMetallic(1.)
+        prop.SetRoughness(min(.8, max(.05, float(roughness if roughness is not None else .25))))
+        prop.SetDiffuse(1.)
+        prop.SetAmbient(0.)
+        # The diffuse color stays the swatch: captures and per-face colors read it.
+        prop.SetDiffuseColor(*(float(v) for v in rgb[:3]))
+        return
+    if prop.GetInterpolation() == 3:  # leaving a metal finish (style/color change)
+        prop.SetInterpolationToPhong()
+        prop.SetMetallic(0.)
     ambient, specular, shininess = kicad_material(kind, terms_rgb)
     if kind == "component":
         prop.SetAmbient(.18)
@@ -151,6 +203,15 @@ class BoardViewport(QWidget):
         # A finite peel count changes the composite as thin mask faces move
         # between depth buckets at different zooms. Finish every visible peel.
         self.plotter.enable_depth_peeling(number_of_peels=0, occlusion_ratio=0.0)
+        # Image-based lighting for metals only (Phong materials ignore it).
+        try:
+            renderer = self.plotter.renderer
+            renderer.SetEnvironmentTexture(studio_environment(), True)
+            renderer.SetEnvironmentUp(0., 0., 1.)  # boards are Z-up; VTK defaults to +Y
+            renderer.SetEnvironmentRight(1., 0., 0.)
+            renderer.UseImageBasedLightingOn()
+        except Exception:  # noqa: BLE001 - very old OpenGL: metals stay Phong-lit
+            pass
         self.plotter.enable_custom_trackball_style(
             left="rotate", shift_left="pan", control_left="spin",
             middle="pan", right="pan", shift_right="pan", control_right="pan")
@@ -277,12 +338,13 @@ class BoardViewport(QWidget):
                 if self.parts[part.key].mesh is not part.mesh:
                     self.actors[part.key].mapper.dataset = part.mesh
                 self.parts[part.key] = part
-                if part.kind == "copper":
+                if part.kind in ("copper", "mask"):
                     BoardViewport._apply_coated_copper(self.actors[part.key], part)
                 if part.kind in ("barrel", "fill", "plug"):
                     # These have no layer-color row to refresh their actor.
                     # Reuse its geometry while following live finish changes.
-                    apply_material(self.actors[part.key].GetProperty(), part.kind, part.color)
+                    apply_material(self.actors[part.key].GetProperty(), part.kind, part.color,
+                                   roughness=getattr(part, "roughness", None))
                 continue
             actor = self.plotter.add_mesh(
                 part.mesh, color=part.color,
@@ -290,10 +352,13 @@ class BoardViewport(QWidget):
                 name=part.key, reset_camera=False, render=False,
             )
             prop = actor.GetProperty()
-            apply_material(prop, part.kind, part.color)
+            apply_material(prop, part.kind, part.color, metallic=getattr(part, "metallic", None),
+                           roughness=getattr(part, "roughness", None))
             self.parts[part.key] = part
             self._apply_coated_copper(actor, part)
-            if part.kind == "component" or part.mesh.GetPointData().GetNormals() is not None:
+            if prop.GetInterpolation() == 3:
+                pass  # physically based metal, set by apply_material
+            elif part.kind == "component" or part.mesh.GetPointData().GetNormals() is not None:
                 # Per-pixel lighting with the mesh's smoothed wall normals.
                 prop.SetInterpolationToPhong()
             else:
@@ -345,11 +410,15 @@ class BoardViewport(QWidget):
         part = self.parts[key]
         if editor is not None:
             apply_material(actor.GetProperty(), part.kind, part.editor_color if editor else part.color,
-                           base_rgb=part.color)
+                           base_rgb=part.color, metallic=getattr(part, "metallic", None),
+                           roughness=getattr(part, "roughness", None))
         if color is not None:
-            apply_material(actor.GetProperty(), part.kind, color, base_rgb=part.color)
+            apply_material(actor.GetProperty(), part.kind, color, base_rgb=part.color,
+                           metallic=getattr(part, "metallic", None), roughness=getattr(part, "roughness", None))
         if opacity is not None:
             actor.GetProperty().SetOpacity(opacity)
+        if part.kind == "mask":
+            self._apply_coated_copper(actor, part)
         if part.kind == "copper":
             self._apply_coated_copper(actor, part)
             patch = self.actors.get(f"via-patch:{part.layer_id}")
@@ -375,15 +444,20 @@ class BoardViewport(QWidget):
         green resist yellow-green). KiCad-style, editor and custom colors keep
         one uniform color. The exact per-face coverage comes from meshing.
         """
-        from .finishes import covered_copper_color
+        from .finishes import covered_copper_color, resist_light_color
         if not hasattr(actor, "GetMapper"):
             return
         mapper = actor.GetMapper()
         mesh = part.mesh
-        names = [name for name in ("coat:F.Mask", "coat:B.Mask") if name in mesh.cell_data]
         color = tuple(actor.GetProperty().GetDiffuseColor())
-        under = covered_copper_color(color)
-        if part.kind != "copper" or not names or np.allclose(under, color, atol=1e-6):
+        if part.kind == "mask":
+            # pcb2blender's two-tone resist: lighter where copper lies beneath.
+            names = ["coat:Cu"] if "coat:Cu" in mesh.cell_data else []
+            under = resist_light_color(color) or color
+        else:
+            names = [name for name in ("coat:F.Mask", "coat:B.Mask") if name in mesh.cell_data]
+            under = covered_copper_color(color)
+        if part.kind not in ("copper", "mask") or not names or np.allclose(under, color, atol=1e-6):
             mapper.ScalarVisibilityOff()
             if mapper.GetInput() is not None and mapper.GetInput() is not mesh:
                 mapper.SetInputData(mesh)
@@ -424,7 +498,8 @@ class BoardViewport(QWidget):
             prop = self.actors[key].GetProperty()
             active = self.led_enabled and self.led_intensity > 0
             color = self.led_color if active and self.led_color is not None else part.color
-            apply_material(prop, part.kind, color)
+            apply_material(prop, part.kind, color, metallic=getattr(part, "metallic", None),
+                           roughness=getattr(part, "roughness", None))
             if active:
                 prop.SetAmbient(1.)
                 prop.SetAmbientColor(*color)

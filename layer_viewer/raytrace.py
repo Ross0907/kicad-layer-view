@@ -107,7 +107,8 @@ def capture_from_viewport(viewport) -> RenderCapture:
         clipping = tuple(ClipPlane(tuple(planes.GetItem(i).GetOrigin()),
                                    tuple(planes.GetItem(i).GetNormal()))
                          for i in range(mapper.GetNumberOfClippingPlanes())) if planes else ()
-        coatings = [name for name in ("F.Mask", "B.Mask") if f"coat:{name}" in mesh.cell_data]
+        coatings = [name for name in (("Cu",) if part.kind == "mask" else ("F.Mask", "B.Mask"))
+                    if f"coat:{name}" in mesh.cell_data]
         coating_mask = coatings[0] if coatings else ""
         covered_faces = (_readonly(_coating_values(mesh.cell_data[f"coat:{coating_mask}"],
                                                    mesh.n_cells), np.float32)

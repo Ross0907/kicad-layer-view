@@ -48,7 +48,8 @@ def test_one_track_edit_rebuilds_only_its_copper_layer(monkeypatch):
         refreshed = geometry.build_scene(changed, previous_scene=first, previous_snapshot=before)
     assert built_layers == [changed.tracks[0].layer]
     rebuilt = set(parts(refreshed)) - refreshed.reused_keys
-    assert rebuilt == {f"copper:{changed.tracks[0].layer}"}
+    # The edited side's resist re-tags its over-copper faces (two-tone resist).
+    assert rebuilt == {f"copper:{changed.tracks[0].layer}", _side_mask(changed, changed.tracks[0].layer)} - {None}
     for key in refreshed.reused_keys:
         assert parts(refreshed)[key].mesh is parts(first)[key].mesh
     assert_matches_full(changed, refreshed)
@@ -148,7 +149,8 @@ def test_disk_scene_bootstrap_and_in_place_snapshot_edit():
     changed = deepcopy(before)
     changed.tracks[0].width_mm += .05
     refreshed = geometry.build_scene(changed, previous_scene=first, previous_snapshot=before)
-    assert len(refreshed.reused_keys) == len(first.parts)-1
+    dependent = 1 + (_side_mask(changed, changed.tracks[0].layer) is not None)
+    assert len(refreshed.reused_keys) == len(first.parts) - dependent
     assert_matches_full(changed, refreshed)
     # Later callers may mutate a retained snapshot; stored signatures still catch it.
     changed.tracks[0].width_mm += .05
@@ -247,3 +249,9 @@ def test_surface_preview_reuses_exact_meshes_when_inner_layers_arrive():
     assert complete.is_complete
     assert set(parts(normal)) <= complete.reused_keys
     assert_matches_full(snapshot, complete)
+
+
+def _side_mask(snapshot, layer):
+    """The resist whose over-copper faces depend on this copper layer, if any."""
+    copper = snapshot.stackup.copper
+    return {copper[0].id: "mask:F.Mask", copper[-1].id: "mask:B.Mask"}.get(layer)

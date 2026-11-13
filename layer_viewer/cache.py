@@ -201,7 +201,7 @@ def _read_scene(directory, data, matching_signatures=None, previous_scene=None):
         metadata = part.get("metadata")
         if isinstance(metadata, dict):
             # Material additions do not invalidate expensive board geometry.
-            metadata = {"metallic": None, "roughness": None, "led": False, **metadata}
+            metadata = {"metallic": None, "roughness": None, "led": False, "model_class": (), **metadata}
         if not isinstance(metadata, dict) or set(metadata) != allowed:
             raise ValueError("Invalid cache mesh metadata")
         for name in ("key", "name", "kind"):
@@ -228,6 +228,10 @@ def _read_scene(directory, data, matching_signatures=None, previous_scene=None):
                 raise ValueError("Invalid cache surface material")
         if not isinstance(metadata["led"], bool):
             raise ValueError("Invalid LED material flag")
+        model_class = metadata["model_class"]
+        if not isinstance(model_class, (list, tuple)) or len(model_class) not in (0, 4):
+            raise ValueError("Invalid cache model class")
+        metadata["model_class"] = tuple(model_class)
         old_copper = (.77, .50, .24)
         if metadata["kind"] in ("copper", "barrel") and tuple(metadata["color"]) == old_copper:
             metadata["color"] = geometry.NATURAL_COPPER_COLOR

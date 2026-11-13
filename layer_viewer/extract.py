@@ -845,6 +845,59 @@ def _mask_apertures(board, kpads, pad_margins, vias, zones, graphics, progress, 
     return output
 
 
+def _footprint_filter_attributes(fp):
+    """Mounting style, DNP and POS exclusion, as KiCad's 3D model filters use them."""
+    try:
+        attributes = fp.attributes
+        style = int(attributes.mounting_style)
+        return {"mounting": {1: "tht", 2: "smd", 3: "virtual"}.get(style, ""),
+                "dnp": bool(attributes.do_not_populate),
+                "exclude_from_pos": bool(attributes.exclude_from_position_files)}
+    except Exception:  # noqa: BLE001 - older API: leave the model always shown
+        return {}
+
+
+# Edge.Cuts segments whose ends are closer than this are joined, like KiCad's
+# outline chaining. Hand-drawn outlines often miss by a micron or two.
+OUTLINE_CHAINING_EPSILON_MM = .02
+
+
+def _chain_endpoints(lines, epsilon=OUTLINE_CHAINING_EPSILON_MM):
+    """Snap nearly coincident line endpoints together so the outline closes."""
+    from shapely.geometry import LineString
+    import numpy as np
+    if len(lines) < 2:
+        return lines
+    ends = np.array([coord for line in lines for coord in (line.coords[0], line.coords[-1])], dtype=float)
+    parent = list(range(len(ends)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    order = np.argsort(ends[:, 0], kind="stable")
+    for position, i in enumerate(order):
+        for j in order[position + 1:]:
+            if ends[j, 0] - ends[i, 0] > epsilon:
+                break
+            if np.hypot(*(ends[j] - ends[i])) <= epsilon:
+                parent[find(int(j))] = find(int(i))
+    roots = np.array([find(i) for i in range(len(ends))])
+    snapped = ends.copy()
+    for root in np.unique(roots):
+        members = roots == root
+        if members.sum() > 1:
+            snapped[members] = ends[members].mean(axis=0)
+    chained = []
+    for index, line in enumerate(lines):
+        coords = list(line.coords)
+        coords[0], coords[-1] = tuple(snapped[2 * index]), tuple(snapped[2 * index + 1])
+        if len(coords) >= 2 and any(c != coords[0] for c in coords[1:]):
+            chained.append(LineString(coords))
+    return chained
+
+
 def _outline(board, progress, shapes=None) -> List[Poly]:
     """Board outline polygons from Edge.Cuts graphics (best effort)."""
     from kipy.board_types import BoardArc, BoardCircle, BoardPolygon, BoardRectangle, BoardSegment
@@ -876,7 +929,17 @@ def _outline(board, progress, shapes=None) -> List[Poly]:
                 closed.append(SPolygon(p.outline, p.holes))
     # polygonize produces an annulus plus its inner polygon for nested loops.
     # XOR its *exterior rings*, not the already-holed polygons, to retain cutouts.
+    lines = _chain_endpoints(lines)
     polys = [SPolygon(p.exterior) for p in polygonize(unary_union(lines))] if lines else []
+    if not polys and lines:
+        # Like KiCad, still show a board: the hull of the Edge.Cuts drawing,
+        # unless a closed shape (a drawn rectangle/polygon board) is larger.
+        hull = unary_union(lines).convex_hull
+        if (isinstance(hull, SPolygon) and hull.area > 0
+                and hull.area > max((shape.area for shape in closed), default=0.)):
+            progress.warn("Board outline on Edge.Cuts is not closed; showing its convex hull. "
+                          "Run DRC in KiCad to find the gap.")
+            polys = [hull]
     polys += closed
     if not polys:
         progress.warn("No closed board outline found on Edge.Cuts")
@@ -991,7 +1054,8 @@ def extract_board(board, refill_zones: bool = False, progress=None, cache=None) 
                     rotation_deg=(model.rotation.x, model.rotation.y, model.rotation.z),
                     offset_mm=(model.offset.x, model.offset.y, model.offset.z),
                     visible=model.visible, opacity=model.opacity)
-                    for model in getattr(fp.definition, "models", [])]))
+                    for model in getattr(fp.definition, "models", [])],
+                **_footprint_filter_attributes(fp)))
             # kipy repacks every child when fp.proto is accessed. Resolving
             # these common overrides inside the pad loop made dense BGAs pay
             # quadratic serialization work on every live update.

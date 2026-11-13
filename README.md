@@ -21,7 +21,8 @@ physical copper, dielectric, solder-mask, silkscreen and paste layers.
   shows the copper pattern), natural FR4 at the edges, white legend ink (black
   on white resist), bare copper under the resist and the plating finish only on
   exposed copper — ENIG/ENEPIG gold, OSP copper, immersion silver/tin, and HASL
-  when the stackup names no finish. A **KiCad 3D viewer** style reproduces
+  when the stackup names no finish. Finishes and plated 3D-model parts are
+  physically based metals that reflect a studio environment. A **KiCad 3D viewer** style reproduces
   KiCad's own palettes and rules exactly. Custom `#RRGGBB(AA)` colors are kept
   exactly; each layer can switch to the PCB editor theme color or a custom one.
 - **KiCad-style rendering.** KiCad's OpenGL material model and light rig, its
@@ -40,6 +41,8 @@ physical copper, dielectric, solder-mask, silkscreen and paste layers.
   [Filled & Capped Vias](https://github.com/Ross0907/kicad-filled-capped-vias) plugin.
 - **3D component models.** STEP and VRML models with their colors, offsets,
   rotation and scale on both sides; they follow their outer layer when exploded.
+  Plated parts render as real metal (as pcb2blender does). KiCad's model
+  filters — THT, SMD, Virtual, Not in POS, DNP — plus top/bottom side.
 - **Inspection tools.** Per-layer visibility, opacity and color; layer search
   and solo; Copper / Stackup / X-ray / Vias presets; X/Y/Z cross-sections;
   point-to-point measurement; KiCad-style arcball rotation and axis snapping.

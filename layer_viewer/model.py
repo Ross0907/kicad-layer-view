@@ -184,6 +184,11 @@ class Footprint:
     pad_ids: List[str] = field(default_factory=list)
     angle_deg: float = 0.0
     models: List[Model3D] = field(default_factory=list)
+    # KiCad's 3D-model filter attributes: "tht", "smd", "virtual" (neither),
+    # or "" when unknown (older snapshots; always shown).
+    mounting: str = ""
+    dnp: bool = False
+    exclude_from_pos: bool = False
 
 
 @dataclass
