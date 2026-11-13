@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.5
 
 - Ray tracing: the surface finish stays only in the resist openings when the
   resist is exploded away, hidden or cut, as on a real board; covered copper
