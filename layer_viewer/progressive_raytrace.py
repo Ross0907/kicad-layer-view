@@ -77,7 +77,12 @@ def _material(mesh, *, coated=False):
     if mesh.kind in ("copper", "barrel", "via_patch"):
         from .finishes import covered_copper_color, ray_metal_color
         # KiCad finish swatches are display colors; trace measured metal F0.
-        metal = {"type": "rgb", "value": _linear(ray_metal_color(mesh.color)).tolist()}
+        f0 = _linear(ray_metal_color(mesh.color))
+        if mesh.kind == "via_patch":
+            # Plating over the cured fill is slightly duller than the pad around
+            # it, so capped vias show as faint satin discs, as on real boards.
+            f0 = f0 * .86
+        metal = {"type": "rgb", "value": np.asarray(f0).tolist()}
         opaque = {"type": "principled", "base_color": metal, "metallic": 1.,
                   "roughness": mesh.roughness if mesh.roughness is not None else
                               (.32 if mesh.kind == "via_patch" else .22)}
@@ -113,13 +118,14 @@ def _material(mesh, *, coated=False):
         from .finishes import resist_light_color
         light = resist_light_color(mesh.color)
         if coated and light is not None:
-            # pcb2blender: lighter and glossier (half roughness) over copper.
+            # pcb2blender: lighter and a little glossier over copper (resist
+            # flows thinner over the raised trace).
             opaque = {"type": "blendbsdf",
                       "weight": {"type": "mesh_attribute", "name": "face_resist_coverage"},
                       "bsdf_0": opaque,
                       "bsdf_1": {"type": "principled", "metallic": 0., "eta": 1.48,
                                  "base_color": {"type": "rgb", "value": _linear(light).tolist()},
-                                 "roughness": roughness * .5}}
+                                 "roughness": roughness * .8}}
     elif mesh.kind == "component":
         opaque = {"type": "principled", "base_color": rgb,
                   "metallic": mesh.metallic if mesh.metallic is not None else 0.,
@@ -147,11 +153,10 @@ def _material(mesh, *, coated=False):
         # the separate satin lobe supplies the dielectric surface reflection.
         # No refraction blur or extra geometry, and eval_null_transmission keeps
         # the same colored copper detail in the denoiser guides.
-        # KiCad opacity describes the visible coating, not absorption per
-        # crossing. A reflected trace crosses it on the way in AND out. Apply
-        # half the optical depth per crossing: round-trip visibility becomes
-        # (1-opacity), rather than (1-opacity)^2 (only 2.9% at alpha=.83).
-        transmission_weight = float(np.sqrt(transmission_weight))
+        # A reflected trace crosses the coating on the way in AND out, so the
+        # copper's round-trip visibility is (1-opacity)^2. Real resist hides
+        # the copper itself; the two-tone color shows the pattern. (Applying
+        # half the depth per crossing made green resist look like tinted glass.)
         tint = np.asarray(mesh.color, dtype=float)
         peak = float(tint.max())
         if peak - float(tint.min()) < .03:

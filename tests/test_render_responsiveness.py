@@ -9,10 +9,12 @@ from layer_viewer.progressive_raytrace import ProgressiveRayTracer, _material
 
 
 @pytest.mark.parametrize('alpha', [0., .25, .5, .83, 1.])
-def test_neutral_mask_roundtrip_applies_display_opacity_once(alpha):
+def test_neutral_mask_hides_copper_on_each_crossing(alpha):
+    # Real resist hides the copper; light crosses it in and out, so copper
+    # visibility is (1-opacity)^2 and the two-tone color shows the pattern.
     material = _material(SimpleNamespace(kind='mask', color=(1., 1., 1.), opacity=alpha))
     transmission = 0. if alpha == 1. else material['weight']
-    assert transmission ** 2 == pytest.approx(1 - alpha)
+    assert transmission == pytest.approx(1 - alpha)
 
 
 def test_black_mask_still_absorbs_more_than_green_and_tint_is_preserved():
@@ -22,7 +24,7 @@ def test_black_mask_still_absorbs_more_than_green_and_tint_is_preserved():
     black, green = returned((11/255,)*3), returned((20/255, 51/255, 36/255))
     assert green[1] > green[2] > green[0]
     assert black.max() < green[1] * .4
-    assert green[1] == pytest.approx(.17)
+    assert green[1] == pytest.approx(.0289)
 
 
 def test_accumulation_can_skip_all_display_work_without_discarding_samples(monkeypatch):

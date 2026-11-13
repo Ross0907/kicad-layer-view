@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Viewport metals (plated copper, gold parts) are lit like KiCad's viewer, by
+  the camera-attached lights, instead of a world-fixed reflection map: copper
+  no longer turns dull when seen from below, and thin traces no longer
+  shimmer while orbiting. Exposed, covered and inner copper shade alike, and
+  ENIG shows as gold rather than pale lemon.
+- Ray tracing: solder resist hides the copper beneath it (light now loses the
+  full opacity on each crossing), and the over-copper resist tone is a subtle
+  lift instead of pcb2blender's strong two-tone, so traces are visible but no
+  longer drawn on. Capped (POFV) vias show as faint satin discs.
+- Smoother edges: stronger FXAA while moving, and the still-view refinement
+  starts sooner (60 ms) and shows after 4 samples.
+
 ## 0.7.2
 
 - The viewport opens on the dark background, matching the ray tracer and the

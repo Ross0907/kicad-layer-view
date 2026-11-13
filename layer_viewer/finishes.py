@@ -126,7 +126,12 @@ _MASK_FAMILY = {NOT_SPECIFIED: "GREEN", "Green": "GREEN", "Light Green": "GREEN"
 _MASK_OPACITY = {"BLACK": .99, "WHITE": .97}
 _REAL_MASK = {name: (_P2B_MASK[family][1], _MASK_OPACITY.get(family, .94))
               for name, family in _MASK_FAMILY.items()}
-_RESIST_LIGHT = {tuple(round(v / 255, 6) for v in dark): tuple(v / 255 for v in light)
+# pcb2blender's full light tone made every trace stand out like a drawing.
+# Real resist shows the copper pattern as a subtle lift: keep this share of
+# the light-dark difference.
+RESIST_TWO_TONE = .45
+_RESIST_LIGHT = {tuple(round(v / 255, 6) for v in dark):
+                 tuple((d + RESIST_TWO_TONE * (lt - d)) / 255 for lt, d in zip(light, dark))
                  for light, dark in _P2B_MASK.values()}
 # pcb2blender MASK_ROUGHNESS_MAP (default 0.45); over copper it is halved.
 MASK_ROUGHNESS = {"White": .4}
@@ -341,9 +346,12 @@ def apply_surface_finish(scene, snapshot, style=None):
             # KiCad builds silk and paste materials from RGB only: always opaque.
             parts.append(replace(part, **changes))
         elif part.kind in ("copper", "barrel", "via_patch"):
-            # A capped-via patch is the same plated metal; the optional
-            # inspection contrast is applied by the viewer, not stored here.
-            parts.append(replace(part, color=plated_color, metallic=1., roughness=plated_roughness))
+            # A capped-via patch is the same plated metal, but the plated-over
+            # fill is a satin disc (real POFV caps show a faint circle). The
+            # optional inspection contrast is applied by the viewer.
+            roughness = (max(.35, 3 * plated_roughness) if part.kind == "via_patch" and style == "realistic"
+                         else plated_roughness)
+            parts.append(replace(part, color=plated_color, metallic=1., roughness=roughness))
         else:
             parts.append(part)
     scene.parts = parts

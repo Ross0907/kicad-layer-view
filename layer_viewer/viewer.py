@@ -82,29 +82,12 @@ def kicad_material(kind, rgb):
     return (r, g, b), (.25, .25, .25), 32.
 
 
-def studio_environment(height=128, width=256):
-    """Equirectangular studio for metal reflections in the OpenGL viewport.
-
-    A soft bright overhead, a light horizon band and two softbox panels, so
-    plated finishes and metal model parts reflect something, as a real board
-    under studio light does. Only physically based (metal) surfaces use it.
-    """
-    import pyvista as pv
-    theta = (np.arange(height) + .5)[:, None] / height * np.pi
-    phi = (np.arange(width) + .5)[None, :] / width * 2 * np.pi
-    up = np.cos(theta)
-    light = np.where(up >= 0, .55 + .45 * np.sqrt(np.maximum(up, 0)), .32 + .23 * (1 + up)) * np.ones_like(phi)
-    for center in (np.pi * .5, np.pi * 1.5):
-        light = light + 1.2 * np.exp(-((phi - center) ** 2) / .1 - ((theta - .95) ** 2) / .06)
-    rgb = np.clip(np.stack([light, light, light * .985], -1), 0, 1)
-    texture = pv.Texture((rgb * 255).astype(np.uint8))
-    texture.SetMipmap(True)
-    texture.SetInterpolate(True)
-    return texture
-
-
 def metal_phong(rgb, roughness=.25):
     """Phong terms that read as polished metal: (ambient, diffuse, specular, power).
+
+    ``ambient`` and ``diffuse`` are coefficients of the surface color: per-face
+    colors (exposed vs resist-covered copper) replace VTK's ambient *color* as
+    well as the diffuse color, so dimming must live in the coefficient.
 
     A metal has almost no diffuse; its color is a tinted reflection. Without an
     environment map that is approximated by a dim diffuse, a strong specular
@@ -115,7 +98,10 @@ def metal_phong(rgb, roughness=.25):
     power = max(10., min(128., 2. / (roughness * roughness) - 2.))
     # (ambient color, diffuse weight, specular color, power). The diffuse
     # color itself stays the swatch: captures and per-face colors read it.
-    return tuple(.32 * v for v in color), .62, tuple(.35 + .65 * v for v in color), power
+    # KiCad's rig (a headlight plus two camera lights) delivers about 0.9 on
+    # an iso-viewed board face: these terms show the swatch at about its own
+    # value, so ENIG reads as gold (neither pale lemon nor dull khaki).
+    return .2, .9, tuple(.25 + .6 * v for v in color), power
 
 
 def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None):
@@ -127,21 +113,27 @@ def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None
     """
     terms_rgb = base_rgb if base_rgb is not None and kind in ("copper", "barrel", "via_patch") else rgb
     from .finishes import is_realistic_metal
-    if (kind in ("copper", "barrel", "via_patch") and is_realistic_metal(rgb)) or (
-            kind == "component" and metallic is not None and metallic >= .5):
-        # Realistic plated finishes and metal model parts are physically
-        # based metals reflecting the viewport's studio environment.
-        prop.SetInterpolationToPBR()
-        prop.SetMetallic(1.)
-        prop.SetRoughness(min(.8, max(.05, float(roughness if roughness is not None else .25))))
-        prop.SetDiffuse(1.)
-        prop.SetAmbient(0.)
-        # The diffuse color stays the swatch: captures and per-face colors read it.
-        prop.SetDiffuseColor(*(float(v) for v in rgb[:3]))
-        return
-    if prop.GetInterpolation() == 3:  # leaving a metal finish (style/color change)
+    if prop.GetInterpolation() == 3:  # older sessions/actors used PBR metal
         prop.SetInterpolationToPhong()
         prop.SetMetallic(0.)
+    if (kind in ("copper", "barrel", "via_patch") and is_realistic_metal(rgb)) or (
+            kind == "component" and metallic is not None and metallic >= .5):
+        # Realistic plated finishes and metal model parts: Phong metal lit by
+        # KiCad's camera-attached lights. A world-fixed environment map made
+        # copper seen from below reflect the dark lower half (dull), and its
+        # sharp reflections shimmered on thin traces while orbiting. Like
+        # KiCad's viewer, every side now looks the same. The path tracer keeps
+        # the physically based metals.
+        ambient, diffuse, specular, power = metal_phong(rgb, roughness)
+        prop.SetAmbient(ambient)
+        prop.SetAmbientColor(*(float(v) for v in rgb[:3]))
+        prop.SetDiffuse(diffuse)
+        # The diffuse color stays the swatch: captures and per-face colors read it.
+        prop.SetDiffuseColor(*(float(v) for v in rgb[:3]))
+        prop.SetSpecular(1.)
+        prop.SetSpecularColor(*specular)
+        prop.SetSpecularPower(power)
+        return
     ambient, specular, shininess = kicad_material(kind, terms_rgb)
     if kind == "component":
         prop.SetAmbient(.18)
@@ -203,15 +195,6 @@ class BoardViewport(QWidget):
         # A finite peel count changes the composite as thin mask faces move
         # between depth buckets at different zooms. Finish every visible peel.
         self.plotter.enable_depth_peeling(number_of_peels=0, occlusion_ratio=0.0)
-        # Image-based lighting for metals only (Phong materials ignore it).
-        try:
-            renderer = self.plotter.renderer
-            renderer.SetEnvironmentTexture(studio_environment(), True)
-            renderer.SetEnvironmentUp(0., 0., 1.)  # boards are Z-up; VTK defaults to +Y
-            renderer.SetEnvironmentRight(1., 0., 0.)
-            renderer.UseImageBasedLightingOn()
-        except Exception:  # noqa: BLE001 - very old OpenGL: metals stay Phong-lit
-            pass
         self.plotter.enable_custom_trackball_style(
             left="rotate", shift_left="pan", control_left="spin",
             middle="pan", right="pan", shift_right="pan", control_right="pan")
@@ -356,9 +339,7 @@ class BoardViewport(QWidget):
                            roughness=getattr(part, "roughness", None))
             self.parts[part.key] = part
             self._apply_coated_copper(actor, part)
-            if prop.GetInterpolation() == 3:
-                pass  # physically based metal, set by apply_material
-            elif part.kind == "component" or part.mesh.GetPointData().GetNormals() is not None:
+            if part.kind == "component" or part.mesh.GetPointData().GetNormals() is not None:
                 # Per-pixel lighting with the mesh's smoothed wall normals.
                 prop.SetInterpolationToPhong()
             else:
@@ -604,11 +585,13 @@ class BoardViewport(QWidget):
         from vtkmodules.vtkRenderingCore import vtkFXAAOptions
         options = vtkFXAAOptions()
         if high_quality:
+            # FXAA 3.11's "extreme quality" thresholds: also smooth the faint
+            # resist/copper and silk edges that the defaults leave stepped.
             options.SetUseHighQualityEndpoints(True)
-            options.SetEndpointSearchIterations(24)
-            options.SetHardContrastThreshold(.03125)
-            options.SetRelativeContrastThreshold(.125)
-            options.SetSubpixelBlendLimit(.5)
+            options.SetEndpointSearchIterations(32)
+            options.SetHardContrastThreshold(.0312)
+            options.SetRelativeContrastThreshold(.063)
+            options.SetSubpixelBlendLimit(.75)
         self.plotter.renderer.SetFXAAOptions(options)
 
     def set_clip(self, axis, fraction, flip=False):

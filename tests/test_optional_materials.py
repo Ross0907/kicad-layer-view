@@ -120,6 +120,6 @@ def test_paste_is_metal_and_hq_fxaa_configuration_never_changes_resolution():
         renderer=SimpleNamespace(SetFXAAOptions=values.append), window_size=(2168, 1689)))
     BoardViewport._configure_fxaa(viewport, True)
     assert values[0].GetUseHighQualityEndpoints()
-    assert values[0].GetEndpointSearchIterations() == 24
-    assert values[0].GetSubpixelBlendLimit() == .5
+    assert values[0].GetEndpointSearchIterations() == 32
+    assert values[0].GetSubpixelBlendLimit() == .75
     assert viewport.plotter.window_size == (2168, 1689)

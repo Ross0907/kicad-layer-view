@@ -85,7 +85,7 @@ def test_scene_uses_transmitting_shadow_transport_without_changing_geometry_or_r
                            (part.points - tracer.center) * tracer.scale)
     mask_material = tracer.scene["part_1"].properties["bsdf"]
     assert mask_material["type"] == "blendbsdf"
-    assert np.isclose(mask_material["weight"] ** 2, .5)  # one visible opacity across two crossings
+    assert np.isclose(mask_material["weight"], .5)  # 1 - opacity per crossing
     assert mask_material["bsdf_1"]["type"] == "thindielectric"
     assert mask_material["bsdf_1"]["int_ior"] == mask_material["bsdf_1"]["ext_ior"]
     sensor = _sensor_dict(tracer.mi, camera, 2168, 1689, tracer.center, tracer.scale)

@@ -14,10 +14,11 @@ from qtpy.QtCore import QAbstractAnimation, QEvent, QObject, QRect, Qt, QTimer
 from qtpy.QtGui import QImage, QPixmap, QRegion
 from qtpy.QtWidgets import QLabel
 
-IDLE_DELAY_MS = 150
+# Start refining almost at once when the view stops; any input cancels it.
+IDLE_DELAY_MS = 60
 SAMPLES = 32
 # The refined image appears after this many samples and sharpens until done.
-PREVIEW_EVERY = 8
+PREVIEW_EVERY = 4
 
 
 def jitter_offsets(count=SAMPLES):

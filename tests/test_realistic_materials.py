@@ -104,10 +104,11 @@ def _hex(rgb):
 def test_resist_uses_pcb2blender_two_tone_colors():
     from layer_viewer.finishes import resist_light_color
     green = material_appearance("mask", "Green")
-    assert _hex(green) == "22521f" and _hex(resist_light_color(green)) == "43a142"
+    # pcb2blender's #43a142 over copper, softened to a subtle lift.
+    assert _hex(green) == "22521f" and _hex(resist_light_color(green)) == "31762f"
     assert material_appearance("mask", "") == green  # unspecified resist is green
     black = material_appearance("mask", "Black")
-    assert _hex(black) == "000000" and _hex(resist_light_color(black)) == "10100f" and black[3] >= .99
+    assert _hex(black) == "000000" and _hex(resist_light_color(black)) == "070707" and black[3] >= .99
     assert resist_light_color(material_appearance("mask", "Green", style="kicad")) is None
 
 

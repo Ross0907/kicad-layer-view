@@ -101,15 +101,18 @@ def test_parallel_model_parsing_can_be_disabled(monkeypatch, tmp_path):
     assert components.preload_models(paths) == 0
 
 
-def test_realistic_metals_are_physically_based_in_the_viewport():
+def test_realistic_metals_are_camera_lit_phong_in_the_viewport():
+    # A world-fixed environment map made copper dull from below and shimmer
+    # while orbiting; like KiCad, metals use the camera-attached lights.
     import vtk
     from layer_viewer.finishes import HASL_COLOR
     from layer_viewer.viewer import apply_material
     prop = vtk.vtkProperty()
     apply_material(prop, "copper", HASL_COLOR, roughness=.2)
-    assert prop.GetInterpolation() == 3 and prop.GetMetallic() == 1.
-    assert prop.GetDiffuseColor() == pytest.approx(HASL_COLOR)  # captures read the swatch
-    apply_material(prop, "copper", (.2, .4, .9))  # custom color: back to KiCad's Phong
     assert prop.GetInterpolation() != 3 and prop.GetMetallic() == 0.
+    assert prop.GetDiffuseColor() == pytest.approx(HASL_COLOR)  # captures read the swatch
+    metal_specular = prop.GetSpecularColor()
+    apply_material(prop, "copper", (.2, .4, .9))  # custom color: KiCad's own copper terms
+    assert prop.GetInterpolation() != 3 and prop.GetSpecularColor() != metal_specular
     apply_material(prop, "component", (.74, .74, .74), metallic=1., roughness=.26)
-    assert prop.GetInterpolation() == 3
+    assert prop.GetInterpolation() != 3 and prop.GetSpecular() == 1.
