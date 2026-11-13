@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1
+
+- 3D models stored as a bare file name (for example `part.stp`) are found the
+  way KiCad finds them: in the project folder, then in KiCad's 3D model
+  folder. Footprints that showed only pads now show their parts.
+- ENIG is a warmer, more saturated gold (`#e8c46c`) instead of pale cream.
+
 ## 0.7.0
 
 Every board shows its stackup

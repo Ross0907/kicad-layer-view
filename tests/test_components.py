@@ -52,6 +52,21 @@ def test_resolve_project_path_alias_and_missing_wrl_counterpart(tmp_path):
     assert components._version_key("10.0") > components._version_key("9.0")
 
 
+def test_bare_model_name_falls_back_to_kicad_3dmodel_dir(tmp_path):
+    """KiCad resolves a bare "part.stp" in the project, then ${KICADn_3DMODEL_DIR}."""
+    project, library = tmp_path / "project", tmp_path / "3dmodels"
+    project.mkdir()
+    library.mkdir()
+    (library / "part.stp").write_text("placeholder")
+    env = {"KIPRJMOD": str(project), "KICAD9_3DMODEL_DIR": str(tmp_path / "old"),
+           "KICAD10_3DMODEL_DIR": str(library)}
+    assert components.resolve_model_path("part.stp", project, env) == (library / "part.stp").resolve()
+    (project / "part.stp").write_text("override")
+    assert components.resolve_model_path("part.stp", project, env) == (project / "part.stp").resolve()
+    # An undefined variable stays unresolved rather than guessing a library file.
+    assert components.resolve_model_path("${NOPE}/part.stp", project, env) is None
+
+
 def test_model_environment_ignores_stale_installations(tmp_path, monkeypatch):
     for version in ("9.0", "10.0", "10.0.stale.20261021_215441"):
         (tmp_path / "KiCad" / version / "share/kicad/3dmodels").mkdir(parents=True)

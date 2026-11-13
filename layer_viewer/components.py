@@ -145,17 +145,30 @@ def resolve_model_path(filename, project_dir="", environment=None):
             break
         value = expanded
     path = Path(value.replace("\\", "/")).expanduser()
+    candidates = [path]
     if not path.is_absolute():
-        path = Path(project_dir) / path
-    if path.is_file():
-        return path.resolve()
+        # FILENAME_RESOLVER::ResolvePath: a relative name is tried in the
+        # project directory, then (legacy behavior) in the versioned
+        # ${KICADn_3DMODEL_DIR}. Footprints often store a bare "part.stp".
+        candidates = [Path(project_dir) / path]
+        if not re.match(r"\s*(?:\$\{|\$\(|%)", str(filename)):
+            versioned = sorted((key for key in values if re.fullmatch(r"KICAD\d+_3DMODEL_DIR", key)),
+                               key=lambda key: int(re.sub(r"\D", "", key)), reverse=True)
+            for key in [*versioned, "KISYS3DMOD"]:
+                if values.get(key):
+                    candidates.append(Path(str(values[key]).replace("\\", "/")) / path)
+                    break
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
     # KiCad's current libraries replaced WRL with STEP. Respect the requested
     # model when it exists; use its same-name counterpart only when missing.
     alternatives = {".wrl": (".step", ".stp"), ".step": (".wrl",), ".stp": (".wrl",)}
-    for suffix in alternatives.get(path.suffix.lower(), ()):
-        alternate = path.with_suffix(suffix)
-        if alternate.is_file():
-            return alternate.resolve()
+    for candidate in candidates:
+        for suffix in alternatives.get(candidate.suffix.lower(), ()):
+            alternate = candidate.with_suffix(suffix)
+            if alternate.is_file():
+                return alternate.resolve()
     return None
 
 

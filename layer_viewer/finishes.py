@@ -89,7 +89,9 @@ STACKUP_KINDS = ("mask", "silk", "paste", "dielectric")
 # library PIN-01/PIN-02 materials; silver/tin from mat4cad METAL_COLORS.
 BARE_COPPER_COLOR = _rgb(0xe1, 0xbb, 0xac)  # pcb2blender NONE (bare copper / OSP)
 HASL_COLOR = _rgb(0xea, 0xea, 0xe5)         # pcb2blender HASL
-REAL_ENIG_COLOR = _rgb(0xef, 0xdf, 0xbb)    # pcb2blender ENIG
+# pcb2blender's ENIG #efdfbb reads as pale cream under image-based lighting;
+# immersion gold is a saturated warm yellow (gold F0 ~ (1, .77, .34) linear).
+REAL_ENIG_COLOR = _rgb(0xe8, 0xc4, 0x6c)
 REAL_SILVER_COLOR = _rgb(0xe7, 0xe5, 0xe1)
 REAL_TIN_COLOR = _rgb(0xcb, 0xca, 0xc0)
 SOLDER_COLOR = _rgb(0xaa, 0xaa, 0xa6)       # pcb2blender solder

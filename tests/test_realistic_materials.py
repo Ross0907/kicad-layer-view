@@ -106,7 +106,7 @@ def test_resist_uses_pcb2blender_two_tone_colors():
 
 def test_finishes_and_legend_use_pcb2blender_colors():
     assert _hex(finish_appearance("")[0]) == "eaeae5"       # HASL
-    assert _hex(finish_appearance("ENIG")[0]) == "efdfbb"
+    assert _hex(finish_appearance("ENIG")[0]) == "e8c46c"
     assert _hex(finish_appearance("OSP")[0]) == "e1bbac"    # bare copper
     assert _hex(material_appearance("silk", "")) == "f3f1f0"
     assert _hex(material_appearance("silk", "", context="White")) == "100f0f"
