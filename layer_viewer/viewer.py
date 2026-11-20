@@ -354,15 +354,11 @@ class BoardViewport(QWidget):
                 continue
             # No smooth_shading: its normals were computed on the GUI thread and
             # then dropped when _apply_coated_copper set part.mesh back as input.
-            # static: part inputs are always plain SetInputData datasets, never
-            # filter outputs, so skip the per-frame pipeline update. A filter
-            # connected here later with SetInputConnection would stop updating.
             actor = self.plotter.add_mesh(
                 part.mesh, color=part.color,
                 opacity=part.opacity, smooth_shading=False, show_edges=False,
-                name=part.key, reset_camera=False, render=False, static=True,
+                name=part.key, reset_camera=False, render=False,
             )
-            self._track_static_mapper(part.key, actor)
             prop = actor.GetProperty()
             apply_material(prop, part.kind, part.color, metallic=getattr(part, "metallic", None),
                            roughness=getattr(part, "roughness", None))
@@ -390,33 +386,6 @@ class BoardViewport(QWidget):
         if not preserve_view:
             self.orient("iso", animate=False)
         self.scene_changed.emit()
-
-    def _track_static_mapper(self, key, actor):
-        """Also mark the inner polydata mapper static once VTK creates it.
-
-        vtkDataSetMapper renders through an internal mapper that it builds on
-        the actor's first render and that does not inherit Static.
-        """
-        pending = getattr(self, "_static_pending", None)
-        if pending is None:
-            pending = self._static_pending = {}
-            renderer = getattr(self.plotter, "renderer", None)
-            if hasattr(renderer, "AddObserver"):
-                renderer.AddObserver("EndEvent", self._finish_static_mappers)
-        pending[key] = actor
-
-    def _finish_static_mappers(self, *_):
-        pending = self._static_pending
-        if not pending:
-            return
-        for key, actor in list(pending.items()):
-            if self.actors.get(key) is not actor:
-                del pending[key]  # removed before it was ever drawn
-                continue
-            inner = getattr(actor.GetMapper(), "GetPolyDataMapper", lambda: None)()
-            if inner is not None:
-                inner.SetStatic(1)
-                del pending[key]
 
     def set_gap(self, gap_mm, reframe=True):
         self.gap_mm = max(0.0, float(gap_mm))

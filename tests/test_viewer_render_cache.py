@@ -75,7 +75,7 @@ def _viewport():
                            set_gap=lambda *args, **kwargs: None, _update_led_appearance=lambda: None,
                            scene_changed=SimpleNamespace(emit=lambda: None),
                            _apply_coated_copper=BoardViewport._apply_coated_copper)
-    for name in ("set_scene", "set_part", "_track_static_mapper", "_finish_static_mappers"):
+    for name in ("set_scene", "set_part"):
         setattr(view, name, MethodType(getattr(BoardViewport, name), view))
     return view
 
@@ -100,7 +100,7 @@ def _shot(view):
     return view.plotter.screenshot(return_img=True)
 
 
-def test_board_mappers_are_static_and_still_follow_color_visibility_and_mesh_changes():
+def test_board_actors_follow_color_visibility_and_mesh_changes():
     snapshot = SimpleNamespace(stackup=SimpleNamespace(copper=[0, 31]))
     component = pv.Sphere(radius=.2, theta_resolution=10, phi_resolution=10, center=(0, 0, .3))
     component.point_data.pop("Normals", None)
@@ -112,11 +112,6 @@ def test_board_mappers_are_static_and_still_follow_color_visibility_and_mesh_cha
     assert comp.GetMapper().GetInput().GetPointData().GetNormals() is None
     assert comp.GetProperty().GetInterpolation() == 2  # Phong
     before = _shot(view)
-    for actor in view.actors.values():
-        mapper = actor.GetMapper()
-        assert mapper.GetStatic() == 1
-        assert mapper.GetPolyDataMapper().GetStatic() == 1  # the mapper that actually renders
-    assert not view._static_pending
 
     # Layer color, visibility and a live mesh swap must all still reach the screen.
     view.set_part("copper:0", color=(.2, .4, .9), render=False)

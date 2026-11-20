@@ -11,8 +11,8 @@
   peeling and FXAA. Captures read triangles without copying them twice.
 - Viewport: showing a board is about twice as fast (set_scene 1.1 s → 0.6 s),
   and layer, preset, solo and opacity changes no longer re-upload unchanged
-  copper and resist colors (12 layers: 60–100 ms → under 20 ms). Part mappers
-  are static, and component normals that were discarded are no longer built.
+  copper and resist colors (12 layers: 60–100 ms → under 20 ms), and component
+  normals that were discarded are no longer built.
 - Loading: polygon cache keys are binary digests, scene signatures are
   computed once per load, the board is meshed while the last view waits for
   cached models, paste and both resist profiles mesh in parallel, cached 3D
