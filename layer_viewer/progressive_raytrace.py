@@ -41,10 +41,12 @@ FREEZE_RENDER = _env_flag("LAYER_VIEW_RT_FREEZE")
 _FREEZE_UNSUPPORTED = set()
 
 
-def _render_one_sample(scene, sensor, seed):
+def _render_one_sample(scene, sensor, seed, key):
     # Module level with a local import, so the frozen closure holds no tracer
     # state. ``mi.render`` (not integrator.render) keeps Mitsuba's re-seeding
-    # of the sampler after a frozen recording.
+    # of the sampler after a frozen recording. ``key`` (film size and sensor
+    # kind) is a plain Python value, so each size gets its own recording: the
+    # film size is a C++ scalar that dr.freeze cannot see.
     import mitsuba
     return mitsuba.render(scene, sensor=sensor, spp=1, seed=seed)
 
@@ -615,9 +617,10 @@ class ProgressiveRayTracer:
             if self._frozen_render is None:
                 # Per tracer, so recordings are released with the scene. Each
                 # sensor (motion/refinement size) is its own recording.
-                self._frozen_render = dr.freeze(_render_one_sample, limit=4)
+                self._frozen_render = dr.freeze(_render_one_sample, limit=8)
             return self._frozen_render(self.scene, self.sensor,
-                                       dr.opaque(self.mi.UInt32, 73 + self.samples))
+                                       dr.opaque(self.mi.UInt32, 73 + self.samples),
+                                       (int(self.width), int(self.height), repr(getattr(self, "_sensor_kind", None))))
         except Exception as exc:  # noqa: BLE001 - the plain render is equivalent
             # Never retried for this sensor type (in any later tracer either).
             _FREEZE_UNSUPPORTED.add(kind)

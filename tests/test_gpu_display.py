@@ -151,6 +151,32 @@ def test_frozen_render_matches_the_plain_render_after_a_camera_move():
         tracer.close()
 
 
+def test_frozen_render_records_each_film_size_separately():
+    from dataclasses import replace
+    from layer_viewer import progressive_raytrace
+    if not progressive_raytrace.FREEZE_RENDER:
+        pytest.skip("LAYER_VIEW_RT_FREEZE disabled")
+    tracer, camera = _tracer()
+    view = replace(camera, parallel_projection=False)
+    sizes = [(96, 64, False), (48, 32, True), (96, 64, False), (64, 40, True), (48, 32, True)]
+    try:
+        images = {}
+        for frozen in (True, False):
+            tracer._freeze_failed = not frozen
+            images[frozen] = []
+            for i, (w, h, motion) in enumerate(sizes):
+                tracer.update_camera(replace(view, position=(5 + i, -20, 20)), w, h, motion=motion)
+                for _ in range(2):  # the second sample replays the recording
+                    tracer.render_batch(samples=1, denoise=False, display=False)
+                image = tracer.display_image(denoise=False, bloom_strength=0.)
+                assert image.shape == (h, w, 3)
+                images[frozen].append(image)
+        for a, b in zip(images[True], images[False]):
+            np.testing.assert_array_equal(a, b)
+    finally:
+        tracer.close()
+
+
 def test_motion_frames_reuse_the_full_size_sensor_and_guided_denoiser():
     from dataclasses import replace
     tracer, camera = _tracer()

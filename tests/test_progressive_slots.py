@@ -105,6 +105,7 @@ def _render_fixture(monkeypatch, freeze, kind="orthographic"):
     tracer.progress, tracer._sum, tracer.samples = None, None, 0
     tracer._frozen_render, tracer._freeze_failed = None, False
     tracer._sensor_kind = (kind, None)
+    tracer.width, tracer.height = 2, 2
     tracer.mi = SimpleNamespace(set_variant=lambda _: None, UInt32=int,
                                render=lambda *a, **kw: rendered.append(kw["seed"]) or np.ones((2, 2, 4)))
     return tracer, rendered
@@ -114,13 +115,14 @@ def test_single_samples_replay_the_frozen_render_with_an_opaque_seed(monkeypatch
     calls = []
 
     def freeze(function, limit=None):
-        assert function is progressive_raytrace._render_one_sample and limit == 4
-        return lambda scene, sensor, seed: calls.append((scene, sensor, seed)) or np.ones((2, 2, 4))
+        assert function is progressive_raytrace._render_one_sample and limit == 8
+        return lambda scene, sensor, seed, key: calls.append((scene, sensor, seed, key)) or np.ones((2, 2, 4))
     monkeypatch.setattr(progressive_raytrace, "FREEZE_RENDER", True)
     tracer, rendered = _render_fixture(monkeypatch, freeze)
     tracer.render_batch(1, display=False)
     tracer.render_batch(1, display=False)
-    assert calls == [("scene", "sensor", ("opaque", 73)), ("scene", "sensor", ("opaque", 74))]
+    key = (2, 2, repr(("orthographic", None)))
+    assert calls == [("scene", "sensor", ("opaque", 73), key), ("scene", "sensor", ("opaque", 74), key)]
     assert not rendered and tracer.samples == 2
     tracer.render_batch(4, display=False)  # multi-sample batches trace normally
     assert rendered == [75] and len(calls) == 2
@@ -130,7 +132,7 @@ def test_freeze_failure_or_disabled_flag_falls_back_to_plain_render(monkeypatch)
     attempts = []
 
     def freeze(function, limit=None):
-        def frozen(scene, sensor, seed):
+        def frozen(scene, sensor, seed, key):
             attempts.append(seed)
             if kinds[0] == "orthographic":
                 raise RuntimeError("variable was not specified as an input")
