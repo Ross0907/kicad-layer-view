@@ -356,6 +356,84 @@ def load_model(path, *, cache_dir=None):
         return meshes
 
 
+def _remember(key, meshes):
+    """Insert loaded meshes into the in-memory LRU (caller holds ``_LOCK``)."""
+    for mesh in meshes:
+        mesh.points.setflags(write=False)
+        mesh.triangles.setflags(write=False)
+    _MEMORY[key] = meshes
+    _MEMORY.move_to_end(key)
+    while len(_MEMORY) > _MEMORY_LIMIT:
+        _MEMORY.popitem(last=False)
+
+
+_MEMORY_LIMIT = 128
+# Warm disk-cache reads (zlib inflate and NumPy validation release the GIL)
+# overlap on a few threads; fewer distinct cached models are read serially.
+PREFETCH_MIN_MODELS = 4
+PREFETCH_WORKERS = 6
+
+
+def _read_cache_quietly(cache_path):
+    # Any failure (even one _read_cache does not expect) leaves the model to
+    # load_model, which reports it exactly as the serial path always did.
+    try:
+        return _read_cache(cache_path)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _prefetch_cached_models(paths, progress=None):
+    """Read already cached models into memory in parallel (best effort).
+
+    Only existing disk-cache entries are read: STEP/VRML parsing, legacy-cache
+    migration and cache writes stay on the serial ``load_model`` path, since
+    OpenCascade readers are not thread-safe. A missing, pruned or invalid
+    entry is simply left for ``load_model``, which then behaves as before.
+    """
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+    root = _cache_root()
+    todo = []
+    for path in dict.fromkeys(Path(p).resolve() for p in paths):
+        try:
+            key = _cache_key(path)
+            with _LOCK:
+                if key in _MEMORY:
+                    _MEMORY.move_to_end(key)  # keep this board's models ahead of the batch
+                    continue
+            cache_path = root / f"{key}.npz"
+            if cache_path.is_file():
+                todo.append((key, cache_path))
+        except OSError:
+            continue
+    todo = todo[:_MEMORY_LIMIT]  # never evict this batch's own reads
+    if len(todo) < PREFETCH_MIN_MODELS:
+        return 0
+    check_cancel = getattr(progress, "check_cancel", None)
+    pool = ThreadPoolExecutor(max_workers=min(PREFETCH_WORKERS, len(todo)), thread_name_prefix="model-read")
+    results = []
+    try:
+        futures = [pool.submit(_read_cache_quietly, cache_path) for _, cache_path in todo]
+        for future in futures:
+            while True:
+                try:
+                    results.append(future.result(timeout=.1))
+                    break
+                except FuturesTimeout:
+                    if check_cancel is not None:
+                        check_cancel()
+    finally:
+        pool.shutdown(wait=len(results) == len(todo), cancel_futures=True)
+    count = 0
+    with _LOCK:
+        # Original path order keeps the LRU recency deterministic.
+        for (key, _), meshes in zip(todo, results):
+            if meshes:
+                _remember(key, meshes)
+                count += 1
+    return count
+
+
 def _model_cached(path):
     key = _cache_key(path)
     with _LOCK:
@@ -695,6 +773,7 @@ def build_component_parts(snapshot, slot_count, progress=None):
             if model.visible and model.opacity > 0 and model.filename not in resolved:
                 resolved[model.filename] = resolve_model_path(model.filename, snapshot.project_dir, environment)
     preload_models([path for path in resolved.values() if path is not None], progress)
+    _prefetch_cached_models([path for path in resolved.values() if path is not None], progress)
     for footprint in snapshot.footprints:
         if progress is not None and hasattr(progress, "check_cancel"):
             progress.check_cancel()

@@ -44,6 +44,46 @@ def test_paste_retains_holes_both_faces_and_snapshot_cache(tmp_path, monkeypatch
         assert actual.led == expected.led
 
 
+def test_paste_meshed_on_the_pool_equals_the_serial_slab(monkeypatch):
+    import threading
+    from layer_viewer import geometry
+
+    snapshot = demo_snapshot()
+    artwork = [Poly([(2, 2), (6, 2), (6, 5), (2, 5)], [[(3, 3), (4, 3), (4, 4), (3, 4)]]),
+               Poly([(5, 4), (9, 4), (9, 7), (5, 7)]), Poly([(-50, -50), (-49, -50), (-49, -49)])]
+    snapshot.solder_paste = {"F.Paste": artwork, "B.Paste": artwork[1:]}
+    threads = []
+    original = geometry.slab
+    def recorded(geom, z, thickness, **kw):
+        if thickness == PASTE_THICKNESS_MM:
+            threads.append(threading.current_thread().name)
+        return original(geom, z, thickness, **kw)
+    monkeypatch.setattr(geometry, "slab", recorded)
+    scene = build_scene(snapshot)
+    assert len(threads) == 2 and all(name.startswith("pcb-mesh") for name in threads)
+    outline = geometry.board_outline(snapshot)
+    paste = [p for p in scene.parts if p.kind == "paste"]
+    assert [p.key for p in paste] == ["paste:F.Paste", "paste:B.Paste"]
+    for part in paste:
+        front = part.name == "F.Paste"
+        cu = snapshot.stackup.copper[0 if front else -1]
+        geom = geometry.polygon_union(geometry.polys_to_shapely(
+            snapshot.solder_paste[part.name])).intersection(outline)
+        z = (cu.z_top_mm + CONTACT_INSET_MM if front else
+             cu.z_bottom_mm - CONTACT_INSET_MM - PASTE_THICKNESS_MM)
+        expected = original(geom, z, PASTE_THICKNESS_MM, smooth=False)
+        np.testing.assert_array_equal(part.mesh.points, expected.points)
+        np.testing.assert_array_equal(part.mesh.faces, expected.faces)
+        assert part.area_mm2 == geom.area
+        assert part.stack_index == (-1 if front else scene.slot_count)
+    # Paste only rebuild (nothing else dirty) still meshes on the pool with a ready outline.
+    changed = replace(snapshot, solder_paste={"F.Paste": artwork[:1], "B.Paste": artwork[1:]})
+    threads.clear()
+    rebuilt = build_scene(changed, previous_scene=scene)
+    assert len(threads) == 1
+    assert {p.key for p in rebuilt.parts} == {p.key for p in scene.parts}
+
+
 def test_led_detection_excludes_terminals_dark_housings_and_non_led_diodes():
     empty = np.zeros((0, 3))
     lens = ModelMesh(empty, empty, (1., .3, .1))

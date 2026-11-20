@@ -93,6 +93,38 @@ def test_invalid_coverage_is_rejected_at_capture_and_world_conversion(coverage):
         _world_mesh(replace(valid, back_covered_faces=coverage), include_coating=True)
 
 
+def _legacy_triangles(mesh):
+    mesh = mesh if mesh.is_all_triangles else mesh.triangulate()
+    return np.asarray(mesh.faces).reshape(-1, 4)[:, 1:]
+
+
+@pytest.mark.parametrize("shape", ("triangles", "quads", "lines"))
+def test_vtk_topology_capture_matches_the_legacy_face_export(shape):
+    import pyvista as pv
+    mesh = pv.Box((0, 2, 0, 1, 0, .5), quads=True)
+    if shape == "triangles":
+        mesh = mesh.triangulate()
+    elif shape == "lines":
+        mesh = mesh.triangulate()
+        mesh.lines = np.asarray((2, 0, 1))  # a mixed cell type must be triangulated
+    viewport = _viewport()
+    if shape != "lines":
+        mesh.cell_data["coat:F.Mask"] = np.linspace(0, 1, mesh.n_cells)
+    viewport.parts["cu"].mesh = mesh
+    from layer_viewer.raytrace import _triangle_cells
+    fast = _triangle_cells(mesh)
+    assert (fast is not None) == (shape == "triangles")
+    captured = capture_from_viewport(viewport).meshes[0]
+    np.testing.assert_array_equal(captured.triangles, _legacy_triangles(mesh))
+    assert captured.triangles.dtype == np.int32 and not captured.triangles.flags.writeable
+    np.testing.assert_array_equal(captured.points, mesh.points)
+    if shape == "triangles":
+        # The capture owns its topology; later edits to the live mesh are not seen.
+        before = captured.triangles.copy()
+        fast[0] = fast[1]
+        np.testing.assert_array_equal(captured.triangles, before)
+
+
 @pytest.mark.parametrize("dual", (False, True))
 def test_clipping_and_triangulation_keep_each_fragment_original_coverage(dual):
     # PolyData clipping operates on six CPU vertices; no plotter is constructed.

@@ -9,13 +9,21 @@ def load_scene_stages(snapshot, *, via_details=False, progress=None):
     avoiding both a second disk read and a second GPU upload of those surfaces.
     """
     from dataclasses import replace
-    from .cache import load_cached_scene, load_previous_scene
-    from .geometry import build_scene, scene_keys
+    from .cache import cache_key, load_cached_scene, load_previous_scene
+    from .geometry import _scene_signatures, build_scene, scene_keys
 
     preview_keys = scene_keys(snapshot, surface_only=True, via_details=False)
     requested = scene_keys(snapshot, via_details=via_details)
     previous = None
-    preview = load_cached_scene(snapshot, requested_keys=preview_keys)
+    # The snapshot is fixed for this whole generator: fingerprint it once.
+    try:
+        key = cache_key(snapshot)
+    except (ValueError, TypeError, OverflowError, RuntimeError):
+        key = None  # load_cached_scene retries and treats the failure as a miss
+    # Every branch below needs the part signatures before its first yield anyway.
+    signatures = _scene_signatures(snapshot)
+    preview = load_cached_scene(snapshot, requested_keys=preview_keys, key=key,
+                                signatures=signatures)
     if preview is not None:
         if preview_keys == requested:
             yield preview, True
@@ -24,14 +32,15 @@ def load_scene_stages(snapshot, *, via_details=False, progress=None):
         yield preview, True
         if progress is not None:
             progress.check_cancel()
-        scene = load_cached_scene(snapshot, requested_keys=requested, previous_scene=preview)
+        scene = load_cached_scene(snapshot, requested_keys=requested, previous_scene=preview, key=key,
+                                  signatures=signatures)
         if scene is not None:
             yield scene, True
             return
     else:
-        previous = load_previous_scene(snapshot, requested_keys=preview_keys)
+        previous = load_previous_scene(snapshot, requested_keys=preview_keys, signatures=signatures)
         preview = build_scene(snapshot, progress=progress, previous_scene=previous,
-                              requested_keys=preview_keys)
+                              requested_keys=preview_keys, signatures=signatures)
         if preview_keys == requested:
             yield preview, False
             return
@@ -43,14 +52,14 @@ def load_scene_stages(snapshot, *, via_details=False, progress=None):
     # an exact surface cache hit whose inner signatures are stale or missing.
     # Retain validated preview objects instead of checksumming/reading them again.
     previous = load_previous_scene(snapshot, requested_keys=requested,
-                                   previous_scene=preview)
+                                   previous_scene=preview, signatures=signatures)
     base = preview
     if previous is not None:
         visible = {part.key for part in preview.parts}
         base = replace(preview, parts=list(preview.parts) + [part for part in previous.parts if part.key not in visible],
                        _geometry_signatures={**previous._geometry_signatures, **preview._geometry_signatures})
     yield build_scene(snapshot, progress=progress, previous_scene=base,
-                      requested_keys=requested), False
+                      requested_keys=requested, signatures=signatures), False
 
 
 class _ModelProgress:
@@ -67,6 +76,22 @@ class _ModelProgress:
 
     def info(self, message):
         if not self.stop.is_set() and self.progress is not None and hasattr(self.progress, "info"):
+            self.progress.info(message)
+
+
+class _BuildProgress(_ModelProgress):
+    """Progress for a board build on a helper thread; stops it once the load is abandoned.
+
+    Unlike the model thread, it forwards to a plain callable progress too, the
+    way ``build_scene`` reports when it runs on the load thread.
+    """
+
+    def info(self, message):
+        if self.stop.is_set() or self.progress is None:
+            return
+        if callable(self.progress):
+            self.progress(message)
+        elif hasattr(self.progress, "info"):
             self.progress.info(message)
 
 
@@ -88,20 +113,33 @@ def load_complete_scene(snapshot, *, via_details=False, components=True, progres
     When the board changed since it was last cached and ``preview`` is given,
     ``preview(scene)`` first receives the last cached view of this board
     (``scene._stale``), with its models when they are ready in time. Its
-    unchanged meshes are then reused, never read twice.
+    unchanged meshes are then reused, never read twice. While 3D models are
+    still loading, the rebuild already starts behind that preview instead of
+    waiting for them.
     """
     import threading
     import time
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+    from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeout,
+                                    wait)
     from .cache import load_cached_scene, load_previous_scene, load_stale_scene
-    from .geometry import build_scene, scene_keys
+    from .geometry import _scene_signatures, build_scene, scene_keys
 
     started = time.monotonic()
     requested = scene_keys(snapshot, via_details=via_details)
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pcb-models")
+    build_pool = None
     stop = threading.Event()
     models = signature = None
     finished = False
+
+    def rebuild(stale, build_progress):
+        # One signature pass serves both the previous-mesh lookup and the build;
+        # the snapshot is not modified in between.
+        signatures = _scene_signatures(snapshot)
+        previous = load_previous_scene(snapshot, requested_keys=requested, previous_scene=stale,
+                                       signatures=signatures)
+        return build_scene(snapshot, progress=build_progress, previous_scene=previous,
+                           requested_keys=requested, signatures=signatures)
 
     def check_cancel():
         if progress is not None and hasattr(progress, "check_cancel"):
@@ -134,16 +172,38 @@ def load_complete_scene(snapshot, *, via_details=False, components=True, progres
         cached = scene is not None
         if scene is None:
             stale = load_stale_scene(snapshot) if preview is not None else None
-            if stale is not None:
-                if models is not None:
-                    ready = model_result(started + STALE_PREVIEW_MODEL_WAIT_S)
-                    if ready is not None:
-                        stale._components = (*ready, signature)
-                check_cancel()
-                preview(stale)
-            previous = load_previous_scene(snapshot, requested_keys=requested, previous_scene=stale)
-            scene = build_scene(snapshot, progress=progress, previous_scene=previous,
-                                requested_keys=requested)
+            if stale is not None and models is not None and not models.done():
+                # Mesh behind the preview while it waits for cached models. The
+                # preview and the final scene are both handed over on this thread.
+                build_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pcb-build")
+                build = build_pool.submit(rebuild, stale, _BuildProgress(progress, stop))
+                deadline = started + STALE_PREVIEW_MODEL_WAIT_S
+                while not models.done() and not build.done():
+                    check_cancel()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    wait((models, build), timeout=min(.1, remaining), return_when=FIRST_COMPLETED)
+                if models.done():
+                    stale._components = (*model_result(), signature)
+                if not build.done():  # never show the stale view once the final one exists
+                    check_cancel()
+                    preview(stale)
+                while True:
+                    try:
+                        scene = build.result(timeout=.1)
+                        break
+                    except FuturesTimeout:
+                        check_cancel()
+            else:
+                if stale is not None:
+                    if models is not None:
+                        ready = model_result(started + STALE_PREVIEW_MODEL_WAIT_S)
+                        if ready is not None:
+                            stale._components = (*ready, signature)
+                    check_cancel()
+                    preview(stale)
+                scene = rebuild(stale, progress)
         if models is not None:
             parts, warnings = model_result()
             scene._components = (parts, warnings, signature)
@@ -153,3 +213,7 @@ def load_complete_scene(snapshot, *, via_details=False, components=True, progres
         if not finished:
             stop.set()
         pool.shutdown(wait=finished, cancel_futures=True)
+        if build_pool is not None:
+            # Also on cancel or error: the build stops at its next cancel point
+            # (stop is set), and no abandoned build overlaps the next load.
+            build_pool.shutdown(wait=True, cancel_futures=True)

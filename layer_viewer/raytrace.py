@@ -90,6 +90,29 @@ def _coating_values(values, face_count, *, components=1):
     return coverage
 
 
+def _triangle_cells(mesh):
+    """Zero-copy (n, 3) view of an all-triangle polygon mesh, else None.
+
+    Reads VTK's offsets/connectivity arrays directly instead of exporting the
+    legacy padded face array (twice, via is_all_triangles and faces). Meshes
+    with vertices, lines, strips or non-triangle polygons return None.
+    """
+    if not hasattr(mesh, "GetPolys"):
+        return None  # plain test doubles
+    try:
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+        polys = mesh.GetPolys()
+        count = polys.GetNumberOfCells()
+        if not count or mesh.GetNumberOfCells() != count:
+            return None
+        offsets = vtk_to_numpy(polys.GetOffsetsArray())
+        if len(offsets) != count + 1 or offsets[0] != 0 or not np.all(np.diff(offsets) == 3):
+            return None
+        return vtk_to_numpy(polys.GetConnectivityArray()).reshape(count, 3)
+    except Exception:  # noqa: BLE001 - the legacy face export is equivalent
+        return None
+
+
 def capture_from_viewport(viewport) -> RenderCapture:
     """Capture current meshes, color/opacity, exploded transforms and clip planes."""
     captured = []
@@ -97,9 +120,15 @@ def capture_from_viewport(viewport) -> RenderCapture:
         if not actor.GetVisibility() or actor.GetProperty().GetOpacity() <= 0:
             continue
         part = viewport.parts[key]
-        mesh = part.mesh if part.mesh.is_all_triangles else part.mesh.triangulate()
+        triangles = _triangle_cells(part.mesh)
+        if triangles is not None:
+            mesh = part.mesh
+        else:
+            mesh = part.mesh if part.mesh.is_all_triangles else part.mesh.triangulate()
         if not mesh.n_points or not mesh.n_cells:
             continue
+        if triangles is None:
+            triangles = np.asarray(mesh.faces).reshape(-1, 4)[:, 1:]
         matrix = actor.GetMatrix()
         transform = tuple(tuple(matrix.GetElement(row, column) for column in range(4)) for row in range(4))
         mapper = actor.GetMapper()
@@ -128,7 +157,7 @@ def capture_from_viewport(viewport) -> RenderCapture:
                     else (0., 0., 0.))
         captured.append(CapturedMesh(part.name, part.kind,
                         _readonly(mesh.points, np.float64),
-                        _readonly(np.asarray(mesh.faces).reshape(-1,4)[:,1:], np.int32),
+                        _readonly(triangles, np.int32),
                         transform, tuple(actor.GetProperty().GetDiffuseColor()),
                         float(actor.GetProperty().GetOpacity()), clipping,
                         getattr(part, "metallic", None), getattr(part, "roughness", None),

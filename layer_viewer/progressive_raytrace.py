@@ -11,12 +11,44 @@ https://mitsuba.readthedocs.io/en/latest/src/how_to_guides/image_io_and_manipula
 """
 from __future__ import annotations
 
+import logging
+import os
 import time
 
 import numpy as np
 
 from .raytrace import (CapturedCamera, RenderCapture, RayTraceUnavailable,
                        _RENDER_LOCK, _sensor_dict, _world_mesh)
+
+log = logging.getLogger(__name__)
+
+
+def _env_flag(name, default=True):
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value not in ("0", "false", "off", "no")
+
+
+# Replay the recorded one-sample render kernels (drjit ``dr.freeze``) instead
+# of re-tracing the Python integrator on every sample. CUDA variants only;
+# set LAYER_VIEW_RT_FREEZE=0 to compare against the plain path. Any error
+# while recording or replaying permanently falls back to the plain path.
+FREEZE_RENDER = _env_flag("LAYER_VIEW_RT_FREEZE")
+# Sensor types whose recording failed in this process. Mitsuba 3.9.1's
+# orthographic sensor keeps members that a frozen function cannot traverse,
+# so parallel views trace normally; perspective views still replay.
+_FREEZE_UNSUPPORTED = set()
+
+
+def _render_one_sample(scene, sensor, seed, key):
+    # Module level with a local import, so the frozen closure holds no tracer
+    # state. ``mi.render`` (not integrator.render) keeps Mitsuba's re-seeding
+    # of the sampler after a frozen recording. ``key`` (film size and sensor
+    # kind) is a plain Python value, so each size gets its own recording: the
+    # film size is a C++ scalar that dr.freeze cannot see.
+    import mitsuba
+    return mitsuba.render(scene, sensor=sensor, spp=1, seed=seed)
 
 
 def _linear(color):
@@ -276,6 +308,13 @@ class ProgressiveRayTracer:
         self._guides = None
         self._display_buffer = None
         self._bloom_buffer = None
+        self._gpu_bloom = None
+        # Up to two sensors (with their guided denoiser) stay resident: the
+        # full refinement size and the reduced motion size, so starting and
+        # ending a drag reuse them instead of rebuilding.
+        self._slots = {"full": None, "motion": None}
+        self._frozen_render = None
+        self._freeze_failed = False
         self._sum = None
         self.samples = 0
         self.denoiser_available = False
@@ -325,6 +364,7 @@ class ProgressiveRayTracer:
                 if not allow_cpu:
                     raise RayTraceUnavailable(f"GPU ray tracing could not allocate this scene: {exc}. OpenGL remains active.") from exc
                 self.scene = self.sensor = self._denoiser = None
+                self._slots = {"full": None, "motion": None}
                 self.triangle_count = 0
                 self.variant = _select_variant(mi, False)
                 self.backend = "CPU (scalar)"
@@ -443,15 +483,27 @@ class ProgressiveRayTracer:
         self._light_parameters = mi.traverse(self.scene)
         self._light_parameters.keep(["light_camera.to_world"])
 
-    def update_camera(self, camera: CapturedCamera, width=None, height=None):
-        """Reset accumulation, preserving the existing geometry/OptiX scene."""
+    # The live worker passes motion=True / packed=True only to backends that
+    # declare these (its test doubles do not).
+    supports_motion_camera = True
+    supports_packed_display = True
+
+    def update_camera(self, camera: CapturedCamera, width=None, height=None, *, motion=False):
+        """Reset accumulation, preserving the existing geometry/OptiX scene.
+
+        ``motion`` frames (reduced size, guide-free denoiser) never build the
+        guided OptiX denoiser; the full-size one stays cached for refinement.
+        """
         with _RENDER_LOCK:
             self.mi.set_variant(self.variant)
-            self._update_camera(camera, width or self.width, height or self.height)
+            self._update_camera(camera, width or self.width, height or self.height, motion=motion)
 
-    def _update_camera(self, camera, width, height):
+    def _update_camera(self, camera, width, height, motion=False):
         self._validate_size(width, height)
-        same_size = self.sensor is not None and (self.width, self.height) == (int(width), int(height))
+        slots = getattr(self, "_slots", None)
+        if self.sensor is None or slots is None:
+            # The first camera, or a forced reload: never reuse a cached sensor.
+            slots = self._slots = {"full": None, "motion": None}
         self.width, self.height = int(width), int(height)
         self.camera = camera
         # Updating one emitter parameter keeps every board mesh and the OptiX
@@ -464,40 +516,65 @@ class ProgressiveRayTracer:
         sensor_dict = _sensor_dict(self.mi, camera, self.width, self.height, self.center, self.scale)
         sensor_dict["film"]["pixel_format"] = "rgba"
         kind = (sensor_dict["type"], sensor_dict.get("fov"))
-        moved = False
-        if same_size and getattr(self, "_sensor_kind", None) == kind:
+        key = (self.width, self.height, kind)
+        name = next((slot_name for slot_name, cached in slots.items()
+                     if cached is not None and cached["key"] == key), None)
+        slot = slots[name] if name is not None else None
+        if slot is not None:
             # Orbiting only moves the sensor: update its transform in place so
-            # the film, denoiser and compiled kernels are all reused.
+            # the film, denoiser and compiled kernels are all reused. Motion
+            # and refinement sizes each keep their own sensor.
             try:
-                params = self._sensor_params
-                params["to_world"] = self.mi.Transform4f(sensor_dict["to_world"])
-                params.update()
-                moved = True
+                slot["params"]["to_world"] = self.mi.Transform4f(sensor_dict["to_world"])
+                slot["params"].update()
             except Exception:  # noqa: BLE001 - fall back to a new sensor
-                moved = False
-        if not moved:
-            self.sensor = self.mi.load_dict(sensor_dict)
-            self._sensor_kind = kind
+                slots[name] = slot = None
+        if slot is None:
+            sensor = self.mi.load_dict(sensor_dict)
             try:
-                self._sensor_params = self.mi.traverse(self.sensor)
+                params = self.mi.traverse(sensor)
             except Exception:  # noqa: BLE001 - always reload the sensor instead
-                self._sensor_kind = None
+                params = None
+            # A sensor without parameters is never reused (key None).
+            slot = {"key": key if params is not None else None, "sensor": sensor,
+                    "params": params, "denoiser": None}
+            slots["motion" if motion else "full"] = slot
+        self._active_slot = slot
+        self.sensor = slot["sensor"]
+        self._sensor_params = slot["params"]
+        self._sensor_kind = kind if slot["params"] is not None else None
         self._sum = None
         self.samples = 0
         self._guides = None
         self._display_buffer = None
         self._gpu_buffer = None
         self._bloom_buffer = None
-        if same_size and self._denoiser is not None:
-            return
-        self._denoiser = None
-        self.denoiser_available = False
-        if self.variant.startswith("cuda"):
+        self._gpu_bloom = None
+        if not motion:
+            # Refinement uses the guided denoiser: keep it per cached size.
+            if slot["denoiser"] is None and self.variant.startswith("cuda"):
+                try:
+                    slot["denoiser"] = self.mi.OptixDenoiser([self.width, self.height],
+                                                             albedo=True, normals=True)
+                except Exception as exc:
+                    self._report(f"OptiX denoising unavailable: {exc}")
+            self.denoiser_available = slot["denoiser"] is not None
+        # Motion frames use the guide-free fast denoiser and keep reporting the
+        # refinement denoiser's availability.
+        self._denoiser = slot["denoiser"]
+
+    def _guided_denoiser(self):
+        """The current size's guided denoiser, created on demand for motion sizes."""
+        if self._denoiser is None and self.denoiser_available and self.variant.startswith("cuda"):
             try:
                 self._denoiser = self.mi.OptixDenoiser([self.width, self.height], albedo=True, normals=True)
-                self.denoiser_available = True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - show the raw frame instead
                 self._report(f"OptiX denoising unavailable: {exc}")
+                return None
+            slot = getattr(self, "_active_slot", None)
+            if slot is not None:
+                slot["denoiser"] = self._denoiser
+        return self._denoiser
 
     def render_batch(self, samples=1, denoise=True, exposure_ev=0., denoise_strength=.35,
                      bloom_strength=.18, bloom_radius=1., *, display=True):
@@ -511,7 +588,9 @@ class ProgressiveRayTracer:
         with _RENDER_LOCK:
             mi = self.mi
             mi.set_variant(self.variant)
-            image = mi.render(self.scene, sensor=self.sensor, spp=int(samples), seed=73 + self.samples)
+            image = self._render_frozen(samples)
+            if image is None:
+                image = mi.render(self.scene, sensor=self.sensor, spp=int(samples), seed=73 + self.samples)
             # Keep the running radiance on the GPU; only the finished display
             # image crosses to the GUI. Evaluating breaks the accumulated graph.
             import drjit as dr
@@ -525,9 +604,39 @@ class ProgressiveRayTracer:
         self.last_batch_seconds = time.perf_counter() - started
         return result
 
+    def _render_frozen(self, samples):
+        """One sample through the recorded (frozen) kernels, or None to trace normally."""
+        if (int(samples) != 1 or not FREEZE_RENDER or getattr(self, "_freeze_failed", True)
+                or not str(getattr(self, "variant", "")).startswith("cuda")):
+            return None
+        kind = (getattr(self, "_sensor_kind", None) or (None,))[0]
+        if kind in _FREEZE_UNSUPPORTED:
+            return None
+        try:
+            import drjit as dr
+            if self._frozen_render is None:
+                # Per tracer, so recordings are released with the scene. Each
+                # sensor (motion/refinement size) is its own recording.
+                self._frozen_render = dr.freeze(_render_one_sample, limit=8)
+            return self._frozen_render(self.scene, self.sensor,
+                                       dr.opaque(self.mi.UInt32, 73 + self.samples),
+                                       (int(self.width), int(self.height), repr(getattr(self, "_sensor_kind", None))))
+        except Exception as exc:  # noqa: BLE001 - the plain render is equivalent
+            # Never retried for this sensor type (in any later tracer either).
+            _FREEZE_UNSUPPORTED.add(kind)
+            self._frozen_render = None
+            log.info("Frozen ray-trace kernels unavailable for %s sensors, tracing normally: %s",
+                     kind, str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
+            return None
+
     def display_image(self, denoise=True, exposure_ev=0., denoise_strength=.35,
-                      bloom_strength=.18, bloom_radius=1., fast=False):
-        """Redisplay accumulated HDR samples without tracing or resetting them."""
+                      bloom_strength=.18, bloom_radius=1., fast=False, packed=False):
+        """Redisplay accumulated HDR samples without tracing or resetting them.
+
+        ``packed=True`` (live viewport) may return an H×W uint32 array of
+        0xFFRRGGBB pixels (QImage.Format_RGB32) instead of H×W×3 RGB bytes;
+        the CPU fallback always returns H×W×3.
+        """
         if self._sum is None or not self.samples:
             raise RuntimeError("No ray-traced samples to display")
         self._check_cancel()
@@ -535,13 +644,13 @@ class ProgressiveRayTracer:
         with _RENDER_LOCK:
             self.mi.set_variant(self.variant)
             result = self._display_image(denoise, exposure_ev, denoise_strength, bloom_strength, bloom_radius,
-                                         fast=fast)
+                                         fast=fast, packed=packed)
         self._check_cancel()
         self.last_batch_seconds = time.perf_counter() - started
         return result
 
     def _display_image(self, denoise, exposure_ev, denoise_strength, bloom_strength=.18, bloom_radius=1.,
-                       fast=False):
+                       fast=False, packed=False):
         denoise_strength = float(denoise_strength)
         if not np.isfinite(denoise_strength) or not 0 <= denoise_strength <= 1:
             raise ValueError("Denoise strength must be between 0 and 1")
@@ -553,10 +662,11 @@ class ProgressiveRayTracer:
             raise ValueError("Bloom radius must be between 0.25 and 4")
         denoise = bool(denoise and denoise_strength > 0)
         has_bloom = getattr(self, "_has_emitters", False) and bloom_strength > 0
-        if (str(getattr(self, "variant", "")).startswith("cuda") and not has_bloom
+        if (str(getattr(self, "variant", "")).startswith("cuda")
                 and not getattr(self, "_gpu_display_failed", False)):
             try:
-                return self._display_gpu(denoise, exposure_ev, denoise_strength, fast)
+                return self._display_gpu(denoise, exposure_ev, denoise_strength, fast,
+                                         bloom_strength if has_bloom else 0., bloom_radius, packed=packed)
             except Exception as exc:  # noqa: BLE001 - the CPU path is equivalent
                 self._gpu_display_failed = True
                 self._report(f"GPU tone mapping unavailable, using CPU: {exc}")
@@ -599,12 +709,15 @@ class ProgressiveRayTracer:
             pixels = pixels + self._bloom_buffer[1] * bloom_strength
         return linear_to_srgb(display_radiance(pixels))
 
-    def _display_gpu(self, denoise, exposure_ev, denoise_strength, fast):
+    def _display_gpu(self, denoise, exposure_ev, denoise_strength, fast, bloom_strength=0.,
+                     bloom_radius=1., *, packed=False):
         """Tone map on the GPU and read back only the finished 8-bit image.
 
         Same operations as the CPU path (denoise blend, exposure, coverage,
-        background, highlight shoulder, sRGB), which spent most of each
-        interactive frame in numpy and in reading float buffers back.
+        background, LED bloom, highlight shoulder, sRGB), which spent most of
+        each interactive frame in numpy and in reading float buffers back.
+        Pixels are packed to 0xFFRRGGBB on the GPU (4 bytes read back per
+        pixel); ``packed=False`` unpacks them to the usual H×W×3 RGB bytes.
         """
         import drjit as dr
         mi = self.mi
@@ -623,28 +736,73 @@ class ProgressiveRayTracer:
         count = width * height
         index = dr.arange(mi.UInt32, count)
         source = average.array
+        halo = (self._gpu_halo(average, index, channels, exposure_ev, bloom_radius)
+                if bloom_strength > 0 and channels >= 7 else None)
         r, g, b = (dr.gather(mi.Float, source, index * channels + c) for c in range(3))
         alpha = dr.clip(dr.gather(mi.Float, source, index * channels + 3), 0., 1.)
+        # Settings and sizes are opaque values, not literals baked into the
+        # kernel: a new exposure, strength or window size reuses the compiled
+        # tone-map kernel instead of compiling another one.
         if filtered is not None:
             denoised = filtered.array
             strength = float(denoise_strength)
-            r, g, b = (value * (1 - strength) + dr.gather(mi.Float, denoised, index * 3 + c) * strength
+            keep, mix = dr.opaque(mi.Float, 1 - strength), dr.opaque(mi.Float, strength)
+            r, g, b = (value * keep + dr.gather(mi.Float, denoised, index * 3 + c) * mix
                        for c, value in enumerate((r, g, b)))
-        scale = dr.select(alpha > 0, mi.Float(2. ** exposure_ev), mi.Float(0.))
-        row = mi.Float(index // width) / max(1, height - 1)
+        scale = dr.select(alpha > 0, dr.opaque(mi.Float, 2. ** exposure_ev), mi.Float(0.))
+        row = (mi.Float(index // dr.opaque(mi.UInt32, width))
+               / dr.opaque(mi.Float, max(1, height - 1)))
         top, bottom = _linear((.11, .17, .22)), _linear((.045, .075, .11))
-        r, g, b = (dr.maximum(value * scale + (float(top[c]) * (1 - row) + float(bottom[c]) * row) * (1 - alpha), 0.)
-                   for c, value in enumerate((r, g, b)))
+        lit = [value * scale + (float(top[c]) * (1 - row) + float(bottom[c]) * row) * (1 - alpha)
+               for c, value in enumerate((r, g, b))]
+        if halo is not None:
+            # As on the CPU path, the halo joins before negatives are clamped.
+            glow = dr.opaque(mi.Float, float(bloom_strength))
+            lit = [value + dr.gather(mi.Float, halo, index * 3 + c) * glow for c, value in enumerate(lit)]
+        r, g, b = (dr.maximum(value, 0.) for value in lit)
         peak = dr.maximum(dr.maximum(r, g), b)
         shoulder = .8 + .2 * (1 - dr.exp(-(peak - .8) / .2))
         factor = dr.select(peak > .8, shoulder / dr.maximum(peak, 1e-10), 1.)
-        out = dr.zeros(mi.Float, count * 3)
-        for c, value in enumerate((r, g, b)):
+        codes = []
+        for value in (r, g, b):
             value = dr.clip(value * factor, 0., 1.)
             encoded = dr.select(value <= .0031308, value * 12.92, 1.055 * dr.power(value, 1 / 2.4) - .055)
-            dr.scatter(out, encoded * 255 + .5, index * 3 + c)
-        pixels = np.asarray(out, dtype=np.float32).reshape(height, width, 3)
-        return np.ascontiguousarray(np.clip(pixels, 0, 255).astype(np.uint8))
+            # Clamped before the cast (out-of-range casts are undefined on
+            # CUDA); truncation matches numpy's astype(uint8).
+            codes.append(mi.UInt32(dr.clip(encoded * 255 + .5, 0., 255.)))
+        bgrx = codes[2] | (codes[1] << 8) | (codes[0] << 16) | mi.UInt32(0xFF000000)
+        pixels = np.ascontiguousarray(np.asarray(bgrx, dtype=np.uint32).reshape(height, width))
+        if packed:
+            return pixels
+        # Little-endian 0xFFRRGGBB is stored B, G, R, X.
+        return np.ascontiguousarray(pixels.view(np.uint8).reshape(height, width, 4)[:, :, 2::-1])
+
+    def _gpu_halo(self, average, index, channels, exposure_ev, bloom_radius):
+        """Flat H×W×3 LED halo on the device, or None when it is exactly zero.
+
+        led_bloom's bright pass is zero wherever exposed emission is at most
+        0.5; a device reduction detects a dim frame without any readback.
+        Otherwise only the emission channels are read back for the CPU halo.
+        """
+        import drjit as dr
+        mi = self.mi
+        bloom_key = (self.samples, exposure_ev, bloom_radius)
+        cached = getattr(self, "_gpu_bloom", None)
+        if cached is not None and cached[0] == bloom_key:
+            return cached[1]
+        source = average.array
+        emitted = [dr.gather(mi.Float, source, index * channels + 4 + c) for c in range(3)]
+        peak = float(np.max(np.asarray(dr.max(dr.maximum(dr.maximum(emitted[0], emitted[1]), emitted[2])))))
+        halo = None
+        # A margin below 0.5 keeps float32 rounding from ever skipping a halo.
+        if not np.isfinite(peak) or peak * float(np.float32(2. ** exposure_ev)) > .49:
+            from .bloom import led_bloom
+            emission = np.asarray(average[:, :, 4:7], dtype=np.float32)
+            image = led_bloom(emission, exposure_ev=exposure_ev, radius=bloom_radius)
+            if np.any(image):
+                halo = mi.Float(np.ascontiguousarray(image, dtype=np.float32).ravel())
+        self._gpu_bloom = (bloom_key, halo)
+        return halo
 
     def _denoised(self, rgb, denoise, fast):
         """OptiX-denoised RGB tensor, or None when denoising is off/unavailable."""
@@ -660,7 +818,7 @@ class ProgressiveRayTracer:
             except Exception as exc:  # noqa: BLE001 - show the raw frame instead
                 self._fast_denoiser = (None,)
                 self._report(f"Fast OptiX denoising unavailable: {exc}")
-        elif denoise and self._denoiser is not None:
+        elif denoise and self._guided_denoiser() is not None:
             try:
                 if self._guides is None:
                     from .raytrace_guides import generate_guides
@@ -674,6 +832,9 @@ class ProgressiveRayTracer:
             except Exception as exc:
                 self._check_cancel()
                 self._denoiser = None
+                slot = getattr(self, "_active_slot", None)
+                if slot is not None:
+                    slot["denoiser"] = None  # never reuse the failed denoiser
                 self._guides = None
                 self.denoiser_available = False
                 self._report(f"OptiX denoising disabled: {exc}")
@@ -702,7 +863,11 @@ class ProgressiveRayTracer:
             self._fast_denoiser = (None,)
             self._sensor_params = None
             self._sensor_kind = None
+            self._slots = {"full": None, "motion": None}
+            self._active_slot = None
+            self._frozen_render = None
             self._bloom_buffer = None
+            self._gpu_bloom = None
             self.sensor = None
             self.scene = None
             self._light_parameters = None

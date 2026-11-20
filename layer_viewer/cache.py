@@ -23,10 +23,12 @@ import tempfile
 import time
 import uuid
 
+import numpy as np
+
 from .geometry import SceneData, ScenePart
 from . import geometry
 from .via_surfaces import via_patch_color
-from .model import BoardSnapshot, Stackup, DielectricLayer
+from .model import BoardSnapshot, Stackup, DielectricLayer, Poly
 from .finishes import apply_surface_finish
 
 ENGINE_VERSION = "14-pofv-resist"
@@ -38,7 +40,23 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 log = logging.getLogger(__name__)
 
 
+def _poly_digest(poly):
+    """Exact binary fingerprint of a polygon's rings (prefixed so it never equals text).
+
+    Formatting every vertex as JSON decimal text dominated ``cache_key`` on large
+    boards. Little-endian doubles are as exact as repr floats and identical for
+    list or tuple points. Never memoize: polygons may be edited in place.
+    """
+    digest = hashlib.blake2b(digest_size=20)
+    for ring in (poly.outline, *poly.holes):
+        digest.update(len(ring).to_bytes(8, "little"))
+        digest.update(np.asarray(ring, dtype="<f8").tobytes())
+    return "P:" + digest.hexdigest()
+
+
 def _json_default(value):
+    if isinstance(value, Poly):
+        return _poly_digest(value)
     if is_dataclass(value):
         # Equivalent serialized fields to asdict without deep-copying every
         # coordinate. Dynamic attributes (e.g. the net index) stay out.
@@ -60,7 +78,9 @@ def _profile():
 def cache_key(snapshot):
     payload = json.dumps(snapshot, default=_json_default, sort_keys=True,
                          ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    return hashlib.sha256((repr(_profile()) + "\n" + payload).encode("utf-8")).hexdigest()
+    # The tag marks the polygon-digest key format; _profile() itself is persisted
+    # as geometry_profile, so changing it would also stop previous-mesh reuse.
+    return hashlib.sha256((repr(_profile()) + "|polydigest1\n" + payload).encode("utf-8")).hexdigest()
 
 
 def _board_identity(snapshot):
@@ -268,10 +288,16 @@ def _read_scene(directory, data, matching_signatures=None, previous_scene=None):
     return result
 
 
-def load_cached_scene(snapshot, requested_keys=None, *, previous_scene=None):
-    """Return a validated cached scene, or None for absent/stale/corrupt data."""
+def load_cached_scene(snapshot, requested_keys=None, *, previous_scene=None, key=None,
+                      signatures=None):
+    """Return a validated cached scene, or None for absent/stale/corrupt data.
+
+    ``key`` (``cache_key(snapshot)``) and ``signatures``
+    (``geometry._scene_signatures(snapshot)``) may be passed by a caller that
+    already computed them for this exact, unmodified snapshot.
+    """
     try:
-        key = cache_key(snapshot)
+        key = cache_key(snapshot) if key is None else key
         root = cache_root()
         directory = root / key
         if not directory.is_dir() or not _inside_root(directory, root):
@@ -283,15 +309,15 @@ def load_cached_scene(snapshot, requested_keys=None, *, previous_scene=None):
         # (e.g. adding exact solder-mask coverage to outer copper). Validate
         # the requested signatures even on exact hits; load_previous_scene can
         # still reuse every unaffected inner layer from the same cache entry.
-        signatures = _signatures(data)
-        current = geometry._scene_signatures(snapshot)
+        stored = _signatures(data)
+        current = geometry._scene_signatures(snapshot) if signatures is None else signatures
         requested = set(current) if requested_keys is None else set(requested_keys)
-        if any(key not in current or signatures.get(key) != current[key] for key in requested):
+        if any(key not in current or stored.get(key) != current[key] for key in requested):
             return None
         if requested_keys is None and not data.get("is_complete", True):
             return None
         return apply_surface_finish(_read_scene(directory, data,
-            {key: signatures[key] for key in requested}, previous_scene), snapshot)
+            {key: stored[key] for key in requested}, previous_scene), snapshot)
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, OverflowError):
         log.debug("Scene cache miss or invalid cache data", exc_info=True)
         return None
@@ -347,7 +373,7 @@ def load_stale_scene(snapshot):
         return None
 
 
-def load_previous_scene(snapshot, requested_keys=None, *, previous_scene=None):
+def load_previous_scene(snapshot, requested_keys=None, *, previous_scene=None, signatures=None):
     """Load unchanged parts from the newest compatible cache of this board.
 
     The returned scene is deliberately partial and must pass through
@@ -355,12 +381,14 @@ def load_previous_scene(snapshot, requested_keys=None, *, previous_scene=None):
     manifests without per-part signatures cannot safely identify reusable parts.
     Staged callers can defer buried payloads and retain already validated mesh
     objects from their surface preview instead of reading those files twice.
+    ``signatures`` may carry ``geometry._scene_signatures(snapshot)`` already
+    computed for this exact snapshot.
     """
     try:
         candidates = _board_entries(snapshot)
         if not candidates:
             return None
-        current = geometry._scene_signatures(snapshot)
+        current = geometry._scene_signatures(snapshot) if signatures is None else signatures
         requested = set(current) if requested_keys is None else set(requested_keys)
         for directory, data in candidates:
             matching = {key: value for key, value in _signatures(data).items()

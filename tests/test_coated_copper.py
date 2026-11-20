@@ -89,12 +89,12 @@ def test_small_scene_marks_outer_copper_and_caps_and_reuses_unchanged_inner_mesh
     # Small built-in fixture only; no external PCB, renderer or window.
     calls = []
     original = geometry.mask_geometry
-    def counted(board, front):
+    def counted(board, front, **kw):
         calls.append(front)
-        return original(board, front)
+        return original(board, front, **kw)
     monkeypatch.setattr(geometry, "mask_geometry", counted)
     scene = build_scene(snapshot)
-    assert calls == [True, False]
+    assert sorted(calls) == [False, True]  # both sides once; built in parallel
     copper = snapshot.stackup.copper
     for part in scene.parts:
         if part.kind not in ("copper", "via_patch"):
@@ -110,6 +110,53 @@ def test_small_scene_marks_outer_copper_and_caps_and_reuses_unchanged_inner_mesh
     for part in updated.parts:
         if part.layer_id in {layer.id for layer in copper[1:-1]}:
             assert part.mesh is old_parts[part.key].mesh
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_mask_profile_with_shared_prepared_outline_is_identical(explicit):
+    import layer_viewer.geometry as geometry
+
+    snapshot = demo_snapshot()
+    if explicit:
+        snapshot.mask_openings = {"F.Mask": [Poly([(1, 1), (4, 1), (4, 3), (1, 3)])],
+                                  "B.Mask": [Poly([(5, 5), (7, 5), (7, 8)])]}
+    outline = geometry.board_outline(snapshot)
+    shapely.prepare(outline)
+    for front in (True, False):
+        reference = geometry.mask_geometry(snapshot, front)
+        shared = geometry.mask_geometry(snapshot, front, outline=outline)
+        assert shapely.to_wkb(shared) == shapely.to_wkb(reference)
+
+
+def test_both_mask_profiles_share_one_outline_and_scene_is_unchanged(monkeypatch):
+    import threading
+    import layer_viewer.geometry as geometry
+
+    snapshot = demo_snapshot()
+    reference = build_scene(snapshot)
+    seen = []
+    original = geometry.mask_geometry
+    def recorded(board, front, **kw):
+        seen.append((front, kw.get("outline"), threading.current_thread().name))
+        return original(board, front, **kw)
+    monkeypatch.setattr(geometry, "mask_geometry", recorded)
+    scene = build_scene(snapshot)
+    assert sorted(front for front, _, _ in seen) == [False, True]
+    assert seen[0][1] is not None and seen[0][1] is seen[1][1]
+    assert all(name.startswith("pcb-mask") for _, _, name in seen)
+    assert [p.key for p in scene.parts] == [p.key for p in reference.parts]
+    for actual, expected in zip(scene.parts, reference.parts):
+        np.testing.assert_array_equal(actual.mesh.points, expected.mesh.points)
+        np.testing.assert_array_equal(actual.mesh.faces, expected.mesh.faces)
+    # A single dirty side is built inline, without a helper thread.
+    from copy import copy
+    seen.clear()
+    front_only = copy(scene)
+    front_only._geometry_signatures = {k: v for k, v in scene._geometry_signatures.items()
+                                       if k != "mask:F.Mask"}
+    front_only._mask_profiles = {"B.Mask": scene._mask_profiles["B.Mask"]}
+    build_scene(snapshot, previous_scene=front_only)
+    assert [(front, name) for front, _, name in seen] == [(True, threading.current_thread().name)]
 
 
 

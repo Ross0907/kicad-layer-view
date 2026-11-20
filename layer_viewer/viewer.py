@@ -181,6 +181,19 @@ def part_transform(part, copper_count, gap_mm, extend_connections):
     return 1.0, offset
 
 
+def _rounded(rgb):
+    return tuple(round(float(c), 6) for c in rgb)
+
+
+def _remember_coat(actor, key, mesh):
+    # The mesh object itself (not its id) guards against a reused id.
+    try:
+        actor._coat_key = key
+        actor._coat_mesh = mesh
+    except AttributeError:  # test doubles without attribute support
+        pass
+
+
 class BoardViewport(QWidget):
     picked = Signal(str)
     scene_changed = Signal()
@@ -339,11 +352,17 @@ class BoardViewport(QWidget):
                     apply_material(self.actors[part.key].GetProperty(), part.kind, part.color,
                                    roughness=getattr(part, "roughness", None))
                 continue
+            # No smooth_shading: its normals were computed on the GUI thread and
+            # then dropped when _apply_coated_copper set part.mesh back as input.
+            # static: part inputs are always plain SetInputData datasets, never
+            # filter outputs, so skip the per-frame pipeline update. A filter
+            # connected here later with SetInputConnection would stop updating.
             actor = self.plotter.add_mesh(
                 part.mesh, color=part.color,
-                opacity=part.opacity, smooth_shading=part.kind == "component", show_edges=False,
-                name=part.key, reset_camera=False, render=False,
+                opacity=part.opacity, smooth_shading=False, show_edges=False,
+                name=part.key, reset_camera=False, render=False, static=True,
             )
+            self._track_static_mapper(part.key, actor)
             prop = actor.GetProperty()
             apply_material(prop, part.kind, part.color, metallic=getattr(part, "metallic", None),
                            roughness=getattr(part, "roughness", None))
@@ -371,6 +390,33 @@ class BoardViewport(QWidget):
         if not preserve_view:
             self.orient("iso", animate=False)
         self.scene_changed.emit()
+
+    def _track_static_mapper(self, key, actor):
+        """Also mark the inner polydata mapper static once VTK creates it.
+
+        vtkDataSetMapper renders through an internal mapper that it builds on
+        the actor's first render and that does not inherit Static.
+        """
+        pending = getattr(self, "_static_pending", None)
+        if pending is None:
+            pending = self._static_pending = {}
+            renderer = getattr(self.plotter, "renderer", None)
+            if hasattr(renderer, "AddObserver"):
+                renderer.AddObserver("EndEvent", self._finish_static_mappers)
+        pending[key] = actor
+
+    def _finish_static_mappers(self, *_):
+        pending = self._static_pending
+        if not pending:
+            return
+        for key, actor in list(pending.items()):
+            if self.actors.get(key) is not actor:
+                del pending[key]  # removed before it was ever drawn
+                continue
+            inner = getattr(actor.GetMapper(), "GetPolyDataMapper", lambda: None)()
+            if inner is not None:
+                inner.SetStatic(1)
+                del pending[key]
 
     def set_gap(self, gap_mm, reframe=True):
         self.gap_mm = max(0.0, float(gap_mm))
@@ -457,9 +503,22 @@ class BoardViewport(QWidget):
             names = [name for name in ("coat:F.Mask", "coat:B.Mask") if name in mesh.cell_data]
             under = covered_copper_color(color)
         if part.kind not in ("copper", "mask") or not names or np.allclose(under, color, atol=1e-6):
+            _remember_coat(actor, None, None)
             mapper.ScalarVisibilityOff()
             if mapper.GetInput() is not None and mapper.GetInput() is not mesh:
                 mapper.SetInputData(mesh)
+            return
+        cap = (resist_cap_color(color, strong_caps)
+               if part.kind == "mask" and "coat:Cap" in mesh.cell_data else None)
+        # The colors depend only on these inputs. Skipping an unchanged
+        # recolor also keeps AddArray from forcing a full GPU re-upload of
+        # this actor on every visibility, preset or solo change.
+        key = (part.kind, _rounded(color), _rounded(under),
+               None if cap is None else _rounded(cap), tuple(names))
+        display = mapper.GetInput()
+        if (getattr(actor, "_coat_key", None) == key and getattr(actor, "_coat_mesh", None) is mesh
+                and display is not None and display is not mesh and mapper.GetScalarVisibility()
+                and display.GetCellData().GetArray("_layer_view_rgb") is not None):
             return
         covered = np.zeros(mesh.n_cells, dtype=bool)
         for name in names:
@@ -467,8 +526,7 @@ class BoardViewport(QWidget):
         rgb = np.empty((mesh.n_cells, 3), dtype=np.uint8)
         rgb[:] = np.round(np.asarray(color) * 255)
         rgb[covered] = np.round(np.asarray(under) * 255)
-        cap = resist_cap_color(color, strong_caps) if part.kind == "mask" else None
-        if cap is not None and "coat:Cap" in mesh.cell_data:
+        if cap is not None:
             capped = np.asarray(mesh.cell_data["coat:Cap"]).reshape(mesh.n_cells, -1)[:, 0] > .5
             rgb[capped] = np.round(np.asarray(cap) * 255)
         from vtkmodules.util.numpy_support import numpy_to_vtk
@@ -476,7 +534,6 @@ class BoardViewport(QWidget):
         array.SetName("_layer_view_rgb")
         # Display-only colors live on a per-actor shallow copy: part.mesh is
         # shared with cache writers and live workers on other threads.
-        display = mapper.GetInput()
         if display is None or display is mesh or display.GetCellData() is mesh.GetCellData():
             display = mesh.copy(deep=False)
             mapper.SetInputData(display)
@@ -485,6 +542,7 @@ class BoardViewport(QWidget):
         mapper.SelectColorArray("_layer_view_rgb")
         mapper.SetColorModeToDirectScalars()
         mapper.ScalarVisibilityOn()
+        _remember_coat(actor, key, mesh)
 
     def refresh(self):
         self.update_clip()

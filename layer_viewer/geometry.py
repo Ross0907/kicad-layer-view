@@ -196,11 +196,14 @@ def dielectric_geometry(snapshot, dielectric, *, outline=None):
     return outline.difference(disjoint_union(holes))
 
 
-def mask_geometry(snapshot, front):
+def mask_geometry(snapshot, front, outline=None):
+    """The resist profile of one side; ``outline`` reuses an already built board outline."""
+    if outline is None:
+        outline = board_outline(snapshot)
     explicit = getattr(snapshot, "mask_openings", None)
     if explicit is not None:
         openings = explicit.get("F.Mask" if front else "B.Mask", [])
-        return board_outline(snapshot).difference(polygon_union(polys_to_shapely(openings)))
+        return outline.difference(polygon_union(polys_to_shapely(openings)))
     copper = snapshot.stackup.copper[0 if front else -1]
     openings = []
     for pad in snapshot.pads:
@@ -214,7 +217,7 @@ def mask_geometry(snapshot, front):
         if copper.id in via.layers and not tented:
             openings.append(circle(via.position, max(via.drill_mm/2,
                                    via.diameters_mm.get(copper.id, via.diameter_mm)/2 + via.mask_margin_mm)))
-    return board_outline(snapshot).difference(polygon_union(openings))
+    return outline.difference(polygon_union(openings))
 
 
 def _join_meshes(meshes):
@@ -514,12 +517,14 @@ def scene_keys(snapshot, *, surface_only=False, via_details=True):
 
 
 def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
-                previous_snapshot=None, requested_keys=None) -> SceneData:
+                previous_snapshot=None, requested_keys=None, signatures=None) -> SceneData:
     """Rebuild changed physical parts; reuse immutable meshes for unchanged ones.
 
     A previous snapshot bootstraps signatures when its scene came from disk.
     In-memory scenes retain their own signatures, detecting in-place snapshot
     edits too. Reused meshes must remain immutable; animation moves actors only.
+    ``signatures`` may carry ``_scene_signatures(snapshot)`` (the object itself,
+    not a copy) already computed for this exact snapshot; it is never modified.
     """
     scene = SceneData(slot_count=max(1, 2*len(snapshot.stackup.copper)-1), warnings=list(snapshot.warnings))
     if not snapshot.outline:
@@ -541,7 +546,7 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
             elif hasattr(progress, "info"):
                 progress.info(message)
     report("Checking changed layer geometry")
-    all_signatures = _scene_signatures(snapshot)
+    all_signatures = _scene_signatures(snapshot) if signatures is None else signatures
     requested = set(all_signatures) if requested_keys is None else set(requested_keys)
     scene._geometry_signatures = {key: value for key, value in all_signatures.items() if key in requested}
     scene.is_complete = set(all_signatures) <= requested
@@ -632,21 +637,6 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
                      getattr(previous_scene, "_mask_profiles", {}).items()
                      if previous_shapes.get(name) is not None
                      and previous_shapes.get(name) == getattr(all_signatures, "mask_shapes", {}).get(name)}
-    outer_coatings = {}
-    for front in (True, False) if copper else ():
-        cu = copper[0 if front else -1]
-        name = "F.Mask" if front else "B.Mask"
-        if name not in mask_profiles and any(key in requested and key not in unchanged for key in
-               (f"copper:{cu.id}", f"via-patch:{cu.id}", f"mask:{name}",
-                f"silk:{'F.SilkS' if front else 'B.SilkS'}")):
-            mask_profiles[name] = mask_geometry(snapshot, front)
-        if name in mask_profiles:
-            # Prepare once before worker submission; uniform covered/open pad
-            # islands then need only indexed predicates, no polygon booleans.
-            shapely.prepare(mask_profiles[name])
-            outer_coatings.setdefault(cu.id, {})[name] = mask_profiles[name]
-    scene._mask_profiles = mask_profiles
-    scene._mask_shape_signatures = dict(getattr(all_signatures, "mask_shapes", {}))
     shared = {}
 
     def shared_outline():
@@ -654,6 +644,38 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
             shared["outline"] = board_outline(snapshot)
             shapely.prepare(shared["outline"])
         return shared["outline"]
+
+    needed_masks = [front for front in ((True, False) if copper else ())
+                    if ("F.Mask" if front else "B.Mask") not in mask_profiles
+                    and any(key in requested and key not in unchanged for key in
+                            (f"copper:{copper[0 if front else -1].id}",
+                             f"via-patch:{copper[0 if front else -1].id}",
+                             f"mask:{'F.Mask' if front else 'B.Mask'}",
+                             f"silk:{'F.SilkS' if front else 'B.SilkS'}"))]
+    if needed_masks:
+        # Build and prepare the outline once on this thread; both sides then
+        # only read it. GEOS releases the GIL, so the two profiles overlap.
+        outline = shared_outline()
+        if len(needed_masks) == 2:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pcb-mask") as mask_pool:
+                mask_jobs = {front: mask_pool.submit(mask_geometry, snapshot, front, outline=outline)
+                             for front in needed_masks}
+                for front in needed_masks:
+                    mask_profiles["F.Mask" if front else "B.Mask"] = mask_jobs[front].result()
+        else:
+            front = needed_masks[0]
+            mask_profiles["F.Mask" if front else "B.Mask"] = mask_geometry(snapshot, front, outline=outline)
+    outer_coatings = {}
+    for front in (True, False) if copper else ():
+        cu = copper[0 if front else -1]
+        name = "F.Mask" if front else "B.Mask"
+        if name in mask_profiles:
+            # Prepare once before worker submission; uniform covered/open pad
+            # islands then need only indexed predicates, no polygon booleans.
+            shapely.prepare(mask_profiles[name])
+            outer_coatings.setdefault(cu.id, {})[name] = mask_profiles[name]
+    scene._mask_profiles = mask_profiles
+    scene._mask_shape_signatures = dict(getattr(all_signatures, "mask_shapes", {}))
 
     def prepare_copper(cu):
         from .via_surfaces import split_cap_surfaces
@@ -770,6 +792,27 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
             if key in requested and key not in unchanged and snapshot.silkscreen.get(silk_name):
                 silk_futures[silk_name] = pool.submit(prepare_silk, front)
 
+    def prepare_paste(front):
+        """Union the stencil apertures, clip them to the board and mesh them off the main thread."""
+        paste_name = "F.Paste" if front else "B.Paste"
+        cu = copper[0 if front else -1]
+        geom = polygon_union(polys_to_shapely(snapshot.solder_paste.get(paste_name, []))).intersection(
+            shared["outline"])
+        paste_z = (cu.z_top_mm + CONTACT_INSET_MM if front else
+                   cu.z_bottom_mm - CONTACT_INSET_MM - PASTE_THICKNESS_MM)
+        mesh = None if geom.is_empty or PASTE_THICKNESS_MM <= 0 else slab(
+            geom, paste_z, PASTE_THICKNESS_MM, smooth=False)
+        return geom, mesh
+
+    paste_futures = {}
+    if copper and snapshot.solder_paste is not None:
+        for front in (True, False):
+            paste_name = "F.Paste" if front else "B.Paste"
+            key = f"paste:{paste_name}"
+            if key in requested and key not in unchanged and snapshot.solder_paste.get(paste_name):
+                shared_outline()  # owning thread: the lazy build + prepare must not race
+                paste_futures[paste_name] = pool.submit(prepare_paste, front)
+
     def copper_result(index):
         future = remote.pop(index, None)
         if future is None:
@@ -818,6 +861,7 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
                       cu.z_bottom_mm, cu.thickness_mm)
         dielectric_futures = {section: future.result() for section, future in dielectric_futures.items()}
         silk_futures = {name: future.result() for name, future in silk_futures.items()}
+        paste_futures = {name: future.result() for name, future in paste_futures.items()}
     finally:
         for future in remote.values():
             future.cancel()
@@ -906,14 +950,12 @@ def build_scene(snapshot: BoardSnapshot, progress=None, *, previous_scene=None,
             paste_name = "F.Paste" if front else "B.Paste"
             paste_editor = snapshot.editor_colors.get(paste_name, (.7, .7, .7))
             if snapshot.solder_paste is not None and not reuse(f"paste:{paste_name}", paste_name, paste_editor):
-                artwork = snapshot.solder_paste.get(paste_name, [])
-                if artwork:
+                if paste_name in paste_futures:  # meshed on the pool alongside copper
                     report(f"Meshing {paste_name}")
-                    geom = polygon_union(polys_to_shapely(artwork)).intersection(shared_outline())
-                    paste_z = (cu.z_top_mm + CONTACT_INSET_MM if front else
-                               cu.z_bottom_mm - CONTACT_INSET_MM - PASTE_THICKNESS_MM)
-                    add(f"paste:{paste_name}", paste_name, "paste", None, slot, geom,
-                        paste_z, PASTE_THICKNESS_MM, (.72, .73, .75), paste_editor)
+                    geom, mesh = paste_futures.pop(paste_name)
+                    if mesh is not None:
+                        scene.parts.append(ScenePart(f"paste:{paste_name}", paste_name, "paste", None, slot,
+                                                     mesh, (.72, .73, .75), paste_editor, geom.area))
     scene.reused_keys = frozenset(reused)
     report(f"Geometry ready: reused {len(reused)} of {len(scene.parts)} mesh parts")
     return apply_surface_finish(scene, snapshot)

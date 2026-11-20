@@ -1,4 +1,5 @@
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -365,3 +366,88 @@ def test_corrupt_model_cache_is_rebuilt(vrml, tmp_path):
     path = cache / f"{components._cache_key(vrml)}.npz"
     path.write_bytes(b"PK\x03\x04bad zip data")
     assert len(components.load_model(vrml, cache_dir=cache)) == 1
+
+
+def _parts_signature(parts):
+    return [(p.key, p.name, tuple(p.color), p.opacity, p.metallic, p.roughness, p.led, p.model_class,
+             p.stack_index, np.asarray(p.mesh.points).tobytes(), np.asarray(p.mesh.faces).tobytes())
+            for p in parts]
+
+
+def test_parallel_cached_model_prefetch_matches_serial_loading(tmp_path, monkeypatch):
+    import threading
+    cache = tmp_path / "model-cache"
+    monkeypatch.setenv("LAYER_VIEW_COMPONENT_CACHE_DIR", str(cache))
+    models = []
+    for i in range(7):
+        path = tmp_path / f"part{i}.wrl"
+        path.write_text(f'''#VRML V2.0 utf8
+Shape {{ appearance Appearance {{ material Material {{ diffuseColor 0.{i} 0.3 0.5 }} }}
+geometry IndexedFaceSet {{ coord Coordinate {{ point [0 0 0, {i + 1} 0 0, 0 1 {i}] }}
+coordIndex [0, 1, 2, -1] }} }}
+''')
+        models.append(Model3D(str(path)))
+    snapshot = demo_snapshot()
+    snapshot.footprints = [Footprint(str(i), f"U{i}", "IC", (i * 3, i), "top" if i % 2 else "bottom",
+                                     angle_deg=15 * i, models=[models[i % 7], models[(i * 3) % 7]])
+                           for i in range(12)]
+    snapshot.footprints.append(Footprint("m", "U99", "IC", (0, 0), "top", models=[Model3D("missing.wrl")]))
+    components._MEMORY.clear()
+    components.build_component_parts(snapshot, 7)  # fill the disk cache
+    corrupt = cache / f"{components._cache_key(Path(models[2].filename).resolve())}.npz"
+    assert corrupt.is_file()
+
+    parses = []
+    read_vrml = components._read_vrml
+    def counted(path, *args, **kwargs):
+        parses.append(Path(path).name)
+        return read_vrml(path, *args, **kwargs)
+    monkeypatch.setattr(components, "_read_vrml", counted)
+
+    def run(prefetch):
+        components._MEMORY.clear()
+        corrupt.write_bytes(b"PK\x03\x04bad zip data")
+        parses.clear()
+        monkeypatch.setattr(components, "PREFETCH_MIN_MODELS", 4 if prefetch else 10 ** 6)
+        parts, warnings = components.build_component_parts(snapshot, 7)
+        return _parts_signature(parts), warnings, list(parses), list(components._MEMORY)
+
+    serial = run(False)
+    readers = []
+    read_cache = components._read_cache
+    def tracked(path, **kwargs):
+        readers.append(threading.current_thread().name)
+        return read_cache(path, **kwargs)
+    monkeypatch.setattr(components, "_read_cache", tracked)
+    parallel = run(True)
+    assert parallel == serial  # parts, warnings, reparsed files and LRU order
+    assert serial[2] == ["part2.wrl"]  # only the corrupt cache entry is parsed again
+    assert serial[1] == ["3D model missing: missing.wrl"]
+    assert any(name.startswith("model-read") for name in readers)
+
+
+def test_prefetch_reads_only_existing_cache_entries_and_honours_cancel(tmp_path, monkeypatch):
+    monkeypatch.setenv("LAYER_VIEW_COMPONENT_CACHE_DIR", str(tmp_path / "empty"))
+    components._MEMORY.clear()
+    paths = [tmp_path / f"m{i}.wrl" for i in range(5)]
+    for path in paths:
+        path.write_text("#VRML V2.0 utf8\n")
+    monkeypatch.setattr(components, "_read_cache", lambda *a, **k: pytest.fail("no cache entry to read"))
+    assert components._prefetch_cached_models(paths) == 0
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("LAYER_VIEW_COMPONENT_CACHE_DIR", str(cache))
+    for path in paths:
+        (cache / f"{components._cache_key(path.resolve())}.npz").write_bytes(b"x")
+    import threading
+    gate = threading.Event()
+    monkeypatch.setattr(components, "_read_cache", lambda *a, **k: (gate.wait(5), None)[1])
+
+    class Cancelled:
+        def check_cancel(self):
+            raise InterruptedError()
+
+    with pytest.raises(InterruptedError):
+        components._prefetch_cached_models(paths, Cancelled())
+    gate.set()
+    assert not components._MEMORY
