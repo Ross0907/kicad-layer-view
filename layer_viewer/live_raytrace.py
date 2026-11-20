@@ -114,7 +114,11 @@ class LiveRayWorker(QThread):
                         pending = None
                     elif tracer is not None:
                         if camera != active_camera or size != active_size:
-                            tracer.update_camera(camera, *size)
+                            if motion and getattr(tracer, "supports_motion_camera", False):
+                                # Keeps the refinement sensor and guided denoiser.
+                                tracer.update_camera(camera, *size, motion=True)
+                            else:
+                                tracer.update_camera(camera, *size)
                             active_camera, active_size = camera, size
                             last_display = 0.
                         else:
@@ -147,6 +151,9 @@ class LiveRayWorker(QThread):
                 settings = dict(denoise=denoise, exposure_ev=exposure_ev,
                                 denoise_strength=denoise_strength,
                                 bloom_strength=bloom_strength, bloom_radius=bloom_radius)
+                if getattr(tracer, "supports_packed_display", False):
+                    # 0xFFRRGGBB pixels: Qt's native RGB32, no conversion.
+                    settings["packed"] = True
                 if motion:
                     # One sample needs the denoiser most; skip its guide pass.
                     settings.update(denoise_strength=max(denoise_strength, .85) if denoise else 0.,
@@ -200,6 +207,8 @@ class LiveRayController(QObject):
         self._scene_dirty = True
         self._camera_signature = None
         self.last_image = None
+        # OpenGL settings saved while the opaque overlay hides the GL frame.
+        self._gl_saved = None
         self.overlay = QLabel(viewport.plotter.interactor)
         self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.overlay.setAlignment(Qt.AlignCenter)
@@ -230,11 +239,54 @@ class LiveRayController(QObject):
         else:
             self.timer.stop()
             self.motion_timer.stop()
-            self.overlay.hide()
+            self._hide_overlay()
             self.last_image = None
             if self.worker is not None:
                 self.worker.stop()
             self.status.emit("OpenGL · full native resolution")
+
+    def _hide_overlay(self):
+        """Every path that uncovers the OpenGL view comes through here."""
+        self.overlay.hide()
+        self._suppress_opengl(False)
+
+    def _suppress_opengl(self, suppress):
+        """Skip unlimited depth peeling and FXAA while the overlay covers the view.
+
+        Camera moves still redraw the OpenGL frame under the ray-traced image;
+        only the axis corner of it is visible, so its expensive passes are
+        wasted and compete with the path tracer for the GPU. They are restored
+        (and a frame requested) whenever the overlay hides.
+        """
+        renderer = getattr(getattr(self.viewport, "plotter", None), "renderer", None)
+        if renderer is None or not hasattr(renderer, "SetUseDepthPeeling"):
+            return  # test doubles have no VTK renderer
+        if suppress:
+            if self._gl_saved is not None:
+                return
+            try:
+                saved = (bool(renderer.GetUseDepthPeeling()), bool(renderer.GetUseFXAA()),
+                         getattr(self.viewport, "_applied_antialiasing", None))
+                renderer.SetUseDepthPeeling(False)
+                renderer.SetUseFXAA(False)
+            except Exception:  # noqa: BLE001 - an optimization only
+                log.debug("Could not reduce hidden OpenGL passes", exc_info=True)
+                return
+            self._gl_saved = saved
+            return
+        if self._gl_saved is None:
+            return
+        (peeling, fxaa, antialiasing), self._gl_saved = self._gl_saved, None
+        try:
+            renderer.SetUseDepthPeeling(peeling)
+            # An antialiasing change meanwhile has already set FXAA itself.
+            if getattr(self.viewport, "_applied_antialiasing", None) == antialiasing:
+                renderer.SetUseFXAA(fxaa)
+        except Exception:  # noqa: BLE001 - an optimization only
+            log.debug("Could not restore OpenGL passes", exc_info=True)
+        request_render = getattr(self.viewport, "request_render", None)
+        if callable(request_render):
+            request_render()
 
     def set_quality(self, samples=None, denoise=None, exposure_ev=None, denoise_strength=None,
                     bloom_enabled=None, bloom_strength=None, bloom_radius=None):
@@ -287,7 +339,7 @@ class LiveRayController(QObject):
         self._revision += 1
         self._valid_from = self._revision
         if clear_image:
-            self.overlay.hide()
+            self._hide_overlay()
             self.last_image = None
         if self.worker is not None:
             self.worker.pause()
@@ -338,9 +390,12 @@ class LiveRayController(QObject):
             return
         if revision != self._revision and not info.get("motion"):
             return
-        height, width, _ = pixels.shape
+        height, width = pixels.shape[:2]
+        # Packed H×W uint32 0xFFRRGGBB (GPU path) is Qt's native RGB32; the
+        # CPU fallback delivers H×W×3 RGB bytes.
+        image_format = QImage.Format_RGB32 if pixels.ndim == 2 else QImage.Format_RGB888
         # Copy before the worker's next frame releases its numpy buffer.
-        picture = QImage(pixels.data, width, height, pixels.strides[0], QImage.Format_RGB888).copy()
+        picture = QImage(pixels.data, width, height, pixels.strides[0], image_format).copy()
         self.last_image = picture
         rect = self.viewport.plotter.interactor.rect()
         self.overlay.setGeometry(rect)
@@ -358,12 +413,13 @@ class LiveRayController(QObject):
             max(0, rect.width()-axis_size), 0, axis_size, axis_size))))
         self.overlay.show()
         self.overlay.raise_()
+        self._suppress_opengl(True)
         quality = (f" · denoise {info.get('denoise_strength', 1.):.0%}"
                    if info["denoised"] else "")
         if info.get("motion"):
             # Trade resolution for frame rate: pixel count scales with scale².
-            # Fixed steps with hysteresis: every size change rebuilds the
-            # sensor and denoisers, so the size must not drift frame to frame.
+            # Fixed steps with hysteresis: every new motion size rebuilds the
+            # motion sensor and fast denoiser, so it must not drift per frame.
             seconds = float(info.get("seconds", MOTION_FRAME_S))
             if seconds > 0:
                 wanted = self.motion_scale * (MOTION_FRAME_S / seconds) ** .5
@@ -397,7 +453,7 @@ class LiveRayController(QObject):
         self.enabled = False
         self.timer.stop()
         self.motion_timer.stop()
-        self.overlay.hide()
+        self._hide_overlay()
         if self.worker is not None and self.worker.isRunning():
             self.worker.stop()
             return False

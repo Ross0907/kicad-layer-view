@@ -247,3 +247,172 @@ def test_moving_keeps_the_ray_traced_image_and_traces_at_reduced_resolution():
         controller.shutdown()
         viewport.deleteLater()
         app.processEvents()
+
+
+class _Renderer:
+    def __init__(self):
+        self.peeling, self.fxaa = True, True
+
+    def GetUseDepthPeeling(self):
+        return self.peeling
+
+    def SetUseDepthPeeling(self, value):
+        self.peeling = bool(value)
+
+    def GetUseFXAA(self):
+        return self.fxaa
+
+    def SetUseFXAA(self, value):
+        self.fxaa = bool(value)
+
+
+def _controller(renderer=None):
+    from qtpy.QtCore import Signal
+    from qtpy.QtWidgets import QWidget
+    from layer_viewer.live_raytrace import LiveRayController
+
+    class Viewport(QWidget):
+        scene_changed = Signal()
+        camera_changed = Signal()
+
+        def request_render(self):
+            self.renders += 1
+
+    viewport = Viewport()
+    viewport.renders = 0
+    viewport._applied_antialiasing = "fxaa_hq"
+    host = QWidget(viewport)
+    host.resize(200, 100)
+    viewport.plotter = SimpleNamespace(interactor=host, window_size=(200, 100), camera=None,
+                                       renderer=renderer)
+    viewport.actors = {"x": 1}
+    controller = LiveRayController(viewport)
+    controller.worker = SimpleNamespace(isInterruptionRequested=lambda: False, pause=lambda: None,
+                                        isRunning=lambda: False, stop=lambda: None,
+                                        submit=lambda *args, **kw: None)
+    controller.enabled = True
+    return controller, viewport
+
+
+_REFINED = {"motion": False, "samples": 4, "target": 64, "backend": "test", "seconds": .01, "denoised": True}
+
+
+def test_hidden_opengl_passes_are_skipped_only_while_the_overlay_covers_the_view():
+    app = QApplication.instance() or QApplication([])
+    renderer = _Renderer()
+    controller, viewport = _controller(renderer)
+    try:
+        frame = np.zeros((100, 200, 3), np.uint8)
+        controller._frame(controller._revision, frame, _REFINED)
+        assert not controller.overlay.isHidden()
+        assert (renderer.peeling, renderer.fxaa) == (False, False)
+        # A camera move keeps the overlay (and the cheap OpenGL frames).
+        controller._moved()
+        assert (renderer.peeling, renderer.fxaa) == (False, False) and viewport.renders == 0
+        # Every overlay-hide path restores the passes and redraws once.
+        controller._invalidate()
+        assert controller.overlay.isHidden()
+        assert (renderer.peeling, renderer.fxaa) == (True, True) and viewport.renders == 1
+        controller._invalidate()
+        assert viewport.renders == 1  # nothing to restore twice
+
+        controller._frame(controller._revision, frame, _REFINED)
+        assert not renderer.peeling
+        controller.set_enabled(False)
+        assert (renderer.peeling, renderer.fxaa) == (True, True) and viewport.renders == 2
+
+        # The previous settings are restored, not forced on.
+        controller.enabled = True
+        renderer.fxaa = False
+        controller._frame(controller._revision, frame, _REFINED)
+        controller.shutdown()
+        assert (renderer.peeling, renderer.fxaa) == (True, False) and viewport.renders == 3
+
+        # An antialiasing change while covered keeps the viewer's new choice.
+        controller.enabled = True
+        renderer.fxaa = True
+        controller._frame(controller._revision, frame, _REFINED)
+        viewport._applied_antialiasing = "none"
+        controller._invalidate()
+        assert renderer.peeling and not renderer.fxaa
+    finally:
+        controller.shutdown()
+        viewport.deleteLater()
+        app.processEvents()
+
+
+def test_packed_gpu_frames_display_as_native_rgb32():
+    from qtpy.QtGui import QImage
+    app = QApplication.instance() or QApplication([])
+    controller, viewport = _controller()
+    try:
+        pixels = np.full((100, 200), 0xFF102030, dtype=np.uint32)
+        controller._frame(controller._revision, pixels, _REFINED)
+        image = controller.last_image
+        assert image.format() == QImage.Format_RGB32 and image.width() == 200
+        color = image.pixelColor(5, 5)
+        assert (color.red(), color.green(), color.blue()) == (0x10, 0x20, 0x30)
+        rgb = np.zeros((100, 200, 3), np.uint8)
+        rgb[...] = (0x10, 0x20, 0x30)
+        controller._frame(controller._revision, rgb, _REFINED)
+        color = controller.last_image.pixelColor(5, 5)
+        assert (color.red(), color.green(), color.blue()) == (0x10, 0x20, 0x30)
+    finally:
+        controller.shutdown()
+        viewport.deleteLater()
+        app.processEvents()
+
+
+def test_worker_passes_motion_and_packed_only_to_backends_that_support_them():
+    app = QApplication.instance() or QApplication([])
+    frames, cameras, displays = [], [], []
+
+    class Backend:
+        supports_motion_camera = supports_packed_display = True
+
+        def __init__(self, capture, width, height, progress):
+            self.size, self.samples = (width, height), 0
+            self.backend, self.last_batch_seconds, self.denoiser_available = "test", .01, True
+
+        def update_camera(self, camera, width, height, *, motion=False):
+            cameras.append((camera, width, height, motion))
+            self.size, self.samples = (width, height), 0
+
+        def render_batch(self, samples, denoise, exposure_ev=0.0, denoise_strength=.35,
+                         bloom_strength=.18, bloom_radius=1., display=True):
+            self.samples += samples
+
+        def display_image(self, packed=False, **settings):
+            displays.append(packed)
+            return np.zeros((self.size[1], self.size[0]), dtype=np.uint32)
+
+        def close(self):
+            pass
+
+    worker = LiveRayWorker(backend_factory=Backend)
+    worker.frame.connect(lambda revision, pixels, info: frames.append((revision, pixels.shape, info)))
+    worker.submit(1, SimpleNamespace(camera="start"), "start", (40, 30), 1, True)
+    worker.start()
+
+    def wait_for(revision):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            app.processEvents()
+            if frames and frames[-1][0] == revision:
+                return
+            time.sleep(.005)
+        raise AssertionError(f"No frame for revision {revision}")
+
+    try:
+        wait_for(1)
+        worker.submit(2, None, "drag", (20, 15), 1, True, motion=True)
+        wait_for(2)
+        worker.submit(3, None, "rest", (40, 30), 1, True)
+        wait_for(3)
+        assert cameras == [("drag", 20, 15, True), ("rest", 40, 30, False)]
+        assert displays and all(displays)
+        assert frames[-1][1] == (30, 40)
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()
