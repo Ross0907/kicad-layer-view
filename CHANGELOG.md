@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Solder paste is shown by default.
+- Live ray tracing is smoother on large boards (10-layer board: 3–13 fps
+  while orbiting → 24–26 fps, first moving frame 0.7 s → 0.1 s): sensors and
+  denoisers are kept per frame size, the one-sample render replays recorded
+  GPU kernels, the display is packed to 8-bit on the GPU, LED bloom stays on
+  the GPU, and the hidden OpenGL view behind the ray-traced image skips depth
+  peeling and FXAA. Captures read triangles without copying them twice.
+- Viewport: showing a board is about twice as fast (set_scene 1.1 s → 0.6 s),
+  and layer, preset, solo and opacity changes no longer re-upload unchanged
+  copper and resist colors (12 layers: 60–100 ms → under 20 ms). Part mappers
+  are static, and component normals that were discarded are no longer built.
+- Loading: polygon cache keys are binary digests, scene signatures are
+  computed once per load, the board is meshed while the last view waits for
+  cached models, paste and both resist profiles mesh in parallel, cached 3D
+  models are read in parallel, and live zone and pad polygons are decoded
+  straight from KiCad's messages (warm 10-layer load 1.0 s → 0.8 s).
+
 ## 0.7.5
 
 - Ray tracing: the surface finish stays only in the resist openings when the
