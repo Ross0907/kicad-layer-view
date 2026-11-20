@@ -399,6 +399,7 @@ def _prefetch_cached_models(paths, progress=None):
             key = _cache_key(path)
             with _LOCK:
                 if key in _MEMORY:
+                    _MEMORY.move_to_end(key)  # keep this board's models ahead of the batch
                     continue
             cache_path = root / f"{key}.npz"
             if cache_path.is_file():

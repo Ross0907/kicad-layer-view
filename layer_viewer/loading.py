@@ -214,4 +214,6 @@ def load_complete_scene(snapshot, *, via_details=False, components=True, progres
             stop.set()
         pool.shutdown(wait=finished, cancel_futures=True)
         if build_pool is not None:
-            build_pool.shutdown(wait=finished, cancel_futures=True)
+            # Also on cancel or error: the build stops at its next cancel point
+            # (stop is set), and no abandoned build overlaps the next load.
+            build_pool.shutdown(wait=True, cancel_futures=True)
