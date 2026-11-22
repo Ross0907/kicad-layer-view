@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 - Realistic style follows photographed boards: matte black resist reads deep
   black in the ray tracer (it was a washed-out grey) and the viewport, ENIG
