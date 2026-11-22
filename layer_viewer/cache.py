@@ -62,7 +62,7 @@ def _json_default(value):
         # coordinate. Dynamic attributes (e.g. the net index) stay out.
         return {field.name: getattr(value, field.name) for field in fields(value)
                 if not ((isinstance(value, Stackup) and field.name == "colors") or
-                        (isinstance(value, DielectricLayer) and field.name == "color") or
+                        (isinstance(value, DielectricLayer) and field.name in ("color", "layer_type")) or
                         (isinstance(value, BoardSnapshot) and
                         (field.name == "surface_finish" or
                          (field.name in ("silkscreen", "solder_paste") and getattr(value, field.name) is None))))}
