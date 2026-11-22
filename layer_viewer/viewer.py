@@ -44,6 +44,8 @@ SLAB_KINDS = ("copper", "dielectric", "mask", "silk", "paste", "via_patch")
 ANTIALIASING_MODES = ("fxaa_hq", "fxaa", "ssaa", "none")
 # Largest scene that may be supersampled; beyond this, FXAA is used instead.
 SSAA_MAX_TRIANGLES = 3_000_000
+# Render interval (ms) while the live ray-traced image covers the board.
+COVERED_RENDER_MS = 33
 BACKGROUNDS = {
     # KiCad 3D viewer default gradient (board_adapter.cpp g_DefaultBackground*).
     "kicad": ((.40, .40, .50), (.80, .80, .90)),
@@ -551,7 +553,11 @@ class BoardViewport(QWidget):
         if refiner is not None:
             refiner.invalidate()
         if not self.render_timer.isActive():
-            self.render_timer.start()
+            live_ray = getattr(self, "live_ray", None)
+            # Under the ray-traced overlay only the axis widget's corner is
+            # drawn: about 30 renders a second keep it following the camera
+            # without competing with the path tracer for the GPU.
+            self.render_timer.start(COVERED_RENDER_MS if getattr(live_ray, "covering", False) else 0)
 
     def orient(self, orientation, animate=True):
         directions = {

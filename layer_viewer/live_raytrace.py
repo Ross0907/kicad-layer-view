@@ -297,6 +297,11 @@ class LiveRayController(QObject):
                 self.worker.stop()
             self.status.emit("OpenGL · full native resolution")
 
+    @property
+    def covering(self):
+        """True while the ray-traced overlay hides the OpenGL board drawing."""
+        return self._gl_saved is not None
+
     def _hide_overlay(self):
         """Every path that uncovers the OpenGL view comes through here."""
         self.overlay.hide()
@@ -339,6 +344,10 @@ class LiveRayController(QObject):
                 renderer.SetUseFXAA(fxaa)
         except Exception:  # noqa: BLE001 - an optimization only
             log.debug("Could not restore OpenGL passes", exc_info=True)
+        # Draw the board at once, not after the slower covered render interval.
+        timer = getattr(self.viewport, "render_timer", None)
+        if timer is not None:
+            timer.stop()
         request_render = getattr(self.viewport, "request_render", None)
         if callable(request_render):
             request_render()

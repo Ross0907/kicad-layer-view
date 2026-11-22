@@ -549,3 +549,30 @@ def test_presets_keep_capped_via_contrast_off_and_lights_follow_the_camera(windo
     lights = list(window.viewport.plotter.renderer.GetLights())
     kinds = sorted(light.GetLightType() for light in lights)
     assert len(lights) == 3 and kinds.count(2) == 2  # 1 headlight + 2 camera lights (VTK_LIGHT_TYPE_CAMERA_LIGHT)
+
+
+def test_live_ray_overlay_stops_board_drawing_and_restores_it_at_once(window):
+    import numpy as np
+    from layer_viewer.viewer import COVERED_RENDER_MS
+    viewport = window.viewport
+    live = viewport.live_ray
+    renderer = viewport.plotter.renderer
+    corner = viewport.axis_widget.GetDefaultRenderer()
+    width, height = viewport.plotter.window_size
+    live.enabled = True
+    try:
+        live._frame(live._revision, np.zeros((height, width), np.uint32),
+                    {"motion": False, "samples": 1, "target": 64, "backend": "test",
+                     "seconds": .01, "denoised": False})
+        assert live.covering and not renderer.GetDraw() and corner.GetDraw()
+        # Camera moves still render the axis widget, at a capped rate.
+        viewport.render_timer.stop()
+        viewport.request_render()
+        assert viewport.render_timer.interval() == COVERED_RENDER_MS
+        viewport.plotter.camera.Azimuth(10)
+        viewport.plotter.render()
+    finally:
+        live.set_enabled(False)
+    # Turning ray tracing off draws the board again on the next event-loop pass.
+    assert not live.covering and renderer.GetDraw()
+    assert viewport.render_timer.isActive() and viewport.render_timer.interval() == 0
