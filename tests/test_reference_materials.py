@@ -36,7 +36,11 @@ def test_viewport_realistic_resist_sheen_is_neutral_and_follows_roughness():
     apply_material(matte, "mask", black, roughness=.6)
     apply_material(glossy, "mask", black, roughness=.2)
     r, g, b = matte.GetSpecularColor()
-    assert r == g == b and r > .02  # black resist has a visible grey sheen
+    assert r == g == b and r > .01  # black resist keeps a faint neutral sheen
+    # ... fainter than a plain resist's, so it reads deep black from above.
+    real_green = vtkProperty()
+    apply_material(real_green, "mask", material_appearance("mask", "Green")[:3], roughness=.6)
+    assert r < .5 * real_green.GetSpecularColor()[0]
     assert matte.GetSpecularPower() < glossy.GetSpecularPower() <= 64
     assert glossy.GetSpecularColor()[0] > r
     # KiCad style (no roughness) keeps KiCad's own terms exactly.
@@ -64,6 +68,21 @@ def test_ray_traced_enig_uses_gold_reflectance():
     f0 = _linear(ray_metal_color(REAL_ENIG_COLOR))
     np.testing.assert_allclose(f0, finishes.ENIG_F0, atol=1e-4)
     assert f0[0] > f0[1] > f0[2] and f0[2] / f0[0] < .5  # clearly yellow gold
+
+
+def test_ray_traced_matte_black_resist_keeps_only_a_faint_sheen():
+    black = material_appearance("mask", "Black")
+    matte = _material(_mesh("mask", black[:3], opacity=1., roughness=.6), coated=True, capped=True)["bsdf"]
+    lobes = [matte["bsdf_0"]["bsdf_0"], matte["bsdf_0"]["bsdf_1"], matte["bsdf_1"]]
+    # Every lobe (bare, over copper, over a capped via) has the faint sheen.
+    assert all("eta" not in lobe and lobe["specular"] == pytest.approx(.06) for lobe in lobes)
+    assert lobes[0]["roughness"] == pytest.approx(.6)
+    # Other resists, and KiCad-style black (no roughness), keep IOR 1.48.
+    green = _material(_mesh("mask", material_appearance("mask", "Green")[:3], roughness=.45))["bsdf"]
+    assert green["eta"] == pytest.approx(1.48) and "specular" not in green
+    kicad = _material(_mesh("mask", black[:3]))["bsdf"]
+    assert kicad["eta"] == pytest.approx(1.48) and "specular" not in kicad
+    assert finishes.resist_specular(material_appearance("mask", "Green")) is None
 
 
 def test_ray_traced_paste_is_rough_and_barely_metallic_when_realistic():

@@ -113,10 +113,20 @@ FOIL_SHEEN = .6
 LAMINATE_GLOSS = .35
 
 
-def resist_sheen(roughness):
-    """Neutral specular weight of a realistic resist: glossier is stronger."""
+def resist_sheen(roughness, rgb=None):
+    """Neutral specular weight of a realistic resist: glossier is stronger.
+
+    A resist with a reduced ray-traced specular (matte black) gets a fainter
+    sheen too, so the headlight does not wash it out to grey from above.
+    """
     roughness = min(1., max(0., float(roughness)))
-    return .015 + .06 * (1. - roughness)
+    sheen = .015 + .06 * (1. - roughness)
+    if rgb is not None:
+        from .finishes import resist_specular
+        specular = resist_specular(rgb)
+        if specular is not None:
+            sheen *= (specular / .5) ** .5
+    return sheen
 
 
 def resist_sheen_power(roughness):
@@ -180,7 +190,7 @@ def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None
     if kind == "mask" and roughness is not None:
         # Realistic resist (only it carries a roughness): a neutral dielectric
         # sheen whose spread follows the resist's roughness, so matte black
-        # shows a soft grey sheen and glossy resists a tighter highlight.
+        # shows a soft, faint sheen and glossy resists a tighter highlight.
         # KiCad's own rgb^2 specular at power 128 left black resist without
         # any highlight at all.
         ambient, _, _ = kicad_material(kind, rgb)
@@ -189,7 +199,7 @@ def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None
         prop.SetDiffuse(1.)
         prop.SetDiffuseColor(*color)
         prop.SetSpecular(1.)
-        prop.SetSpecularColor(*(resist_sheen(roughness),) * 3)
+        prop.SetSpecularColor(*(resist_sheen(roughness, rgb),) * 3)
         prop.SetSpecularPower(resist_sheen_power(roughness))
         return
     if (kind in ("copper", "barrel", "via_patch") and is_realistic_metal(rgb)) or (

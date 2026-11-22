@@ -146,9 +146,13 @@ def _material(mesh, *, coated=False, capped=False):
         # it from the underlying conductor without an oily clearcoat lobe.
         # Matte resists (black, white) carry a higher roughness.
         roughness = getattr(mesh, "roughness", None) or .36
+        from .finishes import resist_light_color, resist_specular
+        # A realistic matte black resist (it carries a roughness) keeps only a
+        # faint satin sheen; every other resist is a plain IOR 1.48 coating.
+        specular = resist_specular(mesh.color) if getattr(mesh, "roughness", None) is not None else None
+        coating = {"eta": 1.48} if specular is None else {"specular": specular}
         opaque = {"type": "principled", "base_color": rgb, "metallic": 0.,
-                  "roughness": roughness, "eta": 1.48}
-        from .finishes import resist_light_color
+                  "roughness": roughness, **coating}
         light = resist_light_color(mesh.color)
         if coated and light is not None:
             # pcb2blender: lighter and a little glossier over copper (resist
@@ -156,7 +160,7 @@ def _material(mesh, *, coated=False, capped=False):
             opaque = {"type": "blendbsdf",
                       "weight": {"type": "mesh_attribute", "name": "face_resist_coverage"},
                       "bsdf_0": opaque,
-                      "bsdf_1": {"type": "principled", "metallic": 0., "eta": 1.48,
+                      "bsdf_1": {"type": "principled", "metallic": 0., **coating,
                                  "base_color": {"type": "rgb", "value": _linear(light).tolist()},
                                  "roughness": roughness * .8}}
             from .finishes import resist_cap_color
@@ -165,7 +169,7 @@ def _material(mesh, *, coated=False, capped=False):
                 opaque = {"type": "blendbsdf",
                           "weight": {"type": "mesh_attribute", "name": "face_resist_cap"},
                           "bsdf_0": opaque,
-                          "bsdf_1": {"type": "principled", "metallic": 0., "eta": 1.48,
+                          "bsdf_1": {"type": "principled", "metallic": 0., **coating,
                                      "base_color": {"type": "rgb",
                                                     "value": _linear(resist_cap_color(mesh.color)).tolist()},
                                      "roughness": roughness * .7}}

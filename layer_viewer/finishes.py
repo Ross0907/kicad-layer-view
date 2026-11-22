@@ -56,7 +56,7 @@ REAL_ENIG_COLOR = _rgb(0xd4, 0xb0, 0x78)
 COPPER_F0 = (.955, .637, .538)
 # Immersion gold F0, tuned so ray-traced pads match photographs of ENIG
 # boards: a clear yellow gold between the photos' median and highlight hues.
-ENIG_F0 = (.90, .62, .26)
+ENIG_F0 = (.90, .56, .20)
 
 # Measured conductor reflectance for physically based ray tracing. KiCad's
 # swatches are display colors; the path tracer uses real metal F0 instead.
@@ -134,7 +134,7 @@ _P2B_MASK = {"GREEN": ((0x43, 0xa1, 0x42), (0x22, 0x52, 0x1f)),
              "PURPLE": ((0x74, 0x48, 0xaa), (0x3b, 0x23, 0x59)),
              "WHITE": ((0xd3, 0xcf, 0xc9), (0xe1, 0xdd, 0xdc)),
              # Matte black LPI resist is a warm near-black, never pure black.
-             "BLACK": ((0x2c, 0x2b, 0x29), (0x20, 0x20, 0x1f))}
+             "BLACK": ((0x2c, 0x2b, 0x29), (0x1d, 0x1c, 0x1a))}
 _MASK_FAMILY = {NOT_SPECIFIED: "GREEN", "Green": "GREEN", "Light Green": "GREEN",
                 "Saturated Green": "GREEN", "Red": "RED", "Light Red": "RED", "Red/Orange": "RED",
                 "Blue": "BLUE", "Light Blue 1": "BLUE", "Light Blue 2": "BLUE", "Green/Blue": "BLUE",
@@ -155,6 +155,11 @@ _RESIST_LIGHT = {tuple(round(v / 255, 6) for v in dark):
 # pcb2blender MASK_ROUGHNESS_MAP (default 0.45); the ray tracer uses 0.8 of
 # it over copper. Matte black resist is noticeably rougher.
 MASK_ROUGHNESS = {"White": .4, "Black": .6}
+# Ray-traced specular weight (Mitsuba principled ``specular``; 0.5 is a plain
+# IOR 1.5 coating) per realistic resist color. Photographed matte black resist
+# reads deep black next to white legend ink: its satin sheen is faint, so at
+# full dielectric strength the studio key light washed it out to grey.
+_RESIST_SPECULAR = {tuple(round(v / 255, 6) for v in _P2B_MASK["BLACK"][1]): .06}
 # Legend ink: a thin TiO2 print reflects about 0.8, a slightly warm white; or
 # black ink on light resist.
 _REAL_SILK = {NOT_SPECIFIED: (0xe6, 0xe6, 0xde), "White": (0xe6, 0xe6, 0xde), "Black": (0x10, 0x0f, 0x0f)}
@@ -190,6 +195,15 @@ _PRESETS = (COPPER_COLOR, ENIG_COLOR, SILVER_COLOR, TIN_COLOR, DEFAULT_FINISH_CO
 def resist_light_color(rgb):
     """pcb2blender's over-copper color for a realistic resist color, else None."""
     return _RESIST_LIGHT.get(tuple(round(float(v), 6) for v in rgb[:3]))
+
+
+def resist_specular(rgb):
+    """Ray-traced specular weight of a realistic resist color, or None.
+
+    None keeps the plain dielectric coating (IOR 1.48). Matte black returns a
+    reduced weight so its sheen stays a faint satin, as on real boards.
+    """
+    return _RESIST_SPECULAR.get(tuple(round(float(v), 6) for v in rgb[:3]))
 
 
 def resist_cap_color(rgb, strong=False):
