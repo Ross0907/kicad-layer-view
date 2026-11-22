@@ -12,6 +12,7 @@ https://mitsuba.readthedocs.io/en/latest/src/how_to_guides/image_io_and_manipula
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 
@@ -37,8 +38,63 @@ def _env_flag(name, default=True):
 FREEZE_RENDER = _env_flag("LAYER_VIEW_RT_FREEZE")
 # Sensor types whose recording failed in this process. Mitsuba 3.9.1's
 # orthographic sensor keeps members that a frozen function cannot traverse,
-# so parallel views trace normally; perspective views still replay.
+# so live parallel views use the narrow perspective stand-in below.
 _FREEZE_UNSUPPORTED = set()
+
+# Live parallel (orthographic) views are traced through a perspective sensor
+# with this narrow vertical field of view, pulled back so the focal plane has
+# exactly the parallel scale. Perspective sensors replay frozen kernels
+# (about 30-70x faster per sample than tracing the orthographic sensor), and
+# at 0.25 degrees the remaining perspective is a fraction of a pixel.
+STANDIN_FOV = .25
+# Rays start at the near clip, at most this far (normalized scene units) in
+# front of the scene, so float32 hit distances stay small at any zoom.
+_STANDIN_SLACK = 4.
+# Normalized geometry lies within the [-1, 1] cube.
+_SCENE_RADIUS = 3 ** .5 * 1.02
+# Reduced motion sizes keep their own sensor and fast denoiser.
+MAX_MOTION_SLOTS = 5
+
+
+def standin_camera(camera, center, scale, clip=None):
+    """Narrow perspective camera matching a parallel ``camera``, and its clip range.
+
+    Returns ``(perspective CapturedCamera, (near, far))``. The near/far clip are
+    plain sensor scalars, so changing them records new frozen kernels: a valid
+    ``clip`` from the previous frame is kept, and the camera distance and field
+    of view absorb orbiting, panning and zooming. Only a large zoom or pan
+    chooses a new range.
+    """
+    focal = (np.asarray(camera.focal_point, dtype=float) - center) * scale
+    view = (np.asarray(camera.position, dtype=float) - center) * scale - focal
+    length = float(np.linalg.norm(view))
+    direction = view / length if length > 0 else np.array((0., 0., 1.))
+    half = max(float(camera.parallel_scale) * scale, 1e-9)
+    # Every scene point lies within ``radius`` of the focal point. A parallel
+    # view shows nothing behind its eye plane, nor does the stand-in.
+    radius = float(np.linalg.norm(focal)) + _SCENE_RADIUS
+    reach = min(length, radius) if length > 0 else radius
+    ideal = half / math.tan(math.radians(STANDIN_FOV / 2))
+
+    def fit(near):
+        distance = min(max(ideal, near + reach), near + reach + _STANDIN_SLACK)
+        return distance, 2 * math.degrees(math.atan(half / distance))
+    if clip is not None:
+        distance, fov = fit(clip[0])
+        if not (STANDIN_FOV / 32 <= fov <= STANDIN_FOV * 2 and clip[1] >= distance + radius):
+            clip = None
+    if clip is None:
+        near = max(ideal - reach - _STANDIN_SLACK / 2, 1e-4)
+        distance, fov = fit(near)
+        clip = (near, 2 * (distance + radius) + 10.)
+    eye = (focal + direction * distance) / scale + center
+    return CapturedCamera(tuple(float(v) for v in eye), tuple(camera.focal_point), tuple(camera.up),
+                          False, float(camera.parallel_scale), fov), clip
+
+
+def _x_fov(vertical_fov, width, height):
+    """Mitsuba's traversed ``x_fov`` (degrees) for a vertical field of view."""
+    return 2 * math.degrees(math.atan(math.tan(math.radians(vertical_fov) / 2) * width / height))
 
 
 def _render_one_sample(scene, sensor, seed, key):
@@ -297,7 +353,7 @@ class ProgressiveRayTracer:
     """
 
     def __init__(self, capture: RenderCapture, width: int, height: int,
-                 prefer_gpu=True, progress=None, *, allow_cpu=True):
+                 prefer_gpu=True, progress=None, *, allow_cpu=True, exact_projection=False):
         if not capture.meshes:
             raise ValueError("No visible board geometry to ray trace")
         self._validate_size(width, height)
@@ -309,10 +365,13 @@ class ProgressiveRayTracer:
         self._display_buffer = None
         self._bloom_buffer = None
         self._gpu_bloom = None
-        # Up to two sensors (with their guided denoiser) stay resident: the
-        # full refinement size and the reduced motion size, so starting and
-        # ending a drag reuse them instead of rebuilding.
-        self._slots = {"full": None, "motion": None}
+        # Sensors (with their denoisers) stay resident: the full refinement
+        # size and up to MAX_MOTION_SLOTS reduced motion sizes, so starting
+        # and ending a drag, or a new motion size, reuse them.
+        self._slots = {}
+        # True traces parallel views with the orthographic sensor itself
+        # (PNG export); live views use the frozen perspective stand-in.
+        self.exact_projection = bool(exact_projection)
         self._frozen_render = None
         self._freeze_failed = False
         self._sum = None
@@ -364,7 +423,7 @@ class ProgressiveRayTracer:
                 if not allow_cpu:
                     raise RayTraceUnavailable(f"GPU ray tracing could not allocate this scene: {exc}. OpenGL remains active.") from exc
                 self.scene = self.sensor = self._denoiser = None
-                self._slots = {"full": None, "motion": None}
+                self._slots = {}
                 self.triangle_count = 0
                 self.variant = _select_variant(mi, False)
                 self.backend = "CPU (scalar)"
@@ -498,12 +557,16 @@ class ProgressiveRayTracer:
             self.mi.set_variant(self.variant)
             self._update_camera(camera, width or self.width, height or self.height, motion=motion)
 
+    def _uses_standin(self, camera):
+        return (bool(camera.parallel_projection) and not getattr(self, "exact_projection", False)
+                and FREEZE_RENDER and str(getattr(self, "variant", "")).startswith("cuda"))
+
     def _update_camera(self, camera, width, height, motion=False):
         self._validate_size(width, height)
         slots = getattr(self, "_slots", None)
-        if self.sensor is None or slots is None:
+        if self.sensor is None or not isinstance(slots, dict):
             # The first camera, or a forced reload: never reuse a cached sensor.
-            slots = self._slots = {"full": None, "motion": None}
+            slots = self._slots = {}
         self.width, self.height = int(width), int(height)
         self.camera = camera
         # Updating one emitter parameter keeps every board mesh and the OptiX
@@ -513,22 +576,47 @@ class ProgressiveRayTracer:
         self._light_parameters["light_camera.to_world"] = self.mi.ScalarTransform4f().look_at(
             origin=[0, 0, 0], target=(target - eye).tolist(), up=list(camera.up))
         self._light_parameters.update()
-        sensor_dict = _sensor_dict(self.mi, camera, self.width, self.height, self.center, self.scale)
+        standin = self._uses_standin(camera)
+        kind = ("standin", None) if standin else None
+        key = None
+        name = None
+        if standin:
+            key = (self.width, self.height, kind)
+            name = next((slot_name for slot_name, cached in slots.items()
+                         if cached is not None and cached["key"] == key), None)
+            cached_clip = slots[name].get("clip") if name is not None else None
+            traced, clip = standin_camera(camera, self.center, self.scale, cached_clip)
+        else:
+            traced, clip = camera, None
+        sensor_dict = _sensor_dict(self.mi, traced, self.width, self.height, self.center, self.scale)
         sensor_dict["film"]["pixel_format"] = "rgba"
-        kind = (sensor_dict["type"], sensor_dict.get("fov"))
-        key = (self.width, self.height, kind)
-        name = next((slot_name for slot_name, cached in slots.items()
-                     if cached is not None and cached["key"] == key), None)
+        if clip is not None:
+            sensor_dict["near_clip"], sensor_dict["far_clip"] = clip
+        if not standin:
+            kind = (sensor_dict["type"], sensor_dict.get("fov"))
+            key = (self.width, self.height, kind)
+            name = next((slot_name for slot_name, cached in slots.items()
+                         if cached is not None and cached["key"] == key), None)
         slot = slots[name] if name is not None else None
         if slot is not None:
             # Orbiting only moves the sensor: update its transform in place so
             # the film, denoiser and compiled kernels are all reused. Motion
             # and refinement sizes each keep their own sensor.
             try:
-                slot["params"]["to_world"] = self.mi.Transform4f(sensor_dict["to_world"])
-                slot["params"].update()
+                params = slot["params"]
+                params["to_world"] = self.mi.Transform4f(sensor_dict["to_world"])
+                if standin:
+                    # Zooming a parallel view narrows or widens the stand-in.
+                    params["x_fov"] = _x_fov(traced.vertical_fov, self.width, self.height)
+                    if slot.get("clip") != clip:
+                        params["near_clip"], params["far_clip"] = clip
+                        slot["clip"] = clip
+                params.update()
             except Exception:  # noqa: BLE001 - fall back to a new sensor
-                slots[name] = slot = None
+                slots.pop(name, None)
+                slot = None
+            else:
+                slots[name] = slots.pop(name)  # most recently used last
         if slot is None:
             sensor = self.mi.load_dict(sensor_dict)
             try:
@@ -537,8 +625,13 @@ class ProgressiveRayTracer:
                 params = None
             # A sensor without parameters is never reused (key None).
             slot = {"key": key if params is not None else None, "sensor": sensor,
-                    "params": params, "denoiser": None}
-            slots["motion" if motion else "full"] = slot
+                    "params": params, "denoiser": None, "fast_denoiser": None, "clip": clip}
+            name = ("motion", self.width, self.height) if motion else "full"
+            slots.pop(name, None)
+            slots[name] = slot
+            motion_names = [slot_name for slot_name in slots if slot_name != "full"]
+            for stale in motion_names[:max(0, len(motion_names) - MAX_MOTION_SLOTS)]:
+                del slots[stale]
         self._active_slot = slot
         self.sensor = slot["sensor"]
         self._sensor_params = slot["params"]
@@ -589,11 +682,16 @@ class ProgressiveRayTracer:
             mi = self.mi
             mi.set_variant(self.variant)
             image = self._render_frozen(samples)
+            import drjit as dr
             if image is None:
-                image = mi.render(self.scene, sensor=self.sensor, spp=int(samples), seed=73 + self.samples)
+                seed = 73 + self.samples
+                if not str(self.variant).startswith("scalar"):
+                    # An opaque seed keeps one compiled kernel for every sample
+                    # instead of baking each new seed into a new kernel.
+                    seed = dr.opaque(mi.UInt32, seed)
+                image = mi.render(self.scene, sensor=self.sensor, spp=int(samples), seed=seed)
             # Keep the running radiance on the GPU; only the finished display
             # image crosses to the GUI. Evaluating breaks the accumulated graph.
-            import drjit as dr
             weighted = image * int(samples)
             self._sum = weighted if self._sum is None else self._sum + weighted
             dr.eval(self._sum)
@@ -810,13 +908,19 @@ class ProgressiveRayTracer:
         if denoise and fast and self.variant.startswith("cuda"):
             # Frames traced while the view moves: a guide-free denoiser skips
             # the extra albedo/normal render. Refinement uses the full one.
+            # Cached per motion size with its sensor, so alternating sizes
+            # never rebuild the denoiser.
+            cache = getattr(self, "_active_slot", None)
+            if cache is None:
+                cache = self.__dict__.setdefault("_loose_slot", {})
             try:
                 size = (self.width, self.height)
-                if getattr(self, "_fast_denoiser", (None,))[0] != size:
-                    self._fast_denoiser = (size, self.mi.OptixDenoiser(list(size)))
-                filtered = self._fast_denoiser[1](rgb)
+                fast_denoiser = cache.get("fast_denoiser")
+                if fast_denoiser is None or fast_denoiser[0] != size:
+                    fast_denoiser = cache["fast_denoiser"] = (size, self.mi.OptixDenoiser(list(size)))
+                filtered = fast_denoiser[1](rgb)
             except Exception as exc:  # noqa: BLE001 - show the raw frame instead
-                self._fast_denoiser = (None,)
+                cache["fast_denoiser"] = None
                 self._report(f"Fast OptiX denoising unavailable: {exc}")
         elif denoise and self._guided_denoiser() is not None:
             try:
@@ -860,10 +964,10 @@ class ProgressiveRayTracer:
             self._guides = None
             self._display_buffer = None
             self._gpu_buffer = None
-            self._fast_denoiser = (None,)
+            self._loose_slot = {}
             self._sensor_params = None
             self._sensor_kind = None
-            self._slots = {"full": None, "motion": None}
+            self._slots = {}
             self._active_slot = None
             self._frozen_render = None
             self._bloom_buffer = None

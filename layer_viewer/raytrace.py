@@ -264,8 +264,11 @@ def render_capture(capture: RenderCapture, output_path, width=1280, height=900,
         if progress is not None and hasattr(progress,"check_cancel"):
             progress.check_cancel()
     from .progressive_raytrace import ProgressiveRayTracer
+    # The export traces parallel views with the true orthographic sensor; the
+    # live viewport's narrow perspective stand-in differs by a fraction of a
+    # pixel at edges.
     with ProgressiveRayTracer(capture, width, height, prefer_gpu=prefer_gpu,
-                              progress=progress) as tracer:
+                              progress=progress, exact_projection=True) as tracer:
         while tracer.samples < samples:
             report(f"Ray tracing: {tracer.samples}/{samples} samples per pixel — {tracer.backend}")
             pixels = tracer.render_batch(1, denoise=denoise,

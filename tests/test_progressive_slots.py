@@ -63,10 +63,85 @@ def test_motion_and_refinement_sizes_keep_their_sensors_and_guided_denoiser():
     tracer._update_camera(_camera(3.), 100, 80)
     assert tracer.sensor is full_sensor and len(loaded) == 2 and len(denoisers) == 1
     assert tracer._denoiser is not None and tracer.samples == 0 and tracer._sum is None
-    # A new motion step replaces only the motion slot.
+    # A new motion step adds its own slot; the earlier size is kept.
     tracer._update_camera(_camera(4.), 62, 50, motion=True)
     tracer._update_camera(_camera(5.), 100, 80)
     assert tracer.sensor is full_sensor and loaded[-1] == (62, 50) and len(loaded) == 3
+    tracer._update_camera(_camera(6.), 50, 40, motion=True)
+    assert tracer.sensor is motion_sensor and len(loaded) == 3
+
+
+def test_motion_slots_are_bounded_and_keep_their_fast_denoisers():
+    tracer, loaded, _ = _tracer()
+    fast = []
+    tracer.mi.OptixDenoiser = lambda size, **kw: fast.append(tuple(size)) or (lambda rgb: rgb)
+    tracer._update_camera(_camera(), 100, 80)
+    sizes = [(20 + 4 * k, 16 + 4 * k) for k in range(progressive_raytrace.MAX_MOTION_SLOTS + 1)]
+    for size in sizes[:2]:
+        tracer._update_camera(_camera(1.), *size, motion=True)
+        tracer._denoised("rgb", True, True)
+    del fast[:]
+    # Alternating motion sizes reuse each size's sensor and fast denoiser.
+    for size in sizes[:2] * 2:
+        tracer._update_camera(_camera(2.), *size, motion=True)
+        assert tracer._denoised("rgb", True, True) == "rgb"
+    assert fast == [] and len(loaded) == 3
+    for size in sizes[2:]:
+        tracer._update_camera(_camera(3.), *size, motion=True)
+    motion = [name for name in tracer._slots if name != "full"]
+    assert "full" in tracer._slots and len(motion) == progressive_raytrace.MAX_MOTION_SLOTS
+    # The least recently used motion size was dropped.
+    assert ("motion",) + sizes[0] not in tracer._slots and ("motion",) + sizes[1] in tracer._slots
+
+
+def test_parallel_views_use_a_perspective_stand_in_with_stable_clipping():
+    tracer, loaded, _ = _tracer()
+    tracer._update_camera(_camera(), 100, 80)
+    assert tracer._sensor_kind == ("standin", None)
+    params = tracer._sensor_params
+    clip = tracer._active_slot["clip"]
+    # Orbiting and modest zooming only move the sensor and change its field
+    # of view: the clip range (a recorded kernel constant) is unchanged.
+    from dataclasses import replace
+    tracer._update_camera(CapturedCamera((10., 0., 1.), (0., 0., 0.), (0., 0., 1.), True, 5., 30.), 100, 80)
+    tracer._update_camera(replace(_camera(), parallel_scale=4.), 100, 80)
+    assert len(loaded) == 1 and tracer._active_slot["clip"] == clip and "near_clip" not in params
+    assert params["x_fov"] < progressive_raytrace._x_fov(progressive_raytrace.STANDIN_FOV, 100, 80)
+    # Zooming far out chooses a new clip range on the same sensor.
+    tracer._update_camera(replace(_camera(), parallel_scale=50.), 100, 80)
+    assert len(loaded) == 1 and params["near_clip"] > clip[0]
+    # Exact projection (PNG export) and the CPU path keep the orthographic sensor.
+    tracer.exact_projection = True
+    tracer._update_camera(_camera(), 100, 80)
+    assert tracer._sensor_kind == ("orthographic", None) and len(loaded) == 2
+
+
+def test_stand_in_matches_the_parallel_scale_and_starts_rays_near_the_scene():
+    import math
+    from layer_viewer.progressive_raytrace import standin_camera, STANDIN_FOV
+    for scale_mm in (.01, 1., 40., 2000.):
+        camera = CapturedCamera((30., -40., 50.), (3., 4., 0.), (0., 0., 1.), True, scale_mm, 30.)
+        center, scale = np.array((1., 2., 0.)), 1 / 50
+        traced, (near, far) = standin_camera(camera, center, scale)
+        assert not traced.parallel_projection and traced.vertical_fov <= STANDIN_FOV * 1.0001
+        focal = (np.asarray(traced.focal_point) - center) * scale
+        eye = (np.asarray(traced.position) - center) * scale
+        distance = np.linalg.norm(eye - focal)
+        # Same half height at the focal plane as the parallel view.
+        assert math.isclose(distance * math.tan(math.radians(traced.vertical_fov) / 2),
+                            scale_mm * scale, rel_tol=1e-6)
+        # Same view direction, and the clip range spans the whole scene...
+        np.testing.assert_allclose((eye - focal) / distance,
+                                   np.subtract(camera.position, camera.focal_point)
+                                   / np.linalg.norm(np.subtract(camera.position, camera.focal_point)))
+        # (the parallel view shows nothing behind its own eye plane either).
+        radius = np.linalg.norm(focal) + 3 ** .5
+        reach = min(radius, np.linalg.norm(np.subtract(camera.position, camera.focal_point)) * scale)
+        assert near <= distance - reach + 1e-9 and far >= distance + radius
+        # ...while rays start within a few units of it (float32 precision).
+        assert near >= distance - reach - progressive_raytrace._STANDIN_SLACK - .1 or near <= 1e-3
+        # A valid range is kept for the next frame.
+        assert standin_camera(camera, center, scale, (near, far))[1] == (near, far)
 
 
 def test_forced_reload_and_projection_change_never_reuse_a_cached_sensor():
@@ -125,7 +200,8 @@ def test_single_samples_replay_the_frozen_render_with_an_opaque_seed(monkeypatch
     assert calls == [("scene", "sensor", ("opaque", 73), key), ("scene", "sensor", ("opaque", 74), key)]
     assert not rendered and tracer.samples == 2
     tracer.render_batch(4, display=False)  # multi-sample batches trace normally
-    assert rendered == [75] and len(calls) == 2
+    # ...with an opaque seed too, so each sample reuses one compiled kernel.
+    assert rendered == [("opaque", 75)] and len(calls) == 2
 
 
 def test_freeze_failure_or_disabled_flag_falls_back_to_plain_render(monkeypatch):
@@ -144,19 +220,23 @@ def test_freeze_failure_or_disabled_flag_falls_back_to_plain_render(monkeypatch)
     tracer.render_batch(1, display=False)
     tracer.render_batch(1, display=False)
     # One failed recording, then that sensor type is never attempted again.
-    assert rendered == [73, 74] and len(attempts) == 1 and tracer.samples == 2
+    assert rendered == [("opaque", 73), ("opaque", 74)] and len(attempts) == 1 and tracer.samples == 2
     assert progressive_raytrace._FREEZE_UNSUPPORTED == {"orthographic"}
     np.testing.assert_array_equal(tracer._sum, np.full((2, 2, 4), 2.))
     # Another sensor type still replays.
     tracer._sensor_kind = ("perspective", 30.)
     kinds[0] = "perspective"
     tracer.render_batch(1, display=False)
-    assert rendered == [73, 74] and len(attempts) == 2
+    assert len(rendered) == 2 and len(attempts) == 2
 
     monkeypatch.setattr(progressive_raytrace, "FREEZE_RENDER", False)
     tracer, rendered = _render_fixture(monkeypatch, lambda *a, **kw: 1 / 0)
     tracer.render_batch(1, display=False)
-    assert rendered == [73]
+    assert rendered == [("opaque", 73)]
+    # The CPU variant passes a plain seed.
+    tracer.variant = "scalar_rgb"
+    tracer.render_batch(1, display=False)
+    assert rendered[-1] == 74
 
 
 def test_freeze_env_flag(monkeypatch):

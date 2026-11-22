@@ -94,6 +94,8 @@ def test_png_export_passes_the_same_exposure_to_every_sample(monkeypatch, tmp_pa
 
     class Backend:
         def __init__(self, *args, **kwargs):
+            # PNG export keeps the true orthographic sensor, not the live stand-in.
+            assert kwargs.get("exact_projection") is True
             self.samples, self.backend = 0, "test"
             self.mi = SimpleNamespace(Bitmap=lambda pixels: SimpleNamespace(
                 write=lambda path: written.append((pixels, path))))
