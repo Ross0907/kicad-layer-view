@@ -416,3 +416,155 @@ def test_worker_passes_motion_and_packed_only_to_backends_that_support_them():
         worker.stop()
         assert worker.wait(3000)
         app.processEvents()
+
+
+def _motion_info(seconds):
+    return {"motion": True, "backend": "test", "seconds": seconds, "denoised": True}
+
+
+def test_motion_size_is_held_for_a_drag_and_adapts_between_drags_on_steady_frames():
+    from layer_viewer import live_raytrace
+    app = QApplication.instance() or QApplication([])
+    controller, viewport = _controller()
+    try:
+        assert controller.motion_scale == .5
+        width, height = controller._motion_size()
+        frame = np.zeros((height, width), np.uint32)
+        # Very fast frames never change the size during the drag...
+        for _ in range(8):
+            controller._frame(controller._revision, frame, _motion_info(.002))
+        assert controller.motion_scale == .5
+        # ...only between drags, by one step.
+        controller._adapt_motion_scale()
+        assert controller.motion_scale == .625
+        assert controller._motion_times == []
+        assert controller._motion_warmup == live_raytrace.MOTION_WARMUP_FRAMES
+        # Frames right after the change (kernel recording) are not judged,
+        # nor are stale frames at the previous size.
+        width, height = controller._motion_size()
+        slow = np.zeros((height, width), np.uint32)
+        controller._frame(controller._revision, slow, _motion_info(2.))
+        controller._frame(controller._revision, slow, _motion_info(2.))
+        controller._frame(controller._revision, frame, _motion_info(2.))
+        assert controller._motion_times == []
+        # The median ignores a single slow outlier.
+        for seconds in (.03, .5, .03, .03):
+            controller._frame(controller._revision, slow, _motion_info(seconds))
+        controller._adapt_motion_scale()
+        assert controller.motion_scale == .625
+        # Too few steady frames: unchanged.
+        controller._motion_times = [.5, .5]
+        controller._adapt_motion_scale()
+        assert controller.motion_scale == .625
+        controller._motion_times = [.5, .5, .5]
+        controller._adapt_motion_scale()
+        assert controller.motion_scale == .5
+    finally:
+        controller.shutdown()
+        viewport.deleteLater()
+        app.processEvents()
+
+
+def test_frames_reuse_the_worker_buffer_and_set_geometry_only_on_resize():
+    app = QApplication.instance() or QApplication([])
+    controller, viewport = _controller()
+    calls = []
+    original = controller.overlay.setMask
+    controller.overlay.setMask = lambda region: calls.append(region) or original(region)
+    try:
+        pixels = np.full((100, 200), 0xFF102030, dtype=np.uint32)
+        controller._frame(controller._revision, pixels, _REFINED)
+        assert controller._last_pixels is pixels  # no copy: the image reads this array
+        controller._frame(controller._revision, pixels.copy(), _REFINED)
+        assert len(calls) == 1
+        image = controller.last_image
+        assert controller.overlay.image is image and image.width() == 200
+        viewport.plotter.interactor.resize(300, 150)
+        controller._frame(controller._revision, pixels, _REFINED)
+        assert len(calls) == 2 and controller.overlay.geometry().width() == 300
+        # A reduced motion frame is painted up to the overlay.
+        controller._frame(controller._revision, np.zeros((25, 50), np.uint32), _motion_info(.01))
+        controller.overlay.repaint()
+    finally:
+        controller.shutdown()
+        viewport.deleteLater()
+        app.processEvents()
+
+
+def test_board_renderer_stops_drawing_under_the_overlay_and_the_axis_corner_clears_itself():
+    import pyvista as pv
+    app = QApplication.instance() or QApplication([])
+    plotter = pv.Plotter(off_screen=True, window_size=(200, 100))
+    plotter.set_background("black", top="white")
+    plotter.add_mesh(pv.Sphere())
+    axis_widget = plotter.add_camera_orientation_widget()
+    renderer, corner = plotter.renderer, axis_widget.GetDefaultRenderer()
+    layer = corner.GetLayer()
+    controller, viewport = _controller(renderer)
+    viewport.axis_widget = axis_widget
+    try:
+        frame = np.zeros((100, 200), np.uint32)
+        controller._frame(controller._revision, frame, _REFINED)
+        assert not renderer.GetDraw() and not renderer.GetUseDepthPeeling()
+        # The axis widget still renders, and clears its own corner.
+        assert corner.GetDraw() and corner.GetLayer() == renderer.GetLayer()
+        assert corner.GetGradientBackground()
+        bottom, top = corner.GetBackground(), corner.GetBackground2()
+        assert 0 <= bottom[0] < top[0] <= 1
+        plotter.camera.Azimuth(30)
+        plotter.render()
+        controller.set_enabled(False)
+        # Turning ray tracing off draws OpenGL again at once.
+        assert renderer.GetDraw() and corner.GetLayer() == layer and viewport.renders == 1
+    finally:
+        controller.shutdown()
+        viewport.deleteLater()
+        plotter.close()
+        app.processEvents()
+
+
+def test_refinement_redisplays_at_milestones_and_on_a_time_budget():
+    from layer_viewer.live_raytrace import refine_display_due, REFINE_DISPLAY_S
+    shown = [n for n in range(1, 65) if refine_display_due(n, 64, .01)]
+    assert shown == [1, 4, 16, 64]
+    assert refine_display_due(7, 64, None) and refine_display_due(7, 64, REFINE_DISPLAY_S)
+
+
+def test_worker_displays_only_the_refinement_frames_it_shows():
+    app = QApplication.instance() or QApplication([])
+    frames, displays = [], []
+
+    class Backend:
+        def __init__(self, capture, width, height, progress):
+            self.size, self.samples = (width, height), 0
+            self.backend, self.last_batch_seconds, self.denoiser_available = "test", .01, True
+
+        def update_camera(self, camera, width, height):
+            self.samples = 0
+
+        def render_batch(self, samples, denoise, exposure_ev=0.0, denoise_strength=.35,
+                         bloom_strength=.18, bloom_radius=1., display=True):
+            self.samples += samples
+
+        def display_image(self, **settings):
+            displays.append(self.samples)
+            return np.zeros((self.size[1], self.size[0], 3), dtype=np.uint8)
+
+        def close(self):
+            pass
+
+    worker = LiveRayWorker(backend_factory=Backend)
+    worker.frame.connect(lambda revision, pixels, info: frames.append(info["samples"]))
+    worker.submit(1, SimpleNamespace(camera="start"), "start", (40, 30), 64, True)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 3
+        while (not frames or frames[-1] < 64) and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(.005)
+        assert frames[-1] == 64 and displays == frames
+        assert frames[:3] == [1, 4, 16] and len(frames) < 10
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()

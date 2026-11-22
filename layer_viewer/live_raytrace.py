@@ -8,23 +8,41 @@ the same scene is refined progressively at full native resolution.
 from __future__ import annotations
 
 import logging
+import statistics
 import threading
 import time
 
 from qtpy.QtCore import QObject, QThread, QTimer, Signal, Qt, QEvent, QRect
-from qtpy.QtGui import QImage, QPixmap, QRegion
-from qtpy.QtWidgets import QLabel
+from qtpy.QtGui import QImage, QPainter, QRegion
+from qtpy.QtWidgets import QWidget
 
 log = logging.getLogger(__name__)
 
 # Fraction of the window resolution traced while the view moves. It adapts
 # between the limits to hold roughly MOTION_FRAME_S per frame on any GPU/board.
+# One size is held for a whole drag (every new size records new kernels);
+# between drags it moves at most one step, judged on the median steady frame.
 MOTION_SCALE = .5
 MOTION_SCALE_STEPS = (.25, .35, .5, .625, .75)
 MOTION_FRAME_S = 1 / 30
 MOTION_SAMPLES = 1
+# Frames right after a size change include kernel recording; never judge them.
+MOTION_WARMUP_FRAMES = 2
+MOTION_MIN_STEADY = 3
+MOTION_HISTORY = 24
 # Refinement at full resolution starts once the view has rested this long.
 STILL_DELAY_MS = 140
+# Refinement redisplays (tone map, guided denoise, readback) at these sample
+# counts and the target, else at most every REFINE_DISPLAY_S; at full size a
+# redisplay costs far more than the 2-3 ms frozen sample it shows.
+REFINE_MILESTONES = (1, 4, 16)
+REFINE_DISPLAY_S = .25
+
+
+def refine_display_due(samples, target, since_last_display):
+    """Whether a refinement frame with ``samples`` accumulated should be shown."""
+    return (samples >= target or samples in REFINE_MILESTONES
+            or since_last_display is None or since_last_display >= REFINE_DISPLAY_S)
 
 
 class _Stopped(Exception):
@@ -146,7 +164,10 @@ class LiveRayWorker(QThread):
                     if self._paused or (self._pending is not None and not motion):
                         continue
                 now = time.perf_counter()
-                if not redisplay and tracer.samples < target and last_display and now - last_display < .1:
+                if (not redisplay and not motion and not refine_display_due(
+                        tracer.samples, target, now - last_display if last_display else None)):
+                    # Display work (and the guided denoiser) runs only for
+                    # frames that are shown.
                     continue
                 settings = dict(denoise=denoise, exposure_ev=exposure_ev,
                                 denoise_strength=denoise_strength,
@@ -183,6 +204,35 @@ class LiveRayWorker(QThread):
                 self._pending = None
 
 
+class _RayOverlay(QWidget):
+    """Paints the latest ray-traced frame over the view.
+
+    A reduced motion frame is filtered up to the window while painting
+    (bilinear), so no full-size copy is made per frame; refinement frames are
+    already at the native resolution and are painted 1:1.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.image = None
+
+    def set_image(self, image):
+        self.image = image
+        self.update()
+
+    def paintEvent(self, _event):
+        if self.image is None:
+            return
+        painter = QPainter(self)
+        if self.image.width() < self.width() * self.devicePixelRatioF() - .5:
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.drawImage(self.rect(), self.image)
+        painter.end()
+
+
 class LiveRayController(QObject):
     status = Signal(str)
     enabled_changed = Signal(bool)
@@ -204,15 +254,17 @@ class LiveRayController(QObject):
         # from before a reset (scene, resize, settings) never are.
         self._valid_from = 0
         self.motion_scale = MOTION_SCALE
+        # Steady motion-frame times at the current scale (seconds).
+        self._motion_times = []
+        self._motion_warmup = MOTION_WARMUP_FRAMES
         self._scene_dirty = True
         self._camera_signature = None
         self.last_image = None
+        self._last_pixels = None
+        self._overlay_layout = None
         # OpenGL settings saved while the opaque overlay hides the GL frame.
         self._gl_saved = None
-        self.overlay = QLabel(viewport.plotter.interactor)
-        self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.overlay.setAlignment(Qt.AlignCenter)
-        self.overlay.setStyleSheet("background: transparent; border: none;")
+        self.overlay = _RayOverlay(viewport.plotter.interactor)
         self.overlay.hide()
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
@@ -251,12 +303,14 @@ class LiveRayController(QObject):
         self._suppress_opengl(False)
 
     def _suppress_opengl(self, suppress):
-        """Skip unlimited depth peeling and FXAA while the overlay covers the view.
+        """Stop drawing the hidden OpenGL scene while the overlay covers the view.
 
-        Camera moves still redraw the OpenGL frame under the ray-traced image;
-        only the axis corner of it is visible, so its expensive passes are
-        wasted and compete with the path tracer for the GPU. They are restored
-        (and a frame requested) whenever the overlay hides.
+        Camera moves still render the window, so the camera-orientation widget
+        in the uncovered corner follows the view and stays clickable, but the
+        board renderer is switched off (``DrawOff``) and the widget clears its
+        own corner with the matching background. Depth peeling and FXAA are
+        also switched off. Everything is restored, and a frame requested,
+        whenever the overlay hides. Camera events do not depend on rendering.
         """
         renderer = getattr(getattr(self.viewport, "plotter", None), "renderer", None)
         if renderer is None or not hasattr(renderer, "SetUseDepthPeeling"):
@@ -272,12 +326,13 @@ class LiveRayController(QObject):
             except Exception:  # noqa: BLE001 - an optimization only
                 log.debug("Could not reduce hidden OpenGL passes", exc_info=True)
                 return
-            self._gl_saved = saved
+            self._gl_saved = saved + (self._stop_board_drawing(renderer),)
             return
         if self._gl_saved is None:
             return
-        (peeling, fxaa, antialiasing), self._gl_saved = self._gl_saved, None
+        (peeling, fxaa, antialiasing, drawing), self._gl_saved = self._gl_saved, None
         try:
+            self._restore_board_drawing(renderer, drawing)
             renderer.SetUseDepthPeeling(peeling)
             # An antialiasing change meanwhile has already set FXAA itself.
             if getattr(self.viewport, "_applied_antialiasing", None) == antialiasing:
@@ -287,6 +342,53 @@ class LiveRayController(QObject):
         request_render = getattr(self.viewport, "request_render", None)
         if callable(request_render):
             request_render()
+
+    def _stop_board_drawing(self, renderer):
+        """Switch the board renderer off; returns what to restore, or None."""
+        if not hasattr(renderer, "DrawOff"):
+            return None
+        widget = getattr(self.viewport, "axis_widget", None)
+        corner = (widget.GetDefaultRenderer()
+                  if widget is not None and hasattr(widget, "GetDefaultRenderer") else None)
+        saved_corner = None
+        try:
+            if corner is not None:
+                # The widget's overlay layer never clears its colour buffer;
+                # with the board renderer off its corner would smear. On the
+                # base layer it clears just its own viewport, painted with the
+                # board renderer's gradient over that span.
+                saved_corner = (corner.GetLayer(), corner.GetBackground(), corner.GetBackground2(),
+                                corner.GetGradientBackground())
+                bottom, top = renderer.GetBackground(), renderer.GetBackground2()
+                if not renderer.GetGradientBackground():
+                    top = bottom
+                span = corner.GetViewport()
+
+                def mix(t):
+                    return tuple(low + (high - low) * t for low, high in zip(bottom, top))
+                corner.SetLayer(renderer.GetLayer())
+                corner.GradientBackgroundOn()
+                corner.SetBackground(*mix(span[1]))
+                corner.SetBackground2(*mix(span[3]))
+            renderer.DrawOff()
+        except Exception:  # noqa: BLE001 - an optimization only
+            log.debug("Could not stop hidden OpenGL drawing", exc_info=True)
+            self._restore_board_drawing(renderer, (corner, saved_corner))
+            return None
+        return corner, saved_corner
+
+    @staticmethod
+    def _restore_board_drawing(renderer, drawing):
+        if drawing is None:
+            return
+        corner, saved_corner = drawing
+        renderer.DrawOn()
+        if corner is not None and saved_corner is not None:
+            layer, background, background2, gradient = saved_corner
+            corner.SetLayer(layer)
+            corner.SetBackground(*background)
+            corner.SetBackground2(*background2)
+            corner.SetGradientBackground(gradient)
 
     def set_quality(self, samples=None, denoise=None, exposure_ev=None, denoise_strength=None,
                     bloom_enabled=None, bloom_strength=None, bloom_radius=None):
@@ -373,9 +475,11 @@ class LiveRayController(QObject):
                 self.worker.start()
             capture = capture_from_viewport(self.viewport) if self._scene_dirty else None
             camera = capture_camera_from_viewport(self.viewport)
-            size = tuple(max(1, int(v)) for v in self.viewport.plotter.window_size)
-            if motion:
-                size = tuple(max(16, int(round(v * self.motion_scale))) for v in size)
+            if not motion:
+                # The drag has ended: only now may the motion size change.
+                self._adapt_motion_scale()
+            size = (self._motion_size() if motion else
+                    tuple(max(1, int(v)) for v in self.viewport.plotter.window_size))
             self.worker.submit(self._revision, capture, camera, size,
                                MOTION_SAMPLES if motion else self.samples, self.denoise,
                                self.exposure_ev, self.denoise_strength,
@@ -392,50 +496,76 @@ class LiveRayController(QObject):
             return
         height, width = pixels.shape[:2]
         # Packed H×W uint32 0xFFRRGGBB (GPU path) is Qt's native RGB32; the
-        # CPU fallback delivers H×W×3 RGB bytes.
+        # CPU fallback delivers H×W×3 RGB bytes. The worker hands over a new
+        # array per frame: keep it alive with the image instead of copying.
         image_format = QImage.Format_RGB32 if pixels.ndim == 2 else QImage.Format_RGB888
-        # Copy before the worker's next frame releases its numpy buffer.
-        picture = QImage(pixels.data, width, height, pixels.strides[0], image_format).copy()
+        picture = QImage(pixels.data, width, height, pixels.strides[0], image_format)
+        self._last_pixels = pixels
         self.last_image = picture
         rect = self.viewport.plotter.interactor.rect()
-        self.overlay.setGeometry(rect)
-        full = tuple(max(1, int(v)) for v in self.viewport.plotter.window_size)
-        if info.get("motion") and width < full[0]:
-            # Filter the reduced motion frame up to the window, not blocky pixels.
-            picture = picture.scaled(full[0], full[1], Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            width = full[0]
-        pixmap = QPixmap.fromImage(picture)
-        pixmap.setDevicePixelRatio(width / max(1, rect.width()))
-        self.overlay.setPixmap(pixmap)
-        # Keep the actual clickable VTK axis widget visible above the image.
-        axis_size = int(135 / max(1., self.viewport.devicePixelRatioF()))
-        self.overlay.setMask(QRegion(rect).subtracted(QRegion(QRect(
-            max(0, rect.width()-axis_size), 0, axis_size, axis_size))))
-        self.overlay.show()
-        self.overlay.raise_()
+        ratio = self.viewport.devicePixelRatioF()
+        layout = (rect.width(), rect.height(), ratio)
+        if layout != self._overlay_layout:
+            # Geometry and the axis-corner mask change only on resize.
+            self._overlay_layout = layout
+            self.overlay.setGeometry(rect)
+            # Keep the actual clickable VTK axis widget visible above the image.
+            axis_size = int(135 / max(1., ratio))
+            self.overlay.setMask(QRegion(rect).subtracted(QRegion(QRect(
+                max(0, rect.width()-axis_size), 0, axis_size, axis_size))))
+        self.overlay.set_image(picture)
+        if self.overlay.isHidden():
+            self.overlay.show()
+            self.overlay.raise_()
         self._suppress_opengl(True)
         quality = (f" · denoise {info.get('denoise_strength', 1.):.0%}"
                    if info["denoised"] else "")
         if info.get("motion"):
-            # Trade resolution for frame rate: pixel count scales with scale².
-            # Fixed steps with hysteresis: every new motion size rebuilds the
-            # motion sensor and fast denoiser, so it must not drift per frame.
-            seconds = float(info.get("seconds", MOTION_FRAME_S))
-            if seconds > 0:
-                wanted = self.motion_scale * (MOTION_FRAME_S / seconds) ** .5
-                steps = MOTION_SCALE_STEPS
-                index = min(range(len(steps)), key=lambda k: abs(steps[k] - self.motion_scale))
-                if wanted > steps[index] * 1.2 and index + 1 < len(steps):
-                    index += 1
-                elif wanted < steps[index] / 1.2 and index > 0:
-                    index -= 1
-                self.motion_scale = steps[index]
+            self._record_motion_frame(width, float(info.get("seconds", MOTION_FRAME_S)))
             self.status.emit(f"Live ray tracing · {info['backend']} · moving · "
                              f"{pixels.shape[1]}×{pixels.shape[0]} · {info['seconds']*1000:.0f} ms/frame")
             return
         self.status.emit(f"Live ray tracing · {info['backend']} · {width}×{height} · "
                          f"{info['samples']}/{info['target']} samples{quality} · "
                          f"{info['seconds']*1000:.0f} ms/frame")
+
+    def _motion_size(self, scale=None):
+        size = tuple(max(1, int(v)) for v in self.viewport.plotter.window_size)
+        scale = self.motion_scale if scale is None else scale
+        return tuple(max(16, int(round(v * scale))) for v in size)
+
+    def _record_motion_frame(self, width, seconds):
+        """Collect a motion frame's time if it was traced at the current scale."""
+        if width != self._motion_size()[0] or seconds <= 0:
+            return
+        if self._motion_warmup > 0:
+            # Frames right after a size change record kernels: never judged.
+            self._motion_warmup -= 1
+            return
+        self._motion_times.append(seconds)
+        del self._motion_times[:-MOTION_HISTORY]
+
+    def _adapt_motion_scale(self):
+        """Between drags, move the motion scale at most one step.
+
+        Pixel count scales with scale², so the frame time does too. Every new
+        size records new kernels, so the size never changes during a drag, and
+        only on the median of several steady frames.
+        """
+        if len(self._motion_times) < MOTION_MIN_STEADY:
+            return
+        seconds = statistics.median(self._motion_times)
+        wanted = self.motion_scale * (MOTION_FRAME_S / seconds) ** .5
+        steps = MOTION_SCALE_STEPS
+        index = min(range(len(steps)), key=lambda k: abs(steps[k] - self.motion_scale))
+        if wanted > steps[index] * 1.2 and index + 1 < len(steps):
+            index += 1
+        elif wanted < steps[index] / 1.2 and index > 0:
+            index -= 1
+        if steps[index] != self.motion_scale:
+            self.motion_scale = steps[index]
+            self._motion_times = []
+            self._motion_warmup = MOTION_WARMUP_FRAMES
 
     def _failed(self, message):
         self.set_enabled(False)
