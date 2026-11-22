@@ -525,9 +525,12 @@ def test_board_renderer_stops_drawing_under_the_overlay_and_the_axis_corner_clea
 
 def test_refinement_redisplays_at_milestones_and_on_a_time_budget():
     from layer_viewer.live_raytrace import refine_display_due, REFINE_DISPLAY_S
-    shown = [n for n in range(1, 65) if refine_display_due(n, 64, .01)]
+    # Slow tracing shows the milestones, and the rest on a time budget...
+    shown = [n for n in range(1, 65) if refine_display_due(n, 64, .15)]
     assert shown == [1, 4, 16, 64]
     assert refine_display_due(7, 64, None) and refine_display_due(7, 64, REFINE_DISPLAY_S)
+    # ...while fast tracing skips milestones that follow a display closely.
+    assert [n for n in range(2, 65) if refine_display_due(n, 64, .01)] == [64]
 
 
 def test_worker_displays_only_the_refinement_frames_it_shows():
@@ -563,7 +566,7 @@ def test_worker_displays_only_the_refinement_frames_it_shows():
             app.processEvents()
             time.sleep(.005)
         assert frames[-1] == 64 and displays == frames
-        assert frames[:3] == [1, 4, 16] and len(frames) < 10
+        assert frames[0] == 1 and len(frames) < 10
     finally:
         worker.stop()
         assert worker.wait(3000)

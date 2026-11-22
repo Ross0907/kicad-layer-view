@@ -34,15 +34,21 @@ MOTION_HISTORY = 24
 STILL_DELAY_MS = 140
 # Refinement redisplays (tone map, guided denoise, readback) at these sample
 # counts and the target, else at most every REFINE_DISPLAY_S; at full size a
-# redisplay costs far more than the 2-3 ms frozen sample it shows.
+# redisplay costs far more than the 2-3 ms frozen sample it shows. A milestone
+# reached within REFINE_MILESTONE_GAP_S of the last display is skipped, so a
+# fast board goes straight to its finished image.
 REFINE_MILESTONES = (1, 4, 16)
+REFINE_MILESTONE_GAP_S = .1
 REFINE_DISPLAY_S = .25
 
 
 def refine_display_due(samples, target, since_last_display):
     """Whether a refinement frame with ``samples`` accumulated should be shown."""
-    return (samples >= target or samples in REFINE_MILESTONES
-            or since_last_display is None or since_last_display >= REFINE_DISPLAY_S)
+    if samples >= target or since_last_display is None:
+        return True
+    if samples in REFINE_MILESTONES:
+        return since_last_display >= REFINE_MILESTONE_GAP_S
+    return since_last_display >= REFINE_DISPLAY_S
 
 
 class _Stopped(Exception):
