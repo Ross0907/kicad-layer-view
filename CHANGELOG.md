@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.2
+
+- No more stutter when a drag ends in live ray tracing: the full-size
+  refinement no longer keeps the GPU at 100 %; after each sample it leaves
+  about a third of the GPU free for Windows and the viewer, and still yields
+  at once when the view moves again.
+- 3D models: copper parts such as inductor windings show a reddish copper
+  instead of the gold used for plated pins (copper and gold are told apart by
+  hue).
+
 ## 0.8.1
 
 - Live ray tracing no longer lags while dragging in a large window. Mouse
