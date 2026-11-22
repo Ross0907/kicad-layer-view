@@ -110,6 +110,9 @@ HASL_COLOR = _rgb(0xda, 0xda, 0xd7)
 # Gold/brass model parts (SMA bodies, gold pins): a deeper gold, since a
 # lighter swatch washes out to beige as an environment-lit metal.
 GOLD_PART_COLOR = _rgb(0xd9, 0xae, 0x55)
+# Copper model parts (inductor windings, bare copper wire): enamelled magnet
+# wire reads as a reddish copper, not as the yellow of plated gold.
+COPPER_PART_COLOR = _rgb(0xd2, 0x7e, 0x55)
 REAL_SILVER_COLOR = _rgb(0xe7, 0xe5, 0xe1)
 REAL_TIN_COLOR = _rgb(0xcb, 0xca, 0xc0)
 SOLDER_COLOR = _rgb(0xaa, 0xaa, 0xa6)       # pcb2blender solder

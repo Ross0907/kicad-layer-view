@@ -131,3 +131,13 @@ def test_mask_faces_over_capped_vias_are_tagged():
     points, triangles, normals, coverage = mesh_mask_layer(task)
     assert coverage["Cap"].any() and coverage["Cu"].sum() > coverage["Cap"].sum()
     assert not (coverage["Cap"].astype(bool) & ~coverage["Cu"].astype(bool)).any()
+
+
+def test_copper_windings_show_copper_not_the_gold_of_plated_pins():
+    from layer_viewer.finishes import COPPER_PART_COLOR, GOLD_PART_COLOR
+    winding = (.78, .53, .42)  # Würth WE-TI 744745 inductor winding (hopper board)
+    assert component_surface(winding)[0] == 1.
+    assert metal_display_color(winding) == pytest.approx(COPPER_PART_COLOR)
+    assert metal_display_color((.859, .738, .496)) == pytest.approx(GOLD_PART_COLOR)  # KiCad PIN-02
+    r, g, b = COPPER_PART_COLOR
+    assert g / r < .7 and r > g > b  # reddish copper, clearly redder than gold

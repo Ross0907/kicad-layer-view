@@ -82,8 +82,15 @@ def component_surface(color, opacity=1.0, *, name="", specular=None, specular_po
 
 
 def _is_gold(color):
+    """Gold or brass: green at least ~3/4 of red (KiCad PIN-02 gold is .86)."""
     r, g, b = map(float, color[:3])
-    return r >= .64 and .64 <= g / max(r, 1e-6) <= .94 and b < g * .8 and r - b >= .22
+    return r >= .64 and .76 <= g / max(r, 1e-6) <= .94 and b < g * .8 and r - b >= .22
+
+
+def _is_copper(color):
+    """Copper: a redder metal, green well under 3/4 of red (wire, windings)."""
+    r, g, b = map(float, color[:3])
+    return r >= .45 and .4 <= g / max(r, 1e-6) < .76 and b <= g * .9 and r - b >= .2
 
 
 def metal_display_color(color):
@@ -98,6 +105,9 @@ def metal_display_color(color):
     if _is_gold(color):
         from .finishes import GOLD_PART_COLOR
         return tuple(float(v) for v in GOLD_PART_COLOR)
+    if _is_copper(color):
+        from .finishes import COPPER_PART_COLOR
+        return tuple(float(v) for v in COPPER_PART_COLOR)
     return tuple(float(1.055 * max(0., v) ** (1 / 2.4) - .055 if v > .0031308 else 12.92 * v)
                  for v in color[:3])
 
