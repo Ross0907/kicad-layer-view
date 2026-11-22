@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.1
+
+- Live ray tracing no longer lags while dragging in a large window. Mouse
+  moves made VTK render the whole hidden window on every move event, which
+  starved the path tracer; now only the axis widget is redrawn, ten times a
+  second. The traced image is capped at 1.6 megapixels and smoothly upscaled
+  to the window, so a maximized high-DPI window no longer fills an 8 GB GPU
+  (which made Windows page video memory and frames take seconds).
+- Black solder resist is a deep black with a faint sheen in both the viewport
+  and the ray tracer; the photo-matched near-black read as grey on screen.
+- Automated renders and tests open their window behind other windows without
+  taking focus.
+
 ## 0.8.0
 
 - Realistic style follows photographed boards: matte black resist reads deep
