@@ -114,7 +114,7 @@ def test_resist_uses_pcb2blender_two_tone_colors():
     assert material_appearance("mask", "") == green  # unspecified resist is green
     # Matte black resist is a warm near-black (photographed boards), never 0.
     black = material_appearance("mask", "Black")
-    assert _hex(black) == "1d1c1a" and _hex(resist_light_color(black)) == "242321" and black[3] >= .99
+    assert _hex(black) == "0e0e0d" and _hex(resist_light_color(black)) == "151514" and black[3] >= .99
     assert resist_light_color(material_appearance("mask", "Green", style="kicad")) is None
 
 

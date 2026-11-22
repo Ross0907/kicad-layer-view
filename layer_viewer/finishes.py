@@ -133,8 +133,9 @@ _P2B_MASK = {"GREEN": ((0x43, 0xa1, 0x42), (0x22, 0x52, 0x1f)),
              "BLUE": ((0x3b, 0x69, 0xaa), (0x1c, 0x36, 0x59)),
              "PURPLE": ((0x74, 0x48, 0xaa), (0x3b, 0x23, 0x59)),
              "WHITE": ((0xd3, 0xcf, 0xc9), (0xe1, 0xdd, 0xdc)),
-             # Matte black LPI resist is a warm near-black, never pure black.
-             "BLACK": ((0x2c, 0x2b, 0x29), (0x1d, 0x1c, 0x1a))}
+             # Matte black LPI resist: a deep, very slightly warm black. A
+             # lighter near-black matched photo pixels but read as grey on screen.
+             "BLACK": ((0x1e, 0x1e, 0x1c), (0x0e, 0x0e, 0x0d))}
 _MASK_FAMILY = {NOT_SPECIFIED: "GREEN", "Green": "GREEN", "Light Green": "GREEN",
                 "Saturated Green": "GREEN", "Red": "RED", "Light Red": "RED", "Red/Orange": "RED",
                 "Blue": "BLUE", "Light Blue 1": "BLUE", "Light Blue 2": "BLUE", "Green/Blue": "BLUE",
@@ -159,7 +160,7 @@ MASK_ROUGHNESS = {"White": .4, "Black": .6}
 # IOR 1.5 coating) per realistic resist color. Photographed matte black resist
 # reads deep black next to white legend ink: its satin sheen is faint, so at
 # full dielectric strength the studio key light washed it out to grey.
-_RESIST_SPECULAR = {tuple(round(v / 255, 6) for v in _P2B_MASK["BLACK"][1]): .06}
+_RESIST_SPECULAR = {tuple(round(v / 255, 6) for v in _P2B_MASK["BLACK"][1]): .04}
 # Legend ink: a thin TiO2 print reflects about 0.8, a slightly warm white; or
 # black ink on light resist.
 _REAL_SILK = {NOT_SPECIFIED: (0xe6, 0xe6, 0xde), "White": (0xe6, 0xe6, 0xde), "Black": (0x10, 0x0f, 0x0f)}

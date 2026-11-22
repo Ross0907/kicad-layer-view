@@ -16,7 +16,8 @@ from layer_viewer.viewer import FOIL_SHEEN_COLOR, FOIL_SHEEN_POWER, apply_materi
 
 def test_resist_legend_and_finish_values_follow_photographed_boards():
     black = material_appearance("mask", "Black")
-    assert 25 / 255 < min(black[:3]) and max(black[:3]) < 40 / 255  # warm near-black
+    # Deep black: a photo-matched near-black (~29) read as grey on screen.
+    assert 8 / 255 < min(black[:3]) and max(black[:3]) < 20 / 255
     assert finishes.MASK_ROUGHNESS["Black"] == pytest.approx(.6)
     silk = material_appearance("silk", "White")
     assert silk[:3] == pytest.approx((230 / 255, 230 / 255, 222 / 255))
@@ -75,7 +76,7 @@ def test_ray_traced_matte_black_resist_keeps_only_a_faint_sheen():
     matte = _material(_mesh("mask", black[:3], opacity=1., roughness=.6), coated=True, capped=True)["bsdf"]
     lobes = [matte["bsdf_0"]["bsdf_0"], matte["bsdf_0"]["bsdf_1"], matte["bsdf_1"]]
     # Every lobe (bare, over copper, over a capped via) has the faint sheen.
-    assert all("eta" not in lobe and lobe["specular"] == pytest.approx(.06) for lobe in lobes)
+    assert all("eta" not in lobe and lobe["specular"] == pytest.approx(.04) for lobe in lobes)
     assert lobes[0]["roughness"] == pytest.approx(.6)
     # Other resists, and KiCad-style black (no roughness), keep IOR 1.48.
     green = _material(_mesh("mask", material_appearance("mask", "Green")[:3], roughness=.45))["bsdf"]
