@@ -1,4 +1,5 @@
 """Sensor/denoiser reuse and frozen-render fallback with fakes; no renderer or GPU."""
+import pytest
 import sys
 from types import SimpleNamespace
 
@@ -293,3 +294,25 @@ def test_prewarm_restores_the_refinement_even_if_it_fails(monkeypatch):
     except RuntimeError:
         pass
     assert (tracer.width, tracer.height, tracer._sum, tracer.samples) == (100, 80, "sum", 12)
+
+
+@pytest.mark.parametrize("position, up, extent", [
+    ((0, 0, 100), (0, 1, 0), (1, .87, .016)),     # assembled, top view
+    ((0, 0, 100), (0, 1, 0), (1, .87, .15)),      # exploded, top view
+    ((100, -100, 100), (0, 0, 1), (1, .87, .15)),  # exploded, iso view
+])
+@pytest.mark.parametrize("zoom", [1, 4, 10, 30])
+def test_parallel_standin_parallax_stays_under_a_pixel_or_uses_the_exact_camera(position, up, extent, zoom):
+    import numpy as np
+    from layer_viewer.progressive_raytrace import standin_camera
+    from layer_viewer.raytrace import CapturedCamera
+    height, center, scale = 939, np.zeros(3), .02
+    camera = CapturedCamera(position, (0, 0, 0), up, True, 50 / zoom, 30.)
+    result = standin_camera(camera, center, scale, None, height, extent)
+    if result is None:
+        return  # traced with the exact orthographic camera instead
+    traced, _ = result
+    direction = np.asarray(position, float) / np.linalg.norm(position)
+    depth = float(np.dot(extent, np.abs(direction)))
+    distance = float(np.linalg.norm(np.asarray(traced.position, float) * scale))
+    assert height / 2 * depth / (distance - depth) <= 1.0 + 1e-6

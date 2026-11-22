@@ -221,7 +221,8 @@ def _read_scene(directory, data, matching_signatures=None, previous_scene=None):
         metadata = part.get("metadata")
         if isinstance(metadata, dict):
             # Material additions do not invalidate expensive board geometry.
-            metadata = {"metallic": None, "roughness": None, "led": False, "model_class": (), **metadata}
+            metadata = {"metallic": None, "roughness": None, "led": False, "model_class": (),
+                        "exploded_opacity": None, **metadata}
         if not isinstance(metadata, dict) or set(metadata) != allowed:
             raise ValueError("Invalid cache mesh metadata")
         for name in ("key", "name", "kind"):

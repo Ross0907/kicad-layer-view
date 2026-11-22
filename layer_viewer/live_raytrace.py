@@ -8,6 +8,7 @@ the same scene is refined progressively at full native resolution.
 from __future__ import annotations
 
 import logging
+import math
 import statistics
 import threading
 import time
@@ -543,6 +544,23 @@ class LiveRayController(QObject):
         except Exception as exc:
             self._failed(str(exc))
 
+    def _axis_hole(self, rect, ratio):
+        widget = getattr(self.viewport, "axis_widget", None)
+        corner = None
+        try:
+            corner = widget.GetDefaultRenderer() if widget is not None else None
+        except Exception:  # noqa: BLE001 - fall back to the fixed corner square
+            corner = None
+        if corner is not None:
+            x0, y0, x1, y1 = corner.GetViewport()
+            width, height = rect.width(), rect.height()
+            left, right = int(x0 * width), int(math.ceil(x1 * width))
+            top, bottom = int((1 - y1) * height), int(math.ceil((1 - y0) * height))
+            if right > left and bottom > top:
+                return QRect(left, top, right - left, bottom - top)
+        size = int(135 / max(1., ratio))
+        return QRect(max(0, rect.width() - size), 0, size, size)
+
     def _frame(self, revision, pixels, info):
         if not self.enabled or revision < self._valid_from:
             return
@@ -564,9 +582,10 @@ class LiveRayController(QObject):
             self._overlay_layout = layout
             self.overlay.setGeometry(rect)
             # Keep the actual clickable VTK axis widget visible above the image.
-            axis_size = int(135 / max(1., ratio))
-            self.overlay.setMask(QRegion(rect).subtracted(QRegion(QRect(
-                max(0, rect.width()-axis_size), 0, axis_size, axis_size))))
+            # The hole is exactly the widget's own viewport: its padding must
+            # stay covered, since nothing redraws there while the board's
+            # OpenGL drawing is paused under the overlay.
+            self.overlay.setMask(QRegion(rect).subtracted(QRegion(self._axis_hole(rect, ratio))))
         self.overlay.set_image(picture)
         if self.overlay.isHidden():
             self.overlay.show()

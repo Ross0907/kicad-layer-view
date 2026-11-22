@@ -52,6 +52,7 @@ def test_legacy_cache_keeps_expensive_geometry_after_material_metadata_added(cac
     for part in data["parts"]:
         part["metadata"].pop("metallic")
         part["metadata"].pop("roughness")
+        part["metadata"].pop("exploded_opacity", None)  # added with exploded laminate
     path.write_text(json.dumps(data))
     result = cache.load_cached_scene(snapshot)
     assert result is not None

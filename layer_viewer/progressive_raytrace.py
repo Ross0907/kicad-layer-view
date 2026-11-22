@@ -62,7 +62,7 @@ _CAMERA_STATE = ("width", "height", "camera", "_active_slot", "sensor", "_sensor
                  "_background", "last_batch_seconds")
 
 
-def standin_camera(camera, center, scale, clip=None):
+def standin_camera(camera, center, scale, clip=None, height_px=None, half_extent=None):
     """Narrow perspective camera matching a parallel ``camera``, and its clip range.
 
     Returns ``(perspective CapturedCamera, (near, far))``. The near/far clip are
@@ -81,6 +81,19 @@ def standin_camera(camera, center, scale, clip=None):
     radius = float(np.linalg.norm(focal)) + _SCENE_RADIUS
     reach = min(length, radius) if length > 0 else radius
     ideal = half / math.tan(math.radians(STANDIN_FOV / 2))
+    required = 0.
+    if height_px:
+        # A point at depth d off the focal plane lands (H/2)·d/(D−d) pixels
+        # from its orthographic position at the frame edge. Keep that under a
+        # pixel for every depth within reach (exploded stacks, steep views).
+        # Depth of the scene box around the focal point along the view: tiny
+        # for a top view, larger for iso views and exploded stacks.
+        depth = reach
+        if half_extent is not None:
+            depth = min(reach, abs(float(np.dot(focal, direction)))
+                        + float(np.dot(np.asarray(half_extent, dtype=float), np.abs(direction))))
+        required = depth * (1 + float(height_px) / 2)
+        ideal = max(ideal, required)
 
     def fit(near):
         top = (near + reach + _STANDIN_SLACK) * 4 / 3
@@ -88,7 +101,8 @@ def standin_camera(camera, center, scale, clip=None):
         return distance, 2 * math.degrees(math.atan(half / distance))
     if clip is not None:
         distance, fov = fit(clip[0])
-        if not (STANDIN_FOV / 32 <= fov <= STANDIN_FOV * 2 and clip[1] >= distance + radius):
+        if not (STANDIN_FOV / 32 <= fov <= STANDIN_FOV * 2 and clip[1] >= distance + radius
+                and distance >= required):
             clip = None
     if clip is None:
         # Clip values are recorded into the kernels as constants: rounding
@@ -97,6 +111,8 @@ def standin_camera(camera, center, scale, clip=None):
         gap = ideal - reach
         near = 2 ** (math.floor(4 * math.log2(gap)) / 4) if gap >= 1 / 16 else 1e-4
         distance, fov = fit(near)
+        if fov < STANDIN_FOV / 32 or distance < required:
+            return None  # too deep a zoom: trace the exact parallel camera
         clip = (near, 2. ** math.ceil(math.log2(2 * (distance + radius) + 10.)))
     eye = (focal + direction * distance) / scale + center
     return CapturedCamera(tuple(float(v) for v in eye), tuple(camera.focal_point), tuple(camera.up),
@@ -493,6 +509,7 @@ class ProgressiveRayTracer:
         lo, hi = bounds.min(axis=0), bounds.max(axis=0)
         self.center = (lo + hi) / 2
         self.scale = 2. / max(float(np.max(hi - lo)), 1e-3)
+        self._half_extent = (hi - lo) / 2 * self.scale  # scene box in traced units
         # Guide images are traced once per camera, through transparent coatings.
         # The built-in AOV wrapper sees only the first mask surface and also
         # invokes the nested beauty integrator again during its AOV pass.
@@ -644,7 +661,13 @@ class ProgressiveRayTracer:
             name = next((slot_name for slot_name, cached in slots.items()
                          if cached is not None and cached["key"] == key), None)
             cached_clip = slots[name].get("clip") if name is not None else None
-            traced, clip = standin_camera(camera, self.center, self.scale, cached_clip)
+            standin_view = standin_camera(camera, self.center, self.scale, cached_clip, self.height,
+                                          getattr(self, "_half_extent", None))
+            if standin_view is None:
+                standin, kind, key, name = False, None, None, None
+                traced, clip = camera, None
+            else:
+                traced, clip = standin_view
         else:
             traced, clip = camera, None
         sensor_dict = _sensor_dict(self.mi, traced, self.width, self.height, self.center, self.scale)
