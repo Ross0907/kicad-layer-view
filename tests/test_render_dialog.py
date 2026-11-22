@@ -148,7 +148,8 @@ def test_settings_scroll_and_never_open_taller_than_the_screen():
     window.set_mask_opacity = lambda value: None
     dialog = RenderDialog(window)
     try:
-        dialog.show()
+        from layer_viewer.app import show_in_background
+        show_in_background(dialog)
         app.processEvents()
         assert isinstance(dialog.scroll, QScrollArea) and dialog.scroll.widgetResizable()
         assert dialog.size().height() <= dialog.screen().availableGeometry().height()
