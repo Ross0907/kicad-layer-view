@@ -60,10 +60,15 @@ class LiveRayWorker(QThread):
         self._pending = None
         self._paused = True
         self._backend_factory = backend_factory
+        # The next drag's motion size, prepared once refinement has finished.
+        self._warm_size = None
 
     def submit(self, revision, capture, camera, size, samples, denoise, exposure_ev=0.0,
-               denoise_strength=.35, bloom_strength=.18, bloom_radius=1., motion=False):
+               denoise_strength=.35, bloom_strength=.18, bloom_radius=1., motion=False,
+               warm_size=None):
         with self._condition:
+            if warm_size is not None:
+                self._warm_size = tuple(warm_size)
             # A later camera can supersede a queued camera, but it must retain
             # new geometry which has not yet reached the worker.
             if capture is None and self._pending is not None:
@@ -82,6 +87,23 @@ class LiveRayWorker(QThread):
         with self._condition:
             self._pending = None
             self._condition.notify_all()
+
+    @staticmethod
+    def _display_settings(tracer, denoise, exposure_ev, denoise_strength, bloom_strength, bloom_radius):
+        settings = dict(denoise=denoise, exposure_ev=exposure_ev, denoise_strength=denoise_strength,
+                        bloom_strength=bloom_strength, bloom_radius=bloom_radius)
+        if getattr(tracer, "supports_packed_display", False):
+            # 0xFFRRGGBB pixels: Qt's native RGB32, no conversion.
+            settings["packed"] = True
+        return settings
+
+    @classmethod
+    def _motion_display_settings(cls, tracer, denoise, exposure_ev, denoise_strength,
+                                 bloom_strength, bloom_radius):
+        # One sample needs the denoiser most; the fast denoiser skips the guide pass.
+        return cls._display_settings(tracer, denoise, exposure_ev,
+                                     max(denoise_strength, .85) if denoise else 0.,
+                                     bloom_strength, bloom_radius)
 
     def info(self, message):
         self.check_cancel()
@@ -105,13 +127,32 @@ class LiveRayWorker(QThread):
                 factory = partial(ProgressiveRayTracer, allow_cpu=False)
             else:
                 factory = self._backend_factory
+            warmed = set()
             while not self.isInterruptionRequested():
                 with self._condition:
+                    warm = None
                     if self._pending is None and (
                             self._paused or tracer is None or tracer.samples >= target):
-                        self._condition.wait(.1)
-                        continue
-                    pending, self._pending = self._pending, None
+                        warm = self._warm_size
+                        if (self._paused or tracer is None or warm is None or warm in warmed
+                                or not hasattr(tracer, "prewarm_motion")):
+                            self._condition.wait(.1)
+                            continue
+                        warmed.add(warm)
+                    else:
+                        pending, self._pending = self._pending, None
+                if warm:
+                    # The view rests with a finished image: prepare the next
+                    # drag's motion size now rather than stall its first frame.
+                    try:
+                        tracer.prewarm_motion(*warm, **self._motion_display_settings(
+                            tracer, denoise, exposure_ev, denoise_strength, bloom_strength,
+                            bloom_radius))
+                    except _Stopped:
+                        raise
+                    except Exception:  # noqa: BLE001 - only a head start
+                        log.debug("Could not prepare the motion size %s", warm, exc_info=True)
+                    continue
                 self.check_cancel()
                 redisplay = False
                 if pending is not None:
@@ -123,6 +164,7 @@ class LiveRayWorker(QThread):
                             tracer.close()
                             tracer = None
                         tracer = factory(capture, *size, progress=self)
+                        warmed.clear()
                         # The capture's camera can precede a queued camera update.
                         if camera != capture.camera:
                             tracer.update_camera(camera, *size)
@@ -169,16 +211,13 @@ class LiveRayWorker(QThread):
                     # Display work (and the guided denoiser) runs only for
                     # frames that are shown.
                     continue
-                settings = dict(denoise=denoise, exposure_ev=exposure_ev,
-                                denoise_strength=denoise_strength,
-                                bloom_strength=bloom_strength, bloom_radius=bloom_radius)
-                if getattr(tracer, "supports_packed_display", False):
-                    # 0xFFRRGGBB pixels: Qt's native RGB32, no conversion.
-                    settings["packed"] = True
                 if motion:
-                    # One sample needs the denoiser most; skip its guide pass.
-                    settings.update(denoise_strength=max(denoise_strength, .85) if denoise else 0.,
-                                    fast=True)
+                    settings = self._motion_display_settings(
+                        tracer, denoise, exposure_ev, denoise_strength, bloom_strength, bloom_radius)
+                    settings["fast"] = True
+                else:
+                    settings = self._display_settings(
+                        tracer, denoise, exposure_ev, denoise_strength, bloom_strength, bloom_radius)
                 pixels = tracer.display_image(**settings)
                 last_display = time.perf_counter()
                 self.check_cancel()
@@ -493,7 +532,7 @@ class LiveRayController(QObject):
                                MOTION_SAMPLES if motion else self.samples, self.denoise,
                                self.exposure_ev, self.denoise_strength,
                                self.bloom_strength if self.bloom_enabled else 0., self.bloom_radius,
-                               motion=motion)
+                               motion=motion, warm_size=self._motion_size())
             self._scene_dirty = False
         except Exception as exc:
             self._failed(str(exc))

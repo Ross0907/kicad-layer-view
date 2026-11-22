@@ -568,3 +568,57 @@ def test_worker_displays_only_the_refinement_frames_it_shows():
         worker.stop()
         assert worker.wait(3000)
         app.processEvents()
+
+
+def test_worker_prepares_the_motion_size_once_refinement_has_finished():
+    app = QApplication.instance() or QApplication([])
+    frames, warmed = [], []
+
+    class Backend:
+        def __init__(self, capture, width, height, progress):
+            self.size, self.samples = (width, height), 0
+            self.backend, self.last_batch_seconds, self.denoiser_available = "test", .01, True
+
+        def update_camera(self, camera, width, height):
+            self.samples = 0
+
+        def render_batch(self, samples, denoise, exposure_ev=0.0, denoise_strength=.35,
+                         bloom_strength=.18, bloom_radius=1., display=True):
+            self.samples += samples
+
+        def display_image(self, **settings):
+            return np.zeros((self.size[1], self.size[0], 3), dtype=np.uint8)
+
+        def prewarm_motion(self, width, height, **settings):
+            # Only ever with a finished image.
+            warmed.append((width, height, self.samples, settings["denoise_strength"]))
+
+        def close(self):
+            pass
+
+    def wait(condition):
+        deadline = time.monotonic() + 3
+        while not condition() and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(.005)
+        return condition()
+
+    worker = LiveRayWorker(backend_factory=Backend)
+    worker.frame.connect(lambda revision, pixels, info: frames.append(info["samples"]))
+    worker.submit(1, SimpleNamespace(camera="start"), "start", (40, 30), 8, True, warm_size=(20, 15))
+    worker.start()
+    try:
+        assert wait(lambda: warmed and frames)
+        assert warmed == [(20, 15, 8, .85)] and frames[-1] == 8
+        # Moving the view refines again, but the size is prepared only once.
+        worker.submit(2, None, "moved", (40, 30), 8, True, warm_size=(20, 15))
+        assert wait(lambda: len(frames) > 1 and frames[-1] == 8 and frames.count(8) == 2)
+        time.sleep(.3)
+        assert len(warmed) == 1
+        # A new motion size is prepared after the next refinement.
+        worker.submit(3, None, "again", (40, 30), 8, True, warm_size=(28, 21))
+        assert wait(lambda: len(warmed) == 2) and warmed[-1][:3] == (28, 21, 8)
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()

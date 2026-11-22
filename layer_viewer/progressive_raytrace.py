@@ -55,6 +55,11 @@ _STANDIN_SLACK = 4.
 _SCENE_RADIUS = 3 ** .5 * 1.02
 # Reduced motion sizes keep their own sensor and fast denoiser.
 MAX_MOTION_SLOTS = 5
+# Everything a camera update replaces; prewarm_motion restores it afterwards.
+_CAMERA_STATE = ("width", "height", "camera", "_active_slot", "sensor", "_sensor_params",
+                 "_sensor_kind", "_sum", "samples", "_guides", "_display_buffer", "_gpu_buffer",
+                 "_bloom_buffer", "_gpu_bloom", "_denoiser", "denoiser_available",
+                 "_background", "last_batch_seconds")
 
 
 def standin_camera(camera, center, scale, clip=None):
@@ -562,6 +567,35 @@ class ProgressiveRayTracer:
         with _RENDER_LOCK:
             self.mi.set_variant(self.variant)
             self._update_camera(camera, width or self.width, height or self.height, motion=motion)
+
+    def prewarm_motion(self, width, height, **display_settings):
+        """Prepare a motion size while the view rests, keeping the refinement.
+
+        The first frame at a new motion size records its frozen kernels, and
+        compiles them when Dr.Jit's kernel cache misses (0.1-4 s on large
+        boards), which would otherwise stall the start of the first drag.
+        One sample is traced and displayed (fast denoiser) at that size, then
+        the refinement sensor, samples and buffers are restored untouched.
+        Returns True when the size was prepared, False when there was nothing
+        to do.
+        """
+        width, height = int(width), int(height)
+        slots = getattr(self, "_slots", None)
+        if (self.scene is None or getattr(self, "camera", None) is None or not FREEZE_RENDER
+                or not str(getattr(self, "variant", "")).startswith("cuda")
+                or not isinstance(slots, dict) or ("motion", width, height) in slots
+                or (width, height) == (self.width, self.height)):
+            return False
+        saved = {name: getattr(self, name, None) for name in _CAMERA_STATE}
+        try:
+            self.update_camera(self.camera, width, height, motion=True)
+            self.render_batch(1, display=False)
+            self.display_image(fast=True, **display_settings)
+        finally:
+            # The camera itself is unchanged, so the light already matches.
+            for name, value in saved.items():
+                setattr(self, name, value)
+        return True
 
     def _uses_standin(self, camera):
         return (bool(camera.parallel_projection) and not getattr(self, "exact_projection", False)

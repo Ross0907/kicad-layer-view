@@ -247,3 +247,49 @@ def test_freeze_env_flag(monkeypatch):
                             ("False", False)):
         monkeypatch.setenv("LAYER_VIEW_RT_FREEZE", value)
         assert progressive_raytrace._env_flag("LAYER_VIEW_RT_FREEZE") is expected
+
+
+def test_prewarm_prepares_a_motion_size_and_keeps_the_refinement(monkeypatch):
+    monkeypatch.setattr(progressive_raytrace, "FREEZE_RENDER", True)
+    tracer, loaded, _ = _tracer()
+    tracer.mi.set_variant = lambda _: None
+    tracer.scene = "scene"
+    tracer._update_camera(_camera(), 100, 80)
+    accumulated, guides = object(), object()
+    tracer._sum, tracer.samples, tracer._guides = accumulated, 64, guides
+    full_sensor, full_slot = tracer.sensor, tracer._active_slot
+    traced = []
+    tracer.render_batch = lambda samples, display=True: traced.append(
+        (tracer.width, tracer.height, tracer.sensor is full_sensor, display))
+    tracer.display_image = lambda **settings: traced.append(settings)
+    assert tracer.prewarm_motion(50, 40, packed=True, denoise_strength=.85)
+    # One sample was traced and shown fast at the motion size, on its own sensor...
+    assert traced == [(50, 40, False, False), {"packed": True, "denoise_strength": .85, "fast": True}]
+    assert ("motion", 50, 40) in tracer._slots and loaded == [(100, 80), (50, 40)]
+    # ...and the finished refinement is exactly as it was.
+    assert (tracer.width, tracer.height, tracer.samples) == (100, 80, 64)
+    assert tracer._sum is accumulated and tracer._guides is guides
+    assert tracer.sensor is full_sensor and tracer._active_slot is full_slot
+    # A prepared size, the refinement size, or no frozen kernels: nothing to do.
+    assert not tracer.prewarm_motion(50, 40)
+    assert not tracer.prewarm_motion(100, 80)
+    monkeypatch.setattr(progressive_raytrace, "FREEZE_RENDER", False)
+    assert not tracer.prewarm_motion(60, 48) and len(traced) == 2
+
+
+def test_prewarm_restores_the_refinement_even_if_it_fails(monkeypatch):
+    monkeypatch.setattr(progressive_raytrace, "FREEZE_RENDER", True)
+    tracer, _, _ = _tracer()
+    tracer.mi.set_variant = lambda _: None
+    tracer.scene = "scene"
+    tracer._update_camera(_camera(), 100, 80)
+    tracer._sum, tracer.samples = "sum", 12
+
+    def fail(*_, **__):
+        raise RuntimeError("out of memory")
+    tracer.render_batch = fail
+    try:
+        tracer.prewarm_motion(50, 40)
+    except RuntimeError:
+        pass
+    assert (tracer.width, tracer.height, tracer._sum, tracer.samples) == (100, 80, "sum", 12)
