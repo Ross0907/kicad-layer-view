@@ -232,7 +232,7 @@ def test_silk_slab_stays_outside_mask_and_respects_apertures_and_cache_dependenc
     assert back.mesh.bounds.z_max == pytest.approx(-geometry.SILK_OFFSET_MM)
     assert front.mesh.bounds.z_max - front.mesh.bounds.z_min == pytest.approx(geometry.SILK_THICKNESS_MM)
     assert front.stack_index == -2 and back.stack_index == scene.slot_count+1
-    assert min(front.color) > .9 and front.kind == "silk"
+    assert min(front.color) > .85 and front.kind == "silk"
     changed = deepcopy(snapshot)
     changed.silkscreen["F.SilkS"] = [Poly([(2,2),(3,2),(3,3),(2,3)])]
     before, after = geometry._scene_signatures(snapshot), geometry._scene_signatures(changed)

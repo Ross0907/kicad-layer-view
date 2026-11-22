@@ -104,6 +104,25 @@ def metal_phong(rgb, roughness=.25):
     return .2, .9, tuple(.25 + .6 * v for v in color), power
 
 
+# Realistic inner foil: diffuse weight and a broad warm copper sheen.
+FOIL_DIFFUSE = .75
+FOIL_SHEEN_COLOR = (1., .82, .70)
+FOIL_SHEEN_POWER = 5.
+FOIL_SHEEN = .6
+
+
+def resist_sheen(roughness):
+    """Neutral specular weight of a realistic resist: glossier is stronger."""
+    roughness = min(1., max(0., float(roughness)))
+    return .015 + .06 * (1. - roughness)
+
+
+def resist_sheen_power(roughness):
+    """Highlight sharpness from roughness: 2/r^2 - 2, kept within [4, 64]."""
+    roughness = max(.05, float(roughness))
+    return max(4., min(64., 2. / (roughness * roughness) - 2.))
+
+
 def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None):
     """Set a VTK property to KiCad's material for ``kind`` in color ``rgb``.
 
@@ -112,10 +131,38 @@ def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None
     swaps only the diffuse color and keeps the finish-derived highlights.
     """
     terms_rgb = base_rgb if base_rgb is not None and kind in ("copper", "barrel", "via_patch") else rgb
-    from .finishes import is_realistic_metal
+    from .finishes import is_bare_foil, is_realistic_metal
     if prop.GetInterpolation() == 3:  # older sessions/actors used PBR metal
         prop.SetInterpolationToPhong()
         prop.SetMetallic(0.)
+    color = tuple(float(v) for v in rgb[:3])
+    if kind == "copper" and is_bare_foil(rgb):
+        # Realistic inner foil: rolled copper with a broad satin sheen. Checked
+        # before the plated-metal terms, whose tight highlight left large flat
+        # exploded foils a dull orange from almost every angle.
+        prop.SetAmbient(.2)
+        prop.SetAmbientColor(*color)
+        prop.SetDiffuse(FOIL_DIFFUSE)
+        prop.SetDiffuseColor(*color)
+        prop.SetSpecular(FOIL_SHEEN)
+        prop.SetSpecularColor(*FOIL_SHEEN_COLOR)
+        prop.SetSpecularPower(FOIL_SHEEN_POWER)
+        return
+    if kind == "mask" and roughness is not None:
+        # Realistic resist (only it carries a roughness): a neutral dielectric
+        # sheen whose spread follows the resist's roughness, so matte black
+        # shows a soft grey sheen and glossy resists a tighter highlight.
+        # KiCad's own rgb^2 specular at power 128 left black resist without
+        # any highlight at all.
+        ambient, _, _ = kicad_material(kind, rgb)
+        prop.SetAmbient(KICAD_AMBIENT)
+        prop.SetAmbientColor(*ambient)
+        prop.SetDiffuse(1.)
+        prop.SetDiffuseColor(*color)
+        prop.SetSpecular(1.)
+        prop.SetSpecularColor(*(resist_sheen(roughness),) * 3)
+        prop.SetSpecularPower(resist_sheen_power(roughness))
+        return
     if (kind in ("copper", "barrel", "via_patch") and is_realistic_metal(rgb)) or (
             kind == "component" and metallic is not None and metallic >= .5):
         # Realistic plated finishes and metal model parts: Phong metal lit by

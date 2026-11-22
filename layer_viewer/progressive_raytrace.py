@@ -118,13 +118,9 @@ def _material(mesh, *, coated=False, capped=False):
         opaque = {"type": "principled", "base_color": metal, "metallic": 1.,
                   "roughness": mesh.roughness if mesh.roughness is not None else
                               (.32 if mesh.kind == "via_patch" else .22)}
-        from .finishes import COVERED_COPPER_COLOR
-        if tuple(round(float(v), 6) for v in mesh.color[:3]) == tuple(round(v, 6) for v in COVERED_COPPER_COLOR):
-            # Inner foils are bare copper laminated in the board: shade them
-            # exactly like resist-covered outer copper so all layers match.
-            opaque = {"type": "diffuse", "reflectance": {"type": "rgb",
-                      "value": _linear(COVERED_COPPER_COLOR).tolist()}}
-        elif coated:
+        # Inner foils (bare laminated copper) take this metal lobe too, with
+        # copper F0 and their own satin roughness.
+        if coated:
             # The exact covered faces use an effective scattering substrate.
             # A polished conductor under our straight-through pigment filter
             # reflected dark component silhouettes as detached "shadows".
@@ -139,7 +135,10 @@ def _material(mesh, *, coated=False, capped=False):
                       "bsdf_0": opaque,
                       "bsdf_1": {"type": "diffuse", "reflectance": under}}
     elif mesh.kind == "paste":
-        opaque = {"type": "principled", "base_color": rgb, "metallic": 1., "roughness": .38}
+        # Realistic unreflowed paste carries its own (nearly matte) values.
+        opaque = {"type": "principled", "base_color": rgb,
+                  "metallic": mesh.metallic if getattr(mesh, "metallic", None) is not None else 1.,
+                  "roughness": mesh.roughness if getattr(mesh, "roughness", None) is not None else .38}
     elif mesh.kind == "mask":
         # Solder resist is dielectric; sharp restrained highlights distinguish
         # it from the underlying conductor without an oily clearcoat lobe.

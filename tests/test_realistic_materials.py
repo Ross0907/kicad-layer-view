@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 
 from layer_viewer import finishes
-from layer_viewer.finishes import (BARE_COPPER_COLOR, COVERED_COPPER_COLOR, HASL_COLOR, REAL_ENIG_COLOR, REAL_SILVER_COLOR,
+from layer_viewer.finishes import (BARE_COPPER_COLOR, BARE_FOIL_COLOR, COVERED_COPPER_COLOR, HASL_COLOR,
+                                   REAL_ENIG_COLOR, REAL_SILVER_COLOR,
                                    REAL_TIN_COLOR, board_body_color, covered_copper_color,
                                    finish_appearance, material_appearance)
 
@@ -89,10 +90,14 @@ def test_switching_style_recolors_without_remeshing():
         outer = {ids[0], ids[-1]}
         copper = [p for p in real.parts if p.kind == "copper"]
         assert {p.color for p in copper if p.layer_id in outer} == {HASL_COLOR}
-        # Only exposed outer copper is plated: inner foils are bare copper,
-        # matching copper under the outer resist.
-        inner = {p.color for p in copper if p.layer_id not in outer}
-        assert inner <= {COVERED_COPPER_COLOR}
+        # Only exposed outer copper is plated: inner foils are bare copper
+        # metal, a satin foil rougher than the plating.
+        inner = [p for p in copper if p.layer_id not in outer]
+        assert inner and {p.color for p in inner} == {BARE_FOIL_COLOR}
+        assert {(p.metallic, p.roughness) for p in inner} == {(1., finishes.BARE_FOIL_ROUGHNESS)}
+        # Back in KiCad style the inner foils take the finish again.
+        again = finishes.apply_surface_finish(real, snapshot, style="kicad")
+        assert BARE_FOIL_COLOR not in {p.color for p in again.parts if p.kind == "copper"}
     finally:
         finishes.set_style("realistic")
 
@@ -107,18 +112,20 @@ def test_resist_uses_pcb2blender_two_tone_colors():
     # pcb2blender's #43a142 over copper, softened to a subtle lift.
     assert _hex(green) == "22521f" and _hex(resist_light_color(green)) == "31762f"
     assert material_appearance("mask", "") == green  # unspecified resist is green
+    # Matte black resist is a warm near-black (photographed boards), never 0.
     black = material_appearance("mask", "Black")
-    assert _hex(black) == "000000" and _hex(resist_light_color(black)) == "070707" and black[3] >= .99
+    assert _hex(black) == "20201f" and _hex(resist_light_color(black)) == "252524" and black[3] >= .99
     assert resist_light_color(material_appearance("mask", "Green", style="kicad")) is None
 
 
 def test_finishes_and_legend_use_pcb2blender_colors():
-    assert _hex(finish_appearance("")[0]) == "eaeae5"       # HASL
-    assert _hex(finish_appearance("ENIG")[0]) == "e8c46c"
+    assert finish_appearance("") == (HASL_COLOR, .2)
+    assert _hex(HASL_COLOR) == "dadad7"                      # a slightly dull tin
+    assert _hex(finish_appearance("ENIG")[0]) == "d4b078"  # photographed ENIG pads
     assert _hex(finish_appearance("OSP")[0]) == "e1bbac"    # bare copper
-    assert _hex(material_appearance("silk", "")) == "f3f1f0"
+    assert _hex(material_appearance("silk", "")) == "e6e6de"  # TiO2 ink, about 0.8
     assert _hex(material_appearance("silk", "", context="White")) == "100f0f"
-    assert _hex(material_appearance("paste", "")) == "aaaaa6"
+    assert _hex(material_appearance("paste", "")) == "8c8c88"  # unreflowed paste
 
 
 def test_viewport_resist_is_lighter_over_copper():
