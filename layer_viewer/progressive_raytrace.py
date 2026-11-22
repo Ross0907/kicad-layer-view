@@ -173,6 +173,8 @@ def display_radiance(pixels, exposure_ev=0.):
 
 def _material(mesh, *, coated=False, capped=False):
     rgb = {"type": "rgb", "value": _linear(mesh.color).tolist()}
+    # Realistic dielectric slabs carry a roughness; KiCad-style ones do not.
+    laminate = mesh.kind == "dielectric" and getattr(mesh, "roughness", None) is not None
     if mesh.kind in ("copper", "barrel", "via_patch"):
         from .finishes import covered_copper_color, ray_metal_color
         # KiCad finish swatches are display colors; trace measured metal F0.
@@ -185,13 +187,9 @@ def _material(mesh, *, coated=False, capped=False):
         opaque = {"type": "principled", "base_color": metal, "metallic": 1.,
                   "roughness": mesh.roughness if mesh.roughness is not None else
                               (.32 if mesh.kind == "via_patch" else .22)}
-        from .finishes import COVERED_COPPER_COLOR
-        if tuple(round(float(v), 6) for v in mesh.color[:3]) == tuple(round(v, 6) for v in COVERED_COPPER_COLOR):
-            # Inner foils are bare copper laminated in the board: shade them
-            # exactly like resist-covered outer copper so all layers match.
-            opaque = {"type": "diffuse", "reflectance": {"type": "rgb",
-                      "value": _linear(COVERED_COPPER_COLOR).tolist()}}
-        elif coated:
+        # Inner foils (bare laminated copper) take this metal lobe too, with
+        # copper F0 and their own satin roughness.
+        if coated:
             # The exact covered faces use an effective scattering substrate.
             # A polished conductor under our straight-through pigment filter
             # reflected dark component silhouettes as detached "shadows".
@@ -206,15 +204,22 @@ def _material(mesh, *, coated=False, capped=False):
                       "bsdf_0": opaque,
                       "bsdf_1": {"type": "diffuse", "reflectance": under}}
     elif mesh.kind == "paste":
-        opaque = {"type": "principled", "base_color": rgb, "metallic": 1., "roughness": .38}
+        # Realistic unreflowed paste carries its own (nearly matte) values.
+        opaque = {"type": "principled", "base_color": rgb,
+                  "metallic": mesh.metallic if getattr(mesh, "metallic", None) is not None else 1.,
+                  "roughness": mesh.roughness if getattr(mesh, "roughness", None) is not None else .38}
     elif mesh.kind == "mask":
         # Solder resist is dielectric; sharp restrained highlights distinguish
         # it from the underlying conductor without an oily clearcoat lobe.
         # Matte resists (black, white) carry a higher roughness.
         roughness = getattr(mesh, "roughness", None) or .36
+        from .finishes import resist_light_color, resist_specular
+        # A realistic matte black resist (it carries a roughness) keeps only a
+        # faint satin sheen; every other resist is a plain IOR 1.48 coating.
+        specular = resist_specular(mesh.color) if getattr(mesh, "roughness", None) is not None else None
+        coating = {"eta": 1.48} if specular is None else {"specular": specular}
         opaque = {"type": "principled", "base_color": rgb, "metallic": 0.,
-                  "roughness": roughness, "eta": 1.48}
-        from .finishes import resist_light_color
+                  "roughness": roughness, **coating}
         light = resist_light_color(mesh.color)
         if coated and light is not None:
             # pcb2blender: lighter and a little glossier over copper (resist
@@ -222,7 +227,7 @@ def _material(mesh, *, coated=False, capped=False):
             opaque = {"type": "blendbsdf",
                       "weight": {"type": "mesh_attribute", "name": "face_resist_coverage"},
                       "bsdf_0": opaque,
-                      "bsdf_1": {"type": "principled", "metallic": 0., "eta": 1.48,
+                      "bsdf_1": {"type": "principled", "metallic": 0., **coating,
                                  "base_color": {"type": "rgb", "value": _linear(light).tolist()},
                                  "roughness": roughness * .8}}
             from .finishes import resist_cap_color
@@ -231,7 +236,7 @@ def _material(mesh, *, coated=False, capped=False):
                 opaque = {"type": "blendbsdf",
                           "weight": {"type": "mesh_attribute", "name": "face_resist_cap"},
                           "bsdf_0": opaque,
-                          "bsdf_1": {"type": "principled", "metallic": 0., "eta": 1.48,
+                          "bsdf_1": {"type": "principled", "metallic": 0., **coating,
                                      "base_color": {"type": "rgb",
                                                     "value": _linear(resist_cap_color(mesh.color)).tolist()},
                                      "roughness": roughness * .7}}
@@ -244,6 +249,10 @@ def _material(mesh, *, coated=False, capped=False):
         # Printed ink has its own matte finish; do not inherit copper metal or
         # the translucent solder resist's optical coating.
         opaque = {"type": "diffuse", "reflectance": rgb}
+    elif laminate:
+        # Realistic glass-epoxy (or other laminate): a resin-glossy surface.
+        opaque = {"type": "roughplastic", "diffuse_reflectance": rgb,
+                  "alpha": float(mesh.roughness), "int_ior": 1.55}
     else:
         opaque = {"type": "roughplastic", "diffuse_reflectance": rgb,
                   "alpha": .38,
@@ -255,7 +264,17 @@ def _material(mesh, *, coated=False, capped=False):
     opacity = mesh.opacity
     transmission_weight = 1 - max(0., opacity)
     transmission = {"type": "null"}
-    if mesh.kind == "mask":
+    if laminate:
+        # An exploded laminate slab keeps both faces, and light crosses both:
+        # each face blocks 1 - sqrt(1 - opacity) so the slab blocks
+        # ``opacity`` in all. Light through it takes the laminate's own tint
+        # (half per face), like real translucent glass-epoxy.
+        transmission_weight = float(np.sqrt(max(0., 1. - opacity)))
+        tint = np.asarray(_linear(mesh.color), dtype=float)
+        tint = np.clip(tint / max(1e-3, float(tint.max())), .05, 1.) ** .5
+        transmission = {"type": "thindielectric", "int_ior": 1., "ext_ior": 1.,
+                        "specular_transmittance": {"type": "rgb", "value": tint.tolist()}}
+    elif mesh.kind == "mask":
         # Approximate pigment absorption in a thin resist coating. Neutral
         # transmission exposed orange copper through green resist, producing a
         # brown board. Equal IORs make this a straight-through color filter;

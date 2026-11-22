@@ -45,11 +45,26 @@ SILVER_COLOR = _rgb(213, 213, 213)
 TIN_COLOR = _rgb(160, 160, 160)
 DEFAULT_FINISH_COLOR = (.75, .61, .23)
 
+# Realistic inner copper foil, laminated bare inside the board (an exploded
+# stack shows it). Display swatch for the viewport; the ray tracer traces it
+# as copper (F0 below), a rolled/treated foil a little rougher than plating.
+BARE_FOIL_COLOR = _rgb(0xc8, 0x8c, 0x6e)
+BARE_FOIL_ROUGHNESS = .32
+# Realistic immersion gold (ENIG) display swatch; its F0 is in _RAY_METAL.
+# Photographed ENIG pads read about (207, 168, 112), highlights (252, 224, 158).
+REAL_ENIG_COLOR = _rgb(0xd4, 0xb0, 0x78)
+COPPER_F0 = (.955, .637, .538)
+# Immersion gold F0, tuned so ray-traced pads match photographs of ENIG
+# boards: a clear yellow gold between the photos' median and highlight hues.
+ENIG_F0 = (.90, .56, .20)
+
 # Measured conductor reflectance for physically based ray tracing. KiCad's
 # swatches are display colors; the path tracer uses real metal F0 instead.
 # Reference: Epic's Physically Based Materials, measured metal base colors.
 _RAY_METAL = {
-    COPPER_COLOR: _srgb_reflectance((.955, .637, .538)),
+    COPPER_COLOR: _srgb_reflectance(COPPER_F0),
+    BARE_FOIL_COLOR: _srgb_reflectance(COPPER_F0),
+    REAL_ENIG_COLOR: _srgb_reflectance(ENIG_F0),
     ENIG_COLOR: _srgb_reflectance((1., .766, .336)),
     SILVER_COLOR: _srgb_reflectance((.972, .960, .915)),
     TIN_COLOR: _srgb_reflectance((.80, .80, .82)),
@@ -88,16 +103,19 @@ STACKUP_KINDS = ("mask", "silk", "paste", "dielectric")
 # pcb2blender's PCB surface-finish shader colors (materials.py), the KiCad
 # library PIN-01/PIN-02 materials; silver/tin from mat4cad METAL_COLORS.
 BARE_COPPER_COLOR = _rgb(0xe1, 0xbb, 0xac)  # pcb2blender NONE (bare copper / OSP)
-HASL_COLOR = _rgb(0xea, 0xea, 0xe5)         # pcb2blender HASL
+# Reflowed solder levelling: a slightly dull, wavy tin surface.
+HASL_COLOR = _rgb(0xda, 0xda, 0xd7)
 # pcb2blender's ENIG #efdfbb reads as pale cream under image-based lighting;
-# immersion gold is a saturated warm yellow (gold F0 ~ (1, .77, .34) linear).
-REAL_ENIG_COLOR = _rgb(0xe8, 0xc4, 0x6c)
+# immersion gold is a saturated warm yellow: REAL_ENIG_COLOR above.
 # Gold/brass model parts (SMA bodies, gold pins): a deeper gold, since a
 # lighter swatch washes out to beige as an environment-lit metal.
 GOLD_PART_COLOR = _rgb(0xd9, 0xae, 0x55)
 REAL_SILVER_COLOR = _rgb(0xe7, 0xe5, 0xe1)
 REAL_TIN_COLOR = _rgb(0xcb, 0xca, 0xc0)
 SOLDER_COLOR = _rgb(0xaa, 0xaa, 0xa6)       # pcb2blender solder
+# Unreflowed solder paste: grey metal powder in flux, rough and nearly matte.
+PASTE_COLOR = _rgb(0x8c, 0x8c, 0x88)
+PASTE_METALLIC, PASTE_ROUGHNESS = .2, .8
 # Copper seen through solder resist: the warm, partly diffuse color that tints
 # green resist yellow-green over traces (not a mirror-like metal).
 COVERED_COPPER_COLOR = _rgb(196, 122, 70)
@@ -115,7 +133,8 @@ _P2B_MASK = {"GREEN": ((0x43, 0xa1, 0x42), (0x22, 0x52, 0x1f)),
              "BLUE": ((0x3b, 0x69, 0xaa), (0x1c, 0x36, 0x59)),
              "PURPLE": ((0x74, 0x48, 0xaa), (0x3b, 0x23, 0x59)),
              "WHITE": ((0xd3, 0xcf, 0xc9), (0xe1, 0xdd, 0xdc)),
-             "BLACK": ((0x10, 0x10, 0x0f), (0x00, 0x00, 0x00))}
+             # Matte black LPI resist is a warm near-black, never pure black.
+             "BLACK": ((0x2c, 0x2b, 0x29), (0x1d, 0x1c, 0x1a))}
 _MASK_FAMILY = {NOT_SPECIFIED: "GREEN", "Green": "GREEN", "Light Green": "GREEN",
                 "Saturated Green": "GREEN", "Red": "RED", "Light Red": "RED", "Red/Orange": "RED",
                 "Blue": "BLUE", "Light Blue 1": "BLUE", "Light Blue 2": "BLUE", "Green/Blue": "BLUE",
@@ -133,23 +152,58 @@ RESIST_TWO_TONE = .45
 _RESIST_LIGHT = {tuple(round(v / 255, 6) for v in dark):
                  tuple((d + RESIST_TWO_TONE * (lt - d)) / 255 for lt, d in zip(light, dark))
                  for light, dark in _P2B_MASK.values()}
-# pcb2blender MASK_ROUGHNESS_MAP (default 0.45); over copper it is halved.
-MASK_ROUGHNESS = {"White": .4}
-# pcb2blender silkscreen: white ink, or black ink on light resist.
-_REAL_SILK = {NOT_SPECIFIED: (0xf3, 0xf1, 0xf0), "White": (0xf3, 0xf1, 0xf0), "Black": (0x10, 0x0f, 0x0f)}
+# pcb2blender MASK_ROUGHNESS_MAP (default 0.45); the ray tracer uses 0.8 of
+# it over copper. Matte black resist is noticeably rougher.
+MASK_ROUGHNESS = {"White": .4, "Black": .6}
+# Ray-traced specular weight (Mitsuba principled ``specular``; 0.5 is a plain
+# IOR 1.5 coating) per realistic resist color. Photographed matte black resist
+# reads deep black next to white legend ink: its satin sheen is faint, so at
+# full dielectric strength the studio key light washed it out to grey.
+_RESIST_SPECULAR = {tuple(round(v / 255, 6) for v in _P2B_MASK["BLACK"][1]): .06}
+# Legend ink: a thin TiO2 print reflects about 0.8, a slightly warm white; or
+# black ink on light resist.
+_REAL_SILK = {NOT_SPECIFIED: (0xe6, 0xe6, 0xde), "White": (0xe6, 0xe6, 0xde), "Black": (0x10, 0x0f, 0x0f)}
 # Natural FR4 is a pale, slightly green tan at a routed edge.
 REAL_FR4 = ((178, 168, 112), 1.)
 _REAL_BOARD = {"FR4 natural": REAL_FR4, "FR4 natural, dark": ((116, 100, 58), 1.)}
+# Realistic laminate per stackup material name: (substrings, sRGB color, light
+# attenuation length in mm, ray roughness). A slab of thickness t seen exploded
+# blocks 1 - exp(-t / length) of the light (Beer-Lambert); "None" stays opaque
+# (metal core). Glass-epoxy is a pale translucent straw; high-Tg epoxies are a
+# deeper amber; polyimide is amber-orange; PTFE is milky white; Rogers RO4000
+# hydrocarbon-ceramic is an opaque-looking cream. First match wins.
+_LAMINATES = (
+    (("alumin", "metal core"), (213, 213, 213), None, .35),
+    (("polyimide", "kapton"), (214, 140, 40), .5, .2),
+    (("ptfe", "teflon", "rt/duroid", "rt5880", "rt6002", "taconic"), (238, 234, 222), .15, .35),
+    (("ro4", "ro3", "rogers"), (224, 212, 178), .10, .3),
+    (("s1000", "s1141", "370hr", "it-180", "it180", "high tg", "high-tg", "hi-tg", "tu-8", "fr408",
+      "isola", "185hr", "pcl370"), (196, 172, 100), .25, .25),
+    (("",), (201, 194, 138), .25, .25),  # FR4 and anything unrecognized
+)
+# Prepreg is resin-rich (thinner glass), so it passes more light than a core.
+PREPREG_LENGTH_FACTOR = 1.3
+# Exploded slabs never fade below this: thin prepreg plies stay legible.
+EXPLODED_OPACITY_FLOOR = .45
 
 # Every color this module can assign to a conductor, for legacy-cache checks.
 _PRESETS = (COPPER_COLOR, ENIG_COLOR, SILVER_COLOR, TIN_COLOR, DEFAULT_FINISH_COLOR,
             BARE_COPPER_COLOR, HASL_COLOR, REAL_ENIG_COLOR, REAL_SILVER_COLOR, REAL_TIN_COLOR,
-            COVERED_COPPER_COLOR)
+            COVERED_COPPER_COLOR, BARE_FOIL_COLOR)
 
 
 def resist_light_color(rgb):
     """pcb2blender's over-copper color for a realistic resist color, else None."""
     return _RESIST_LIGHT.get(tuple(round(float(v), 6) for v in rgb[:3]))
+
+
+def resist_specular(rgb):
+    """Ray-traced specular weight of a realistic resist color, or None.
+
+    None keeps the plain dielectric coating (IOR 1.48). Matte black returns a
+    reduced weight so its sheen stays a faint satin, as on real boards.
+    """
+    return _RESIST_SPECULAR.get(tuple(round(float(v), 6) for v in rgb[:3]))
 
 
 def resist_cap_color(rgb, strong=False):
@@ -198,7 +252,7 @@ def material_appearance(kind, value="", style=None, context=None):
     ``context`` may give the resist color name, which picks legible legend ink.
     """
     if kind == "paste":
-        return (*SOLDER_COLOR, 1.) if _style(style) == "realistic" else DEFAULT_PASTE
+        return (*PASTE_COLOR, 1.) if _style(style) == "realistic" else DEFAULT_PASTE
     if isinstance(value, (list, tuple)) and len(value) in (3, 4):
         if all(isinstance(v, (int, float)) and math.isfinite(v) and 0 <= v <= 1 for v in value):
             return tuple(float(v) for v in value) if len(value) == 4 else (*map(float, value), 1.)
@@ -253,6 +307,33 @@ def board_body_color(dielectric_colors, style=None):
     return tuple(body)
 
 
+def dielectric_appearance(layer, style=None):
+    """Realistic look of one dielectric slab from its stackup material, or None.
+
+    Returns ``(rgb, exploded_opacity, roughness)``. None in the KiCad style and
+    for a slab with an explicit stackup color, which keeps KiCad's rules.
+    Assembled, every slab is opaque; ``exploded_opacity`` is how translucent a
+    separated slab of glass-epoxy of this thickness and type looks (None: it
+    stays opaque).
+    """
+    if _style(style) != "realistic":
+        return None
+    color = getattr(layer, "color", "")
+    if isinstance(color, (list, tuple)) or str(color or NOT_SPECIFIED) != NOT_SPECIFIED:
+        return None
+    material = str(getattr(layer, "material", "") or "").lower()
+    for names, rgb, length, roughness in _LAMINATES:
+        if any(name in material for name in names):
+            break
+    if length is not None and str(getattr(layer, "layer_type", "") or "").lower() == "prepreg":
+        length *= PREPREG_LENGTH_FACTOR
+    exploded = None
+    if length is not None:
+        thickness = max(0., float(getattr(layer, "thickness_mm", 0.) or 0.))
+        exploded = min(1., max(EXPLODED_OPACITY_FLOOR, 1. - math.exp(-thickness / length)))
+    return _rgb(*rgb), exploded, roughness
+
+
 def finish_appearance(name, style=None):
     """(display color, ray roughness) for a stackup copper finish, as KiCad maps it.
 
@@ -274,7 +355,7 @@ def finish_appearance(name, style=None):
             return REAL_SILVER_COLOR, .15
         if "tin" in lower and "hasl" not in lower:
             return REAL_TIN_COLOR, .25
-        return HASL_COLOR, .15
+        return HASL_COLOR, .2
     if raw.endswith("OSP"):
         return COPPER_COLOR, .28
     if raw.endswith(("IG", "gold")):
@@ -286,10 +367,15 @@ def finish_appearance(name, style=None):
     return DEFAULT_FINISH_COLOR, .26
 
 
-# Bare copper (inner foils) is the same environment-lit metal as the outer
-# copper, so every layer of the stack shows one consistent copper.
+# Realistic metals. Inner foils (BARE_FOIL_COLOR) are real copper metal in
+# the ray tracer and get their own satin sheen in the viewport.
 _REALISTIC_FINISHES = (HASL_COLOR, REAL_ENIG_COLOR, REAL_SILVER_COLOR, REAL_TIN_COLOR, BARE_COPPER_COLOR,
-                       COVERED_COPPER_COLOR)
+                       COVERED_COPPER_COLOR, BARE_FOIL_COLOR)
+
+
+def is_bare_foil(rgb):
+    """True for the realistic inner-foil swatch (bare laminated copper)."""
+    return _same(rgb, BARE_FOIL_COLOR)
 
 
 def _same(rgb, swatch):
@@ -323,16 +409,31 @@ def ray_metal_color(rgb):
     return tuple(rgb)
 
 
+def _dielectric_for(part, dielectrics):
+    """The stackup dielectric a ``dielectric:<index>`` slab was built from."""
+    try:
+        index = int(str(part.key).rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    return dielectrics[index] if 0 <= index < len(dielectrics) else None
+
+
+def _fields_of(part, changes):
+    """Only the changes ``part`` has fields for (minimal part records)."""
+    return {name: value for name, value in changes.items() if name in ("color", "opacity") or hasattr(part, name)}
+
+
 def apply_surface_finish(scene, snapshot, style=None):
     """Re-derive every material color from the stackup on new or reused meshes.
 
     Conductors (foils, barrels, cap patches) use the board finish. In the
-    realistic style inner foils are bare copper, the same color as copper
-    under the outer resist: only exposed outer copper is plated, so every
-    layer of the exploded stack shows one consistent copper. Every dielectric slab
-    shows KiCad's blended board-body color. UI custom/editor colors live on
-    actors and remain separate. Part records are replaced so an earlier scene
-    stays immutable.
+    realistic style inner foils are bare copper metal (only exposed outer
+    copper is plated), and each dielectric slab shows its own laminate
+    (``dielectric_appearance``), opaque when assembled and translucent once
+    exploded. A slab with an explicit stackup color, and every slab in the
+    KiCad style, shows KiCad's blended board-body color. UI custom/editor
+    colors live on actors and remain separate. Part records are replaced so
+    an earlier scene stays immutable.
     """
     style = _style(style)
     plated_color, plated_roughness = finish_appearance(getattr(snapshot, "surface_finish", ""), style)
@@ -343,12 +444,27 @@ def apply_surface_finish(scene, snapshot, style=None):
     copper_ids = [layer.id for layer in getattr(stackup, "copper", ())]
     outer_ids = {copper_ids[0], copper_ids[-1]} if copper_ids else set()
     inner_bare = style == "realistic"
+    dielectrics = list(getattr(stackup, "dielectrics", ()))
     parts = []
     for part in scene.parts:
         if part.kind == "copper" and inner_bare and outer_ids and part.layer_id not in outer_ids:
-            parts.append(replace(part, color=COVERED_COPPER_COLOR, metallic=1., roughness=plated_roughness))
+            parts.append(replace(part, color=BARE_FOIL_COLOR, metallic=1., roughness=BARE_FOIL_ROUGHNESS))
         elif part.kind == "dielectric":
-            parts.append(replace(part, color=body[:3], opacity=body[3]))
+            layer = _dielectric_for(part, dielectrics)
+            look = dielectric_appearance(layer, style) if layer is not None else None
+            if look is None:
+                changes = {"color": body[:3], "opacity": body[3], "roughness": None, "exploded_opacity": None}
+            else:
+                rgb, exploded, roughness = look
+                changes = {"color": rgb, "opacity": 1., "roughness": roughness, "exploded_opacity": exploded}
+            parts.append(replace(part, **_fields_of(part, changes)))
+        elif part.kind == "paste":
+            rgba = material_appearance("paste", "", style)
+            realistic = style == "realistic"
+            parts.append(replace(part, **_fields_of(part, {
+                "color": rgba[:3], "opacity": 1.,
+                "metallic": PASTE_METALLIC if realistic else None,
+                "roughness": PASTE_ROUGHNESS if realistic else None})))
         elif part.kind in STACKUP_KINDS:
             context = None
             if part.kind == "silk":

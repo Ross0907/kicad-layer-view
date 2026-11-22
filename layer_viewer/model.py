@@ -50,6 +50,7 @@ class DielectricLayer:
     below_layer: int = -1   # copper layer id directly below
     z_bottom_mm: float = 0.0
     color: object = ""     # KiCad color name/#RRGGBBAA, or live IPC RGBA tuple
+    layer_type: str = ""   # KiCad's (type "core"|"prepreg"); "" when unknown
 
 
 # KiCad 3D viewer constants (3d-viewer/3d_canvas/board_adapter.cpp).
@@ -421,6 +422,24 @@ def saved_color_names(expression):
     return colors
 
 
+def dielectric_type(values):
+    """``"core"`` or ``"prepreg"`` from saved stackup layer values, else ""."""
+    kind = str(values.get("type", "") or "").strip().lower()
+    return kind if kind in ("core", "prepreg") else ""
+
+
+def saved_dielectric_types(expression):
+    """Core/prepreg type per saved dielectric (``"dielectric 1"`` ...)."""
+    types = {}
+    for node in (expression or [])[1:]:
+        if (isinstance(node, list) and len(node) > 1 and node[0] == "layer"
+                and str(node[1]).startswith("dielectric ")):
+            kind = dielectric_type(stackup_layer_values(node))
+            if kind:
+                types[str(node[1])] = kind
+    return types
+
+
 def saved_mask_thickness(expression):
     """Per-side solder-mask item thickness from a saved stackup, in mm."""
     result = {}
@@ -475,7 +494,8 @@ def demo_snapshot() -> BoardSnapshot:
         else:
             i = index // 2
             dielectrics.append(DielectricLayer(thickness, "FR4 core" if i == 1 else "Prepreg",
-                                              4.3, ids[i], ids[i + 1], z))
+                                              4.3, ids[i], ids[i + 1], z,
+                                              layer_type="core" if i == 1 else "prepreg"))
     def rectangle(x0, y0, x1, y1):
         return Poly([(x0,y0), (x1,y0), (x1,y1), (x0,y1)])
     board = rectangle(0, 0, 56, 36)

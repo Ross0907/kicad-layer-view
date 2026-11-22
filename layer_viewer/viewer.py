@@ -106,6 +106,54 @@ def metal_phong(rgb, roughness=.25):
     return .2, .9, tuple(.25 + .6 * v for v in color), power
 
 
+# Realistic inner foil: diffuse weight and a broad warm copper sheen.
+FOIL_DIFFUSE = .75
+FOIL_SHEEN_COLOR = (1., .82, .70)
+FOIL_SHEEN_POWER = 5.
+FOIL_SHEEN = .6
+# Realistic laminate resin gloss (white specular weight).
+LAMINATE_GLOSS = .35
+
+
+def resist_sheen(roughness, rgb=None):
+    """Neutral specular weight of a realistic resist: glossier is stronger.
+
+    A resist with a reduced ray-traced specular (matte black) gets a fainter
+    sheen too, so the headlight does not wash it out to grey from above.
+    """
+    roughness = min(1., max(0., float(roughness)))
+    sheen = .015 + .06 * (1. - roughness)
+    if rgb is not None:
+        from .finishes import resist_specular
+        specular = resist_specular(rgb)
+        if specular is not None:
+            sheen *= (specular / .5) ** .5
+    return sheen
+
+
+def resist_sheen_power(roughness):
+    """Highlight sharpness from roughness: 2/r^2 - 2, kept within [4, 64]."""
+    roughness = max(.05, float(roughness))
+    return max(4., min(64., 2. / (roughness * roughness) - 2.))
+
+
+# Exploded laminate translucency ramps in between these gaps (mm); fully
+# assembled boards are always exactly opaque.
+TRANSLUCENT_GAP_START_MM = .1
+TRANSLUCENT_GAP_RAMP_MM = .4
+
+
+def exploded_opacity(opacity, exploded, gap_mm):
+    """Opacity of a slab at ``gap_mm``: ``opacity`` assembled, ramping smoothly
+    (smoothstep) to ``exploded`` once the layers are apart. ``exploded`` None
+    keeps ``opacity`` at every gap."""
+    if exploded is None:
+        return opacity
+    t = min(1., max(0., (float(gap_mm) - TRANSLUCENT_GAP_START_MM) / TRANSLUCENT_GAP_RAMP_MM))
+    t = t * t * (3. - 2. * t)
+    return opacity + (min(opacity, float(exploded)) - opacity) * t
+
+
 def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None):
     """Set a VTK property to KiCad's material for ``kind`` in color ``rgb``.
 
@@ -114,10 +162,48 @@ def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None
     swaps only the diffuse color and keeps the finish-derived highlights.
     """
     terms_rgb = base_rgb if base_rgb is not None and kind in ("copper", "barrel", "via_patch") else rgb
-    from .finishes import is_realistic_metal
+    from .finishes import is_bare_foil, is_realistic_metal
     if prop.GetInterpolation() == 3:  # older sessions/actors used PBR metal
         prop.SetInterpolationToPhong()
         prop.SetMetallic(0.)
+    color = tuple(float(v) for v in rgb[:3])
+    if kind == "copper" and is_bare_foil(rgb):
+        # Realistic inner foil: rolled copper with a broad satin sheen. Checked
+        # before the plated-metal terms, whose tight highlight left large flat
+        # exploded foils a dull orange from almost every angle.
+        prop.SetAmbient(.2)
+        prop.SetAmbientColor(*color)
+        prop.SetDiffuse(FOIL_DIFFUSE)
+        prop.SetDiffuseColor(*color)
+        prop.SetSpecular(FOIL_SHEEN)
+        prop.SetSpecularColor(*FOIL_SHEEN_COLOR)
+        prop.SetSpecularPower(FOIL_SHEEN_POWER)
+        return
+    if kind == "dielectric" and roughness is not None:
+        # Realistic laminate: the glossy resin surface of glass-epoxy.
+        prop.SetAmbient(.25)
+        prop.SetAmbientColor(*color)
+        prop.SetDiffuse(.85)
+        prop.SetDiffuseColor(*color)
+        prop.SetSpecular(LAMINATE_GLOSS)
+        prop.SetSpecularColor(1., 1., 1.)
+        prop.SetSpecularPower(40.)
+        return
+    if kind == "mask" and roughness is not None:
+        # Realistic resist (only it carries a roughness): a neutral dielectric
+        # sheen whose spread follows the resist's roughness, so matte black
+        # shows a soft, faint sheen and glossy resists a tighter highlight.
+        # KiCad's own rgb^2 specular at power 128 left black resist without
+        # any highlight at all.
+        ambient, _, _ = kicad_material(kind, rgb)
+        prop.SetAmbient(KICAD_AMBIENT)
+        prop.SetAmbientColor(*ambient)
+        prop.SetDiffuse(1.)
+        prop.SetDiffuseColor(*color)
+        prop.SetSpecular(1.)
+        prop.SetSpecularColor(*(resist_sheen(roughness, rgb),) * 3)
+        prop.SetSpecularPower(resist_sheen_power(roughness))
+        return
     if (kind in ("copper", "barrel", "via_patch") and is_realistic_metal(rgb)) or (
             kind == "component" and metallic is not None and metallic >= .5):
         # Realistic plated finishes and metal model parts: Phong metal lit by
@@ -196,6 +282,16 @@ def _remember_coat(actor, key, mesh):
         pass
 
 
+def _opacity_state(view):
+    """(opacity per key before the exploded ramp, keys the user set explicitly)."""
+    base = getattr(view, "_opacity_base", None)
+    override = getattr(view, "_opacity_override", None)
+    if base is None or override is None:
+        base, override = {}, set()
+        view._opacity_base, view._opacity_override = base, override
+    return base, override
+
+
 class BoardViewport(QWidget):
     picked = Signal(str)
     scene_changed = Signal()
@@ -250,6 +346,9 @@ class BoardViewport(QWidget):
         self.actors = {}
         self.parts = {}
         self.planes = {}
+        # Layer opacity as set by the material or the user (before the
+        # exploded-laminate ramp), and the keys the user explicitly set.
+        _opacity_state(self)
         self.gap_mm = 0.0
         self.auto_frame = True
         self.antialiasing = "fxaa_hq"
@@ -340,11 +439,18 @@ class BoardViewport(QWidget):
                 self.plotter.remove_actor(self.actors.pop(key), reset_camera=False, render=False)
                 self.parts.pop(key, None)
                 self.planes.pop(key, None)
+                _opacity_state(self)[0].pop(key, None)
+                _opacity_state(self)[1].discard(key)
         self.copper_count = len(snapshot.stackup.copper)
         for part in incoming.values():
             if part.key in self.actors:
-                if self.parts[part.key].mesh is not part.mesh:
+                previous = self.parts[part.key]
+                if previous.mesh is not part.mesh:
                     self.actors[part.key].mapper.dataset = part.mesh
+                if (part.key not in _opacity_state(self)[1]
+                        and getattr(previous, "opacity", None) != getattr(part, "opacity", None)):
+                    # A live material edit: the new stackup alpha applies.
+                    _opacity_state(self)[0].pop(part.key, None)
                 self.parts[part.key] = part
                 if part.kind in ("copper", "mask"):
                     BoardViewport._apply_coated_copper(self.actors[part.key], part)
@@ -396,6 +502,9 @@ class BoardViewport(QWidget):
                                            self.gap_mm, self.extend_connections)
             actor.SetScale(1, 1, scale)
             actor.SetPosition(0, 0, offset)
+            if self.parts[key].kind == "dielectric":
+                # Before update_clip, which culls by opacity.
+                actor.GetProperty().SetOpacity(BoardViewport.effective_opacity(self, key))
         self.update_clip()
         if reframe and getattr(self, "auto_frame", False) and self.actors:
             # Fit the full moved stack, not just the old assembled camera range.
@@ -405,11 +514,25 @@ class BoardViewport(QWidget):
         self.request_render()
         self.scene_changed.emit()
 
+    def effective_opacity(self, key):
+        """Shown opacity of a layer: the material or user value, except that a
+        realistic laminate slab without a user override turns translucent as
+        the layers separate (exactly its own opacity when assembled)."""
+        part = self.parts[key]
+        base = _opacity_state(self)[0].get(key, getattr(part, "opacity", 1.))
+        if key in _opacity_state(self)[1]:
+            return base
+        return exploded_opacity(base, getattr(part, "exploded_opacity", None), self.gap_mm)
+
     def set_extended_connections(self, enabled):
         self.extend_connections = bool(enabled)
         self.set_gap(self.gap_mm)
 
-    def set_part(self, key, *, visible=None, editor=None, color=None, opacity=None, render=True):
+    def set_part(self, key, *, visible=None, editor=None, color=None, opacity=None, override=False,
+                 render=True):
+        """Update one layer's actor. ``override`` marks ``opacity`` as the
+        user's explicit choice (the opacity cell or the X-ray preset), which
+        always wins over the automatic exploded-laminate translucency."""
         actor = self.actors.get(key)
         if actor is None:
             return
@@ -424,7 +547,12 @@ class BoardViewport(QWidget):
             apply_material(actor.GetProperty(), part.kind, color, base_rgb=part.color,
                            metallic=getattr(part, "metallic", None), roughness=getattr(part, "roughness", None))
         if opacity is not None:
-            actor.GetProperty().SetOpacity(opacity)
+            _opacity_state(self)[0][key] = float(opacity)
+            if override:
+                _opacity_state(self)[1].add(key)
+            else:
+                _opacity_state(self)[1].discard(key)
+            actor.GetProperty().SetOpacity(BoardViewport.effective_opacity(self, key))
         strong = getattr(self, "show_via_patches", False)
         if part.kind == "mask":
             self._apply_coated_copper(actor, part, strong_caps=strong)

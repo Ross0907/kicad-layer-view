@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Realistic style follows photographed boards: matte black resist reads deep
+  black in the ray tracer (it was a washed-out grey) and the viewport, ENIG
+  pads are a clearer yellow gold, the legend a slightly warm white, HASL a
+  duller tin, and unreflowed paste rough and barely metallic.
+- Exploded views: inner copper foils are real copper metal instead of matte
+  orange, and each dielectric slab shows its own laminate from the stackup
+  material and core/prepreg type (FR4, high-Tg, polyimide, PTFE, Rogers),
+  exactly opaque when assembled and translucent once exploded. An opacity
+  you set, or the X-ray preset, always wins.
 - Solder paste is shown by default.
 - Live ray tracing is smoother on large boards (10-layer board: 3–13 fps
   while orbiting → 24–26 fps, first moving frame 0.7 s → 0.1 s): sensors and

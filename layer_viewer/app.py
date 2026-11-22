@@ -810,7 +810,12 @@ class MainWindow(QMainWindow):
                 lambda value, key=part.key: self._set_layer_opacity(key, value))
             self.table.setCellWidget(row, 3, opacity)
             self.rows[part.key] = (visible, color, opacity)
-            self.viewport.set_part(part.key, color=color.rgb(), opacity=opacity.value(), render=False)
+            exploded = getattr(part, "exploded_opacity", None)
+            if exploded is not None:
+                opacity.setToolTip(f"Opaque when assembled; fades to {exploded:.2f} as the layers "
+                                   "are exploded, like real laminate. Enter a value to fix it.")
+            self.viewport.set_part(part.key, color=color.rgb(), opacity=opacity.value(),
+                                   override=part.key in self._opacity_overrides, render=False)
         self.filter_layers(self.layer_search.text())
         if selected in self._row_keys:
             self.table.selectRow(self._row_keys.index(selected))
@@ -937,7 +942,8 @@ class MainWindow(QMainWindow):
                 self._opacity_overrides[key] = value
             opacity.setValue(value)
             opacity.blockSignals(False)
-            self.viewport.set_part(key, color=color.rgb(), opacity=value, render=False)
+            self.viewport.set_part(key, color=color.rgb(), opacity=value,
+                                   override=key in self._opacity_overrides, render=False)
         self.apply_visibility()
 
     def _layer_opacity(self, part):
@@ -948,7 +954,7 @@ class MainWindow(QMainWindow):
 
     def _set_layer_opacity(self, key, value):
         self._opacity_overrides[key] = value
-        self.viewport.set_part(key, opacity=value)
+        self.viewport.set_part(key, opacity=value, override=True)
 
     @property
     def mask_opacity(self):
@@ -967,7 +973,7 @@ class MainWindow(QMainWindow):
                 opacity.blockSignals(True)
                 opacity.setValue(value)
                 opacity.blockSignals(False)
-                self.viewport.set_part(key, opacity=value, render=False)
+                self.viewport.set_part(key, opacity=value, override=True, render=False)
         self.viewport.refresh()
 
     def show_render_settings(self):

@@ -18,7 +18,7 @@ from typing import Dict, Iterable, List, Optional
 from .model import (
     BoardSnapshot, CopperLayer, DielectricLayer, Footprint, Model3D, Net, Pad, Poly, Stackup,
     Track, Via, Zone, MIN_LAYER_THICKNESS_MM, default_stackup_thicknesses, read_board_stackup,
-    read_board_surface_finish, saved_color_names,
+    read_board_surface_finish, saved_color_names, saved_dielectric_types,
 )
 from contextlib import contextmanager
 
@@ -289,20 +289,35 @@ def _surface_finish(board_stackup, board) -> str:
         return ""
 
 
-def _saved_color_names(board):
+def _saved_stackup(board):
+    """The saved board's stackup expression, or None."""
     try:
         filename = board.document.board_filename
         if not filename:
-            return {}
+            return None
         path = Path(filename)
         if not path.is_absolute():
             project = getattr(getattr(board.document, "project", None), "path", "")
             if not project:
-                return {}
+                return None
             path = Path(project) / path
-        return saved_color_names(read_board_stackup(path))
+        return read_board_stackup(path)
     except (AttributeError, OSError, ValueError):
-        return {}
+        return None
+
+
+def _live_dielectric_type(dielectric, saved=""):
+    """Core/prepreg from IPC (KiCad 10.0.6+), else the saved board's type."""
+    from kipy.proto.board import board_pb2
+    try:
+        kind = dielectric.type
+        if kind == board_pb2.BoardStackupDielectricType.BSDT_CORE:
+            return "core"
+        if kind == board_pb2.BoardStackupDielectricType.BSDT_PREPREG:
+            return "prepreg"
+    except (AttributeError, ValueError):
+        pass  # older kipy/KiCad: no dielectric type over IPC
+    return saved
 
 
 # wx parses KiCad's simple palette names into these RGB values; IPC then
@@ -387,13 +402,16 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
     cu_ids = _copper_layer_ids(board, stackup_layers, progress)
     names = _layer_names(board, cu_ids, stackup_layers)
 
-    saved_colors = _saved_color_names(board)
+    saved_stackup = _saved_stackup(board)
+    saved_colors = saved_color_names(saved_stackup)
+    saved_types = saved_dielectric_types(saved_stackup)
     technical_names = {BoardLayer.BL_F_Mask: "F.Mask", BoardLayer.BL_B_Mask: "B.Mask",
                        BoardLayer.BL_F_SilkS: "F.SilkS", BoardLayer.BL_B_SilkS: "B.SilkS"}
     colors = {}
     mask_thickness = {}
     dielectric_index = 0
-    entries = []  # (kind, layer_id, thickness_mm, material, epsilon_r, color), top to bottom
+    # (kind, layer_id, thickness_mm, material, epsilon_r, color, core/prepreg), top to bottom
+    entries = []
     try:
         for sl in stackup_layers:
             if not sl.enabled:
@@ -407,7 +425,7 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
                     mask_thickness[name] = _mm(sl.thickness)
             if sl.type == board_pb2.BoardStackupLayerType.BSLT_COPPER and sl.layer in names:
                 # KiCad clamps copper to 1 um to avoid degenerate solids.
-                entries.append(("cu", sl.layer, max(_mm(sl.thickness), MIN_LAYER_THICKNESS_MM), "", 0.0, ""))
+                entries.append(("cu", sl.layer, max(_mm(sl.thickness), MIN_LAYER_THICKNESS_MM), "", 0.0, "", ""))
             elif sl.type == board_pb2.BoardStackupLayerType.BSLT_DIELECTRIC:
                 diel = sl.dielectric
                 subs = diel.layers if diel is not None else []
@@ -418,7 +436,8 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
                 name = f"dielectric {dielectric_index}"
                 color = _live_stackup_color(sl, saved_colors.get(name, ""), kind="dielectric",
                                            progress=progress, layer_name=name)
-                entries.append(("diel", -1, t, mat, er, color))
+                entries.append(("diel", -1, t, mat, er, color,
+                                _live_dielectric_type(diel, saved_types.get(name, ""))))
     except Exception as e:  # noqa: BLE001 - stackup is optional; fall back below
         progress.warn(f"Could not read board stackup layers ({e}); using defaults")
         entries = []
@@ -434,9 +453,9 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
         cu_t, diel_t, mask_t = default_stackup_thicknesses(DEFAULT_BOARD_THICKNESS_MM, n, 2)
         mask_thickness = {"F.Mask": mask_t, "B.Mask": mask_t}
         for i, lid in enumerate(cu_ids):
-            entries.append(("cu", lid, cu_t, "", 0.0, ""))
+            entries.append(("cu", lid, cu_t, "", 0.0, "", ""))
             if i < n - 1:
-                entries.append(("diel", -1, diel_t, "FR4", 4.5, ""))
+                entries.append(("diel", -1, diel_t, "FR4", 4.5, "", ""))
 
     total = sum(e[2] for e in entries)
     z = total
@@ -444,7 +463,7 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
     dielectrics: List[DielectricLayer] = []
     last_cu = -1
     pending_diel: List[DielectricLayer] = []
-    for kind, lid, t, mat, er, color in entries:
+    for kind, lid, t, mat, er, color, layer_type in entries:
         z -= t
         if kind == "cu":
             copper.append(CopperLayer(id=lid, name=names.get(lid, str(lid)), index=len(copper),
@@ -455,7 +474,7 @@ def extract_stackup(board, progress: ProgressReporter = NULL, *, metadata=None) 
             last_cu = lid
         else:
             d = DielectricLayer(thickness_mm=t, material=mat, epsilon_r=er, above_layer=last_cu,
-                                z_bottom_mm=z, color=color)
+                                z_bottom_mm=z, color=color, layer_type=layer_type)
             dielectrics.append(d)
             pending_diel.append(d)
 

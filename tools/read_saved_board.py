@@ -101,7 +101,7 @@ def _stackup(board, path, layers, names, warnings):
     stackup gets KiCad's BuildDefaultStackupList stackup (35 um copper, 10 um
     masks, "Not specified" colors), not an approximation.
     """
-    from layer_viewer.model import (default_stackup_thicknesses, saved_color_names,
+    from layer_viewer.model import (default_stackup_thicknesses, dielectric_type, saved_color_names,
                                     saved_mask_thickness, stackup_layer_values,
                                     MIN_LAYER_THICKNESS_MM)
     expression = _stackup_expression(path)
@@ -156,7 +156,8 @@ def _stackup(board, path, layers, names, warnings):
             dielectric.append(DielectricLayer(thickness, values.get("material", ""),
                                                float(values.get("epsilon_r", 0)),
                                                ordered_ids[index-1], ordered_ids[index], z,
-                                               material_colors.get(name, "")))
+                                               material_colors.get(name, ""),
+                                               layer_type=dielectric_type(values)))
     colors = {name: value for name, value in material_colors.items()
               if name in ("F.Mask", "B.Mask", "F.SilkS", "B.SilkS")}
     return Stackup(copper, dielectric, total, from_board=explicit, colors=colors,

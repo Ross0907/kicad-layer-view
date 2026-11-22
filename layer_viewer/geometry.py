@@ -158,6 +158,9 @@ class ScenePart:
     led: bool = False
     # Components: (side, mounting, dnp, exclude_from_pos) for KiCad's filters.
     model_class: Tuple = ()
+    # Realistic dielectric slabs: opacity once fully exploded (None: always
+    # ``opacity``). The viewport ramps to it as the layers separate.
+    exploded_opacity: Optional[float] = None
 
 
 @dataclass
