@@ -11,7 +11,7 @@ import pytest
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import QApplication, QColorDialog
 
-from layer_viewer.app import MainWindow
+from layer_viewer.app import MainWindow, show_in_background
 from layer_viewer.geometry import build_scene
 from layer_viewer.model import demo_snapshot
 
@@ -32,7 +32,7 @@ def demo_scene():
 @pytest.fixture
 def window(qt_application, demo_scene):
     ui = MainWindow(gap=3.)
-    ui.show()
+    show_in_background(ui)  # never cover the user's windows while testing
     qt_application.processEvents()
     ui.viewport.plotter.ren_win.SetSize(1000, 800)
     ui.loaded(*demo_scene)
@@ -411,7 +411,7 @@ def test_close_cancels_all_workers_together_including_png_export(window, monkeyp
     window._component_worker = Detail(1)
     window._detail_worker = Detail(2)
     window.render_dialog = RenderDialog(window)
-    window.render_dialog.show()
+    show_in_background(window.render_dialog)
     window.render_dialog.worker = RayWorker(SimpleNamespace(), 'unused.png', 16, 16, 1, window)
     tasks.extend([window.worker, window._component_worker, window._detail_worker,
                   window.render_dialog.worker])

@@ -50,6 +50,17 @@ QToolTip { background: #e2edf4; color: #172432; border: 0; }
 """
 
 
+
+def show_in_background(widget):
+    """Show a window for automation without taking focus or covering others.
+
+    Rendering, screenshots and tests need a real window, but it must not
+    jump in front of whatever the user is working in.
+    """
+    widget.setAttribute(Qt.WA_ShowWithoutActivating, True)
+    widget.show()
+    widget.lower()
+
 class LayerColorControl(QWidget):
     changed = Signal(object)
 

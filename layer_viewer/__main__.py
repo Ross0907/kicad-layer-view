@@ -126,7 +126,11 @@ def main(plugin=False):
     if args.render:
         window.scene_ready.connect(lambda: QTimer.singleShot(800, render))
         window.load_failed.connect(fail)
-    window.show()
+        # Automated renders draw a real window, but behind the user's windows.
+        from .app import show_in_background
+        show_in_background(window)
+    else:
+        window.show()
     source = "demo" if args.demo else "snapshot" if args.snapshot else "board" if args.board else "ipc"
     QTimer.singleShot(100, lambda: window.load(source, args.snapshot or args.board))
     result = app.exec()
