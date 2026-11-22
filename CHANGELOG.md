@@ -9,6 +9,17 @@
   GPU kernels, the display is packed to 8-bit on the GPU, LED bloom stays on
   the GPU, and the hidden OpenGL view behind the ray-traced image skips depth
   peeling and FXAA. Captures read triangles without copying them twice.
+- Live ray tracing in the default parallel (orthographic) view is now as
+  fast as perspective (Pynq board with parts: orbiting 1–4 fps → 50–60 fps,
+  finished 64-sample image after a drag not reached in 4 s → 0.4 s; 10-layer
+  board: 1 fps → 60 fps). Parallel views are traced through a 0.25° perspective
+  stand-in that replays recorded GPU kernels; it differs from the exact view
+  by less than the sampling noise, and PNG export still uses the exact
+  orthographic camera. The motion resolution is held for a whole drag, the
+  next drag's resolution is prepared while the view rests (no multi-second
+  stall at the start of the first drag), the hidden OpenGL board is no longer
+  redrawn under the ray-traced image, and refinement redisplays only at a few
+  milestones.
 - Viewport: showing a board is about twice as fast (set_scene 1.1 s → 0.6 s),
   and layer, preset, solo and opacity changes no longer re-upload unchanged
   copper and resist colors (12 layers: 60–100 ms → under 20 ms), and component
