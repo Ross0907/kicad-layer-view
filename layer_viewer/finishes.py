@@ -161,6 +161,25 @@ _REAL_SILK = {NOT_SPECIFIED: (0xe6, 0xe6, 0xde), "White": (0xe6, 0xe6, 0xde), "B
 # Natural FR4 is a pale, slightly green tan at a routed edge.
 REAL_FR4 = ((178, 168, 112), 1.)
 _REAL_BOARD = {"FR4 natural": REAL_FR4, "FR4 natural, dark": ((116, 100, 58), 1.)}
+# Realistic laminate per stackup material name: (substrings, sRGB color, light
+# attenuation length in mm, ray roughness). A slab of thickness t seen exploded
+# blocks 1 - exp(-t / length) of the light (Beer-Lambert); "None" stays opaque
+# (metal core). Glass-epoxy is a pale translucent straw; high-Tg epoxies are a
+# deeper amber; polyimide is amber-orange; PTFE is milky white; Rogers RO4000
+# hydrocarbon-ceramic is an opaque-looking cream. First match wins.
+_LAMINATES = (
+    (("alumin", "metal core"), (213, 213, 213), None, .35),
+    (("polyimide", "kapton"), (214, 140, 40), .5, .2),
+    (("ptfe", "teflon", "rt/duroid", "rt5880", "rt6002", "taconic"), (238, 234, 222), .15, .35),
+    (("ro4", "ro3", "rogers"), (224, 212, 178), .10, .3),
+    (("s1000", "s1141", "370hr", "it-180", "it180", "high tg", "high-tg", "hi-tg", "tu-8", "fr408",
+      "isola", "185hr", "pcl370"), (196, 172, 100), .25, .25),
+    (("",), (201, 194, 138), .25, .25),  # FR4 and anything unrecognized
+)
+# Prepreg is resin-rich (thinner glass), so it passes more light than a core.
+PREPREG_LENGTH_FACTOR = 1.3
+# Exploded slabs never fade below this: thin prepreg plies stay legible.
+EXPLODED_OPACITY_FLOOR = .45
 
 # Every color this module can assign to a conductor, for legacy-cache checks.
 _PRESETS = (COPPER_COLOR, ENIG_COLOR, SILVER_COLOR, TIN_COLOR, DEFAULT_FINISH_COLOR,
@@ -274,6 +293,33 @@ def board_body_color(dielectric_colors, style=None):
     return tuple(body)
 
 
+def dielectric_appearance(layer, style=None):
+    """Realistic look of one dielectric slab from its stackup material, or None.
+
+    Returns ``(rgb, exploded_opacity, roughness)``. None in the KiCad style and
+    for a slab with an explicit stackup color, which keeps KiCad's rules.
+    Assembled, every slab is opaque; ``exploded_opacity`` is how translucent a
+    separated slab of glass-epoxy of this thickness and type looks (None: it
+    stays opaque).
+    """
+    if _style(style) != "realistic":
+        return None
+    color = getattr(layer, "color", "")
+    if isinstance(color, (list, tuple)) or str(color or NOT_SPECIFIED) != NOT_SPECIFIED:
+        return None
+    material = str(getattr(layer, "material", "") or "").lower()
+    for names, rgb, length, roughness in _LAMINATES:
+        if any(name in material for name in names):
+            break
+    if length is not None and str(getattr(layer, "layer_type", "") or "").lower() == "prepreg":
+        length *= PREPREG_LENGTH_FACTOR
+    exploded = None
+    if length is not None:
+        thickness = max(0., float(getattr(layer, "thickness_mm", 0.) or 0.))
+        exploded = min(1., max(EXPLODED_OPACITY_FLOOR, 1. - math.exp(-thickness / length)))
+    return _rgb(*rgb), exploded, roughness
+
+
 def finish_appearance(name, style=None):
     """(display color, ray roughness) for a stackup copper finish, as KiCad maps it.
 
@@ -349,6 +395,15 @@ def ray_metal_color(rgb):
     return tuple(rgb)
 
 
+def _dielectric_for(part, dielectrics):
+    """The stackup dielectric a ``dielectric:<index>`` slab was built from."""
+    try:
+        index = int(str(part.key).rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    return dielectrics[index] if 0 <= index < len(dielectrics) else None
+
+
 def _fields_of(part, changes):
     """Only the changes ``part`` has fields for (minimal part records)."""
     return {name: value for name, value in changes.items() if name in ("color", "opacity") or hasattr(part, name)}
@@ -359,9 +414,12 @@ def apply_surface_finish(scene, snapshot, style=None):
 
     Conductors (foils, barrels, cap patches) use the board finish. In the
     realistic style inner foils are bare copper metal (only exposed outer
-    copper is plated). Every dielectric slab shows KiCad's blended board-body
-    color. UI custom/editor colors live on actors and remain separate. Part
-    records are replaced so an earlier scene stays immutable.
+    copper is plated), and each dielectric slab shows its own laminate
+    (``dielectric_appearance``), opaque when assembled and translucent once
+    exploded. A slab with an explicit stackup color, and every slab in the
+    KiCad style, shows KiCad's blended board-body color. UI custom/editor
+    colors live on actors and remain separate. Part records are replaced so
+    an earlier scene stays immutable.
     """
     style = _style(style)
     plated_color, plated_roughness = finish_appearance(getattr(snapshot, "surface_finish", ""), style)
@@ -372,12 +430,20 @@ def apply_surface_finish(scene, snapshot, style=None):
     copper_ids = [layer.id for layer in getattr(stackup, "copper", ())]
     outer_ids = {copper_ids[0], copper_ids[-1]} if copper_ids else set()
     inner_bare = style == "realistic"
+    dielectrics = list(getattr(stackup, "dielectrics", ()))
     parts = []
     for part in scene.parts:
         if part.kind == "copper" and inner_bare and outer_ids and part.layer_id not in outer_ids:
             parts.append(replace(part, color=BARE_FOIL_COLOR, metallic=1., roughness=BARE_FOIL_ROUGHNESS))
         elif part.kind == "dielectric":
-            parts.append(replace(part, color=body[:3], opacity=body[3]))
+            layer = _dielectric_for(part, dielectrics)
+            look = dielectric_appearance(layer, style) if layer is not None else None
+            if look is None:
+                changes = {"color": body[:3], "opacity": body[3], "roughness": None, "exploded_opacity": None}
+            else:
+                rgb, exploded, roughness = look
+                changes = {"color": rgb, "opacity": 1., "roughness": roughness, "exploded_opacity": exploded}
+            parts.append(replace(part, **_fields_of(part, changes)))
         elif part.kind == "paste":
             rgba = material_appearance("paste", "", style)
             realistic = style == "realistic"

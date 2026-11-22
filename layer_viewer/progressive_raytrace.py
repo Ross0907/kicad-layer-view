@@ -106,6 +106,8 @@ def display_radiance(pixels, exposure_ev=0.):
 
 def _material(mesh, *, coated=False, capped=False):
     rgb = {"type": "rgb", "value": _linear(mesh.color).tolist()}
+    # Realistic dielectric slabs carry a roughness; KiCad-style ones do not.
+    laminate = mesh.kind == "dielectric" and getattr(mesh, "roughness", None) is not None
     if mesh.kind in ("copper", "barrel", "via_patch"):
         from .finishes import covered_copper_color, ray_metal_color
         # KiCad finish swatches are display colors; trace measured metal F0.
@@ -176,6 +178,10 @@ def _material(mesh, *, coated=False, capped=False):
         # Printed ink has its own matte finish; do not inherit copper metal or
         # the translucent solder resist's optical coating.
         opaque = {"type": "diffuse", "reflectance": rgb}
+    elif laminate:
+        # Realistic glass-epoxy (or other laminate): a resin-glossy surface.
+        opaque = {"type": "roughplastic", "diffuse_reflectance": rgb,
+                  "alpha": float(mesh.roughness), "int_ior": 1.55}
     else:
         opaque = {"type": "roughplastic", "diffuse_reflectance": rgb,
                   "alpha": .38,
@@ -187,7 +193,17 @@ def _material(mesh, *, coated=False, capped=False):
     opacity = mesh.opacity
     transmission_weight = 1 - max(0., opacity)
     transmission = {"type": "null"}
-    if mesh.kind == "mask":
+    if laminate:
+        # An exploded laminate slab keeps both faces, and light crosses both:
+        # each face blocks 1 - sqrt(1 - opacity) so the slab blocks
+        # ``opacity`` in all. Light through it takes the laminate's own tint
+        # (half per face), like real translucent glass-epoxy.
+        transmission_weight = float(np.sqrt(max(0., 1. - opacity)))
+        tint = np.asarray(_linear(mesh.color), dtype=float)
+        tint = np.clip(tint / max(1e-3, float(tint.max())), .05, 1.) ** .5
+        transmission = {"type": "thindielectric", "int_ior": 1., "ext_ior": 1.,
+                        "specular_transmittance": {"type": "rgb", "value": tint.tolist()}}
+    elif mesh.kind == "mask":
         # Approximate pigment absorption in a thin resist coating. Neutral
         # transmission exposed orange copper through green resist, producing a
         # brown board. Equal IORs make this a straight-through color filter;
