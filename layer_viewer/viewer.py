@@ -45,7 +45,7 @@ ANTIALIASING_MODES = ("fxaa_hq", "fxaa", "ssaa", "none")
 # Largest scene that may be supersampled; beyond this, FXAA is used instead.
 SSAA_MAX_TRIANGLES = 3_000_000
 # Render interval (ms) while the live ray-traced image covers the board.
-COVERED_RENDER_MS = 33
+COVERED_RENDER_MS = 100
 BACKGROUNDS = {
     # KiCad 3D viewer default gradient (board_adapter.cpp g_DefaultBackground*).
     "kicad": ((.40, .40, .50), (.80, .80, .90)),

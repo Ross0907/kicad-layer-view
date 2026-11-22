@@ -31,6 +31,8 @@ MOTION_SAMPLES = 1
 MOTION_WARMUP_FRAMES = 2
 MOTION_MIN_STEADY = 3
 MOTION_HISTORY = 24
+# Largest traced film (pixels); bigger windows are upscaled from this size.
+MAX_TRACE_PIXELS = 1_600_000
 # Refinement at full resolution starts once the view has rested this long.
 STILL_DELAY_MS = 140
 # Refinement redisplays (tone map, guided denoise, readback) at these sample
@@ -426,14 +428,30 @@ class LiveRayController(QObject):
                 corner.SetBackground(*mix(span[1]))
                 corner.SetBackground2(*mix(span[3]))
             renderer.DrawOff()
+            # A mouse drag makes VTK's interactor style render the whole window
+            # on every move event, bypassing the viewport's capped redraw
+            # timer. At a large window each such render holds the GIL for
+            # ~14 ms and starves the ray-trace worker (5 fps while dragging).
+            # Only the capped timer draws the axis widget while covered.
+            iren = getattr(getattr(self.viewport, "plotter", None), "iren", None)
+            interactor = getattr(iren, "interactor", iren)
+            if interactor is not None and hasattr(interactor, "EnableRenderOff"):
+                saved_interactor = bool(interactor.GetEnableRender())
+                interactor.EnableRenderOff()
+                self._interactor_render = (interactor, saved_interactor)
         except Exception:  # noqa: BLE001 - an optimization only
             log.debug("Could not stop hidden OpenGL drawing", exc_info=True)
             self._restore_board_drawing(renderer, (corner, saved_corner))
             return None
         return corner, saved_corner
 
-    @staticmethod
-    def _restore_board_drawing(renderer, drawing):
+    def _restore_board_drawing(self, renderer, drawing):
+        saved = getattr(self, "_interactor_render", None)
+        if saved is not None:
+            self._interactor_render = None
+            interactor, enabled = saved
+            if enabled:
+                interactor.EnableRenderOn()
         if drawing is None:
             return
         corner, saved_corner = drawing
@@ -533,8 +551,7 @@ class LiveRayController(QObject):
             if not motion:
                 # The drag has ended: only now may the motion size change.
                 self._adapt_motion_scale()
-            size = (self._motion_size() if motion else
-                    tuple(max(1, int(v)) for v in self.viewport.plotter.window_size))
+            size = self._motion_size() if motion else self._trace_size()
             self.worker.submit(self._revision, capture, camera, size,
                                MOTION_SAMPLES if motion else self.samples, self.denoise,
                                self.exposure_ev, self.denoise_strength,
@@ -602,8 +619,21 @@ class LiveRayController(QObject):
                          f"{info['samples']}/{info['target']} samples{quality} · "
                          f"{info['seconds']*1000:.0f} ms/frame")
 
+    def _trace_size(self):
+        """Traced film size: the window, capped at MAX_TRACE_PIXELS.
+
+        A maximized window on a high-DPI laptop screen is ~3 Mpx. Tracing
+        every physical pixel kept full-size sample sums, guide images and
+        OptiX denoiser scratch per cached size, filling an 8 GB GPU so Windows
+        paged video memory and frames took seconds. The finished image is
+        filtered up to the window, which on a scaled display is invisible.
+        """
+        width, height = (max(1, int(v)) for v in self.viewport.plotter.window_size)
+        factor = min(1., math.sqrt(MAX_TRACE_PIXELS / float(width * height)))
+        return max(16, int(round(width * factor))), max(16, int(round(height * factor)))
+
     def _motion_size(self, scale=None):
-        size = tuple(max(1, int(v)) for v in self.viewport.plotter.window_size)
+        size = self._trace_size()
         scale = self.motion_scale if scale is None else scale
         return tuple(max(16, int(round(v * scale))) for v in size)
 

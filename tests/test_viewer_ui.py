@@ -565,6 +565,9 @@ def test_live_ray_overlay_stops_board_drawing_and_restores_it_at_once(window):
                     {"motion": False, "samples": 1, "target": 64, "backend": "test",
                      "seconds": .01, "denoised": False})
         assert live.covering and not renderer.GetDraw() and corner.GetDraw()
+        # Mouse drags must not render the whole window per move event.
+        interactor = getattr(viewport.plotter.iren, "interactor", viewport.plotter.iren)
+        assert not interactor.GetEnableRender()
         # Camera moves still render the axis widget, at a capped rate.
         viewport.render_timer.stop()
         viewport.request_render()
@@ -575,4 +578,22 @@ def test_live_ray_overlay_stops_board_drawing_and_restores_it_at_once(window):
         live.set_enabled(False)
     # Turning ray tracing off draws the board again on the next event-loop pass.
     assert not live.covering and renderer.GetDraw()
+    assert interactor.GetEnableRender()
     assert viewport.render_timer.isActive() and viewport.render_timer.interval() == 0
+
+
+def test_live_ray_traces_at_most_max_trace_pixels_for_large_windows(window):
+    from layer_viewer import live_raytrace
+    live = window.viewport.live_ray
+    original = type(window.viewport.plotter).window_size
+    try:
+        type(window.viewport.plotter).window_size = property(lambda self: (2038, 1418))
+        width, height = live._trace_size()
+        assert width * height <= live_raytrace.MAX_TRACE_PIXELS
+        assert abs(width / height - 2038 / 1418) < .01  # aspect kept; upscaled to the window
+        mw, mh = live._motion_size()
+        assert mw <= width and mh <= height
+        type(window.viewport.plotter).window_size = property(lambda self: (800, 600))
+        assert live._trace_size() == (800, 600)  # small windows trace every pixel
+    finally:
+        type(window.viewport.plotter).window_size = original
