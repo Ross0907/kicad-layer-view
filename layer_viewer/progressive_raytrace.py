@@ -47,8 +47,9 @@ _FREEZE_UNSUPPORTED = set()
 # (about 30-70x faster per sample than tracing the orthographic sensor), and
 # at 0.25 degrees the remaining perspective is a fraction of a pixel.
 STANDIN_FOV = .25
-# Rays start at the near clip, at most this far (normalized scene units) in
-# front of the scene, so float32 hit distances stay small at any zoom.
+# Rays start at the near clip, at most this far (normalized scene units) plus
+# a quarter of the camera distance in front of the scene, so float32 hit
+# distances stay small (well below a pixel and the resist thickness).
 _STANDIN_SLACK = 4.
 # Normalized geometry lies within the [-1, 1] cube.
 _SCENE_RADIUS = 3 ** .5 * 1.02
@@ -77,16 +78,21 @@ def standin_camera(camera, center, scale, clip=None):
     ideal = half / math.tan(math.radians(STANDIN_FOV / 2))
 
     def fit(near):
-        distance = min(max(ideal, near + reach), near + reach + _STANDIN_SLACK)
+        top = (near + reach + _STANDIN_SLACK) * 4 / 3
+        distance = min(max(ideal, near + reach), top)
         return distance, 2 * math.degrees(math.atan(half / distance))
     if clip is not None:
         distance, fov = fit(clip[0])
         if not (STANDIN_FOV / 32 <= fov <= STANDIN_FOV * 2 and clip[1] >= distance + radius):
             clip = None
     if clip is None:
-        near = max(ideal - reach - _STANDIN_SLACK / 2, 1e-4)
+        # Clip values are recorded into the kernels as constants: rounding
+        # them to a coarse grid (near to powers of 2^(1/4), far to powers of
+        # two) lets similar views, and later sessions, reuse compiled kernels.
+        gap = ideal - reach
+        near = 2 ** (math.floor(4 * math.log2(gap)) / 4) if gap >= 1 / 16 else 1e-4
         distance, fov = fit(near)
-        clip = (near, 2 * (distance + radius) + 10.)
+        clip = (near, 2. ** math.ceil(math.log2(2 * (distance + radius) + 10.)))
     eye = (focal + direction * distance) / scale + center
     return CapturedCamera(tuple(float(v) for v in eye), tuple(camera.focal_point), tuple(camera.up),
                           False, float(camera.parallel_scale), fov), clip
@@ -685,7 +691,7 @@ class ProgressiveRayTracer:
             import drjit as dr
             if image is None:
                 seed = 73 + self.samples
-                if not str(self.variant).startswith("scalar"):
+                if str(self.variant).startswith(("cuda", "llvm")):
                     # An opaque seed keeps one compiled kernel for every sample
                     # instead of baking each new seed into a new kernel.
                     seed = dr.opaque(mi.UInt32, seed)

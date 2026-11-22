@@ -139,7 +139,10 @@ def test_stand_in_matches_the_parallel_scale_and_starts_rays_near_the_scene():
         reach = min(radius, np.linalg.norm(np.subtract(camera.position, camera.focal_point)) * scale)
         assert near <= distance - reach + 1e-9 and far >= distance + radius
         # ...while rays start within a few units of it (float32 precision).
-        assert near >= distance - reach - progressive_raytrace._STANDIN_SLACK - .1 or near <= 1e-3
+        assert near >= .75 * distance - reach - progressive_raytrace._STANDIN_SLACK or near <= 1e-3
+        # The clip range is rounded so similar views share compiled kernels.
+        assert near <= 1e-3 or abs(4 * math.log2(near) - round(4 * math.log2(near))) < 1e-9
+        assert math.log2(far) == round(math.log2(far))
         # A valid range is kept for the next frame.
         assert standin_camera(camera, center, scale, (near, far))[1] == (near, far)
 
