@@ -31,6 +31,9 @@ MOTION_SAMPLES = 1
 MOTION_WARMUP_FRAMES = 2
 MOTION_MIN_STEADY = 3
 MOTION_HISTORY = 24
+# Share of the GPU a still view's refinement may use (the rest stays free for
+# the desktop and this window, which otherwise stutter after a drag ends).
+REFINE_GPU_SHARE = .65
 # Largest traced film (pixels); bigger windows are upscaled from this size.
 MAX_TRACE_PIXELS = 1_600_000
 # Refinement at full resolution starts once the view has rested this long.
@@ -122,6 +125,30 @@ class LiveRayWorker(QThread):
         if self.isInterruptionRequested():
             raise _Stopped()
 
+    def _share_gpu(self, tracer, launched):
+        """Leave part of the GPU to the desktop while a still view refines.
+
+        Back-to-back full-size samples kept the GPU at 100 %, so Windows' own
+        compositing, and this window, stuttered as soon as a drag ended. After
+        each refinement sample wait for it to finish, then rest for a share of
+        its time; a new camera or setting wakes the worker at once.
+        """
+        if REFINE_GPU_SHARE >= 1:
+            return
+        started = time.perf_counter() - launched
+        if str(getattr(tracer, "variant", "")).startswith("cuda"):
+            try:
+                import drjit as dr
+                dr.sync_thread()  # releases the GIL while the GPU finishes
+            except Exception:  # noqa: BLE001 - pacing is a courtesy only
+                return
+        busy = time.perf_counter() - started
+        rest = min(.1, busy * (1 - REFINE_GPU_SHARE) / REFINE_GPU_SHARE)
+        if rest > .001:
+            with self._condition:
+                if self._pending is None and not self._paused:
+                    self._condition.wait(rest)
+
     def run(self):
         tracer = None
         revision, target, denoise, exposure_ev, denoise_strength = 0, 64, True, 0.0, .35
@@ -210,6 +237,8 @@ class LiveRayWorker(QThread):
                                         denoise_strength=denoise_strength,
                                         bloom_strength=bloom_strength, bloom_radius=bloom_radius,
                                         display=False)
+                    if not motion:
+                        self._share_gpu(tracer, time.perf_counter() - frame_started)
                 self.check_cancel()
                 with self._condition:
                     if self._paused or (self._pending is not None and not motion):

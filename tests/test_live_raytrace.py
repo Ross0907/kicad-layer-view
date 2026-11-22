@@ -625,3 +625,23 @@ def test_worker_prepares_the_motion_size_once_refinement_has_finished():
         worker.stop()
         assert worker.wait(3000)
         app.processEvents()
+
+
+def test_refinement_leaves_part_of_the_gpu_free_and_wakes_for_a_new_camera():
+    import threading
+    from layer_viewer import live_raytrace
+    worker = LiveRayWorker(backend_factory=lambda *a, **k: None)
+    tracer = SimpleNamespace(variant="test")  # no CUDA: nothing to wait for
+    worker._paused = False
+    start = time.perf_counter()
+    worker._share_gpu(tracer, .05)  # a 50 ms sample
+    rested = time.perf_counter() - start
+    expected = .05 * (1 - live_raytrace.REFINE_GPU_SHARE) / live_raytrace.REFINE_GPU_SHARE
+    assert expected * .7 <= rested <= expected + .05
+    # A new camera arrives during the rest: the worker wakes at once.
+    timer = threading.Timer(.01, lambda: worker.submit(1, None, "cam", (8, 6), 1, False))
+    start = time.perf_counter()
+    timer.start()
+    worker._share_gpu(tracer, 10.)  # would rest the 100 ms cap
+    timer.join()
+    assert time.perf_counter() - start < .08
