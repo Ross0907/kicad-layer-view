@@ -119,6 +119,13 @@ SOLDER_COLOR = _rgb(0xaa, 0xaa, 0xa6)       # pcb2blender solder
 # Unreflowed solder paste: grey metal powder in flux, rough and nearly matte.
 PASTE_COLOR = _rgb(0x8c, 0x8c, 0x88)
 PASTE_METALLIC, PASTE_ROUGHNESS = .2, .8
+# Reflowed solder joints (SAC305 / tin-lead): a satin bright metal. The ray
+# tracer uses SOLDER_JOINT_F0 (linear reflectance) rather than the swatch.
+SOLDER_JOINT_COLOR = _rgb(200, 200, 198)
+SOLDER_JOINT_ROUGHNESS = .25
+SOLDER_JOINT_F0 = (.80, .80, .82)
+# KiCad style: a plain light grey, like KiCad's own paste/solder grey.
+KICAD_SOLDER_COLOR = (.75, .75, .75)
 # Copper seen through solder resist: the warm, partly diffuse color that tints
 # green resist yellow-green over traces (not a mirror-like metal).
 COVERED_COPPER_COLOR = _rgb(196, 122, 70)
@@ -287,6 +294,16 @@ def material_appearance(kind, value="", style=None, context=None):
         rgb, alpha = _BOARD[name]
         return _rgb(*rgb) + (alpha,)
     return UNKNOWN_COLOR
+
+
+def solder_appearance(style=None):
+    """``(rgb, metallic, roughness)`` of reflowed solder joints in a material style.
+
+    Realistic: satin bright metal. KiCad style: plain light grey, no metal values.
+    """
+    if _style(style) == "realistic":
+        return SOLDER_JOINT_COLOR, 1., SOLDER_JOINT_ROUGHNESS
+    return KICAD_SOLDER_COLOR, None, None
 
 
 def board_body_color(dielectric_colors, style=None):
@@ -469,6 +486,10 @@ def apply_surface_finish(scene, snapshot, style=None):
                 "color": rgba[:3], "opacity": 1.,
                 "metallic": PASTE_METALLIC if realistic else None,
                 "roughness": PASTE_ROUGHNESS if realistic else None})))
+        elif part.kind == "solder":
+            rgb, metallic, roughness = solder_appearance(style)
+            parts.append(replace(part, **_fields_of(part, {
+                "color": rgb, "opacity": 1., "metallic": metallic, "roughness": roughness})))
         elif part.kind in STACKUP_KINDS:
             context = None
             if part.kind == "silk":

@@ -76,6 +76,9 @@ def kicad_material(kind, rgb):
         return (r, g, b), (r*r + .1, g*g + .1, b*b + .1), .078125 * 128.
     if kind == "paste":
         return (r, g, b), (r*r, g*g, b*b), .1 * 128.
+    if kind == "solder":
+        # KiCad style reflowed joints: a plain light grey with a soft sheen.
+        return (r*.5, g*.5, b*.5), (.35, .35, .35), .3 * 128.
     if kind == "dielectric":
         return (117/255, 97/255, 47/255), (18/255, 3/255, 20/255), .1 * 128.
     if kind in ("fill", "plug"):
@@ -205,7 +208,7 @@ def apply_material(prop, kind, rgb, base_rgb=None, metallic=None, roughness=None
         prop.SetSpecularPower(resist_sheen_power(roughness))
         return
     if (kind in ("copper", "barrel", "via_patch") and is_realistic_metal(rgb)) or (
-            kind == "component" and metallic is not None and metallic >= .5):
+            kind in ("component", "solder") and metallic is not None and metallic >= .5):
         # Realistic plated finishes and metal model parts: Phong metal lit by
         # KiCad's camera-attached lights. A world-fixed environment map made
         # copper seen from below reflect the dark lower half (dull), and its

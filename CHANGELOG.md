@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- New optional "Solder joints" view (off by default, next to "Solder paste"):
+  reflowed joints built from the pad geometry. SMD pads get a concave fillet
+  rising toward the part (a thin dome on fine-pitch pads); plated
+  through-hole pins get a meniscus fillet and a short pin stub on the solder
+  side. Joints follow the outer layers when exploded; realistic style shades
+  them as satin solder metal (viewport and ray tracer), KiCad style as plain
+  light grey.
+
 ## 0.8.2
 
 - No more stutter when a drag ends in live ray tracing: the full-size

@@ -99,7 +99,9 @@ def main(plugin=False):
         # capture the completed board and any requested component models.
         if (window._board_preview or window._detail_worker is not None
                 or (window.kind_boxes["component"].isChecked()
-                    and window._component_worker is not None)):
+                    and window._component_worker is not None)
+                or (window.kind_boxes["solder"].isChecked()
+                    and window._solder_worker is not None)):
             QTimer.singleShot(150, render)
             return
         rendered[0] = True

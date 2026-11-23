@@ -211,6 +211,10 @@ class MainWindow(QMainWindow):
         self._component_warnings = []
         self._component_loaded_signature = None
         self._detail_worker = None
+        # Optional reflowed solder joints: parts, and the snapshot they match.
+        self._solder_worker = None
+        self._solder_parts = []
+        self._solder_snapshot = None
         self.source = ("ipc", None)
         self.rows = {}
         self._solo_key = None
@@ -299,14 +303,21 @@ class MainWindow(QMainWindow):
             category_row.addWidget(box, i // 3, i % 3)
         layout.addLayout(category_row)
         detail_row = QGridLayout()
-        for i, (kind, title) in enumerate((("component", "3D components"), ("paste", "Solder paste"),
-                                           ("via_patch", "POFV contrast"))):
+        for i, (kind, title) in enumerate((("component", "3D components"), ("via_patch", "POFV contrast"),
+                                           ("paste", "Solder paste"), ("solder", "Solder joints"))):
             box = QCheckBox(title)
-            # KiCad shows capped vias in the plain finish; contrast is opt-in.
-            box.setChecked(kind != "via_patch")
+            # KiCad shows capped vias in the plain finish; contrast and the
+            # illustrative reflowed joints are opt-in.
+            box.setChecked(kind not in ("via_patch", "solder"))
             box.toggled.connect(self.apply_visibility)
             self.kind_boxes[kind] = box
             detail_row.addWidget(box, i // 2, i % 2)
+        # Paste is the unreflowed deposit of the same solder: show one or the other.
+        self.kind_boxes["solder"].toggled.connect(lambda on: on and self.kind_boxes["paste"].setChecked(False))
+        self.kind_boxes["paste"].toggled.connect(lambda on: on and self.kind_boxes["solder"].setChecked(False))
+        self.kind_boxes["solder"].setToolTip(
+            "Reflowed solder joints: concave fillets on SMD pads and meniscus cones around "
+            "through-hole pins. Illustrative shapes from the pad geometry; replaces the paste deposits.")
         self.kind_boxes["via_patch"].setToolTip(
             "Show a contrasting finish over capped via bores. This is a visual inspection aid; "
             "KiCad does not record a measured surface finish.")
@@ -498,7 +509,7 @@ class MainWindow(QMainWindow):
     def load(self, source="ipc", path=None):
         if self._closing:
             return
-        for task in (self._component_worker, self._detail_worker):
+        for task in (self._component_worker, self._detail_worker, self._solder_worker):
             if task is not None:
                 task.requestInterruption()
         # The newest request wins even if a stopped worker's queued ``finished``
@@ -614,8 +625,10 @@ class MainWindow(QMainWindow):
             # The load worker built the models alongside the board.
             self._component_parts, self._component_warnings = list(delivered[0]), list(delivered[1])
             self._component_loaded_signature = signature
-        if self._component_parts or self._component_warnings:
-            scene = replace(scene, parts=list(scene.parts) + self._component_parts,
+        if not preserve:
+            self._solder_parts = []
+        if self._component_parts or self._component_warnings or self._solder_parts:
+            scene = replace(scene, parts=list(scene.parts) + self._extra_parts(),
                             warnings=list(dict.fromkeys(scene.warnings + self._component_warnings)))
         self.snapshot, self.scene = snapshot, scene
         if not preserve or self._solo_key not in {part.key for part in scene.parts}:
@@ -656,6 +669,7 @@ class MainWindow(QMainWindow):
         elif self._board_preview:
             self.statusBar().showMessage(f"Board surface ready in {elapsed:.1f}s · preparing inner layers…")
         self._ensure_components()
+        self._ensure_solder()
         self.scene_ready.emit()
 
     def layer_controls(self):
@@ -699,7 +713,7 @@ class MainWindow(QMainWindow):
                 or self.sender() is not self._detail_worker
                 or self._detail_worker.isInterruptionRequested()):
             return
-        self._refresh_extra_scene(replace(scene, parts=list(scene.parts) + self._component_parts,
+        self._refresh_extra_scene(replace(scene, parts=list(scene.parts) + self._extra_parts(),
                                   warnings=list(dict.fromkeys(scene.warnings + self._component_warnings))))
 
     def _details_finished(self):
@@ -758,6 +772,44 @@ class MainWindow(QMainWindow):
             task.deleteLater()
             if task.signature != self._component_signature or task.isInterruptionRequested():
                 self._ensure_components()
+
+    def _extra_parts(self):
+        """Parts built after the board: 3D models and the optional solder joints."""
+        return list(self._component_parts) + list(self._solder_parts)
+
+    def _ensure_solder(self):
+        """Build the reflowed joints off the GUI thread once they are first shown."""
+        if (self._closing or self.snapshot is None or self._pending_load is not None
+                or not self.kind_boxes["solder"].isChecked() or self._solder_snapshot is self.snapshot):
+            return
+        if self._solder_worker is not None:
+            if self._solder_worker.snapshot is not self.snapshot:
+                self._solder_worker.requestInterruption()
+            return
+        from .scene_tasks import SolderTask
+        task = self._solder_worker = SolderTask(self.snapshot, self.scene.slot_count, self)
+        task.ready.connect(self._solder_ready)
+        task.failed.connect(lambda message: self.statusBar().showMessage(f"Solder joints: {message}"))
+        task.finished.connect(self._solder_finished)
+        task.start(QThread.LowPriority)
+
+    def _solder_ready(self, snapshot, parts):
+        task = self.sender()
+        if (self._closing or self._pending_load is not None or task is not self._solder_worker
+                or snapshot is not self.snapshot or task.isInterruptionRequested()):
+            return
+        self._solder_parts, self._solder_snapshot = list(parts), snapshot
+        self._refresh_extra_scene(replace(self.scene, parts=[p for p in self.scene.parts if p.kind != "solder"]
+                                          + self._solder_parts))
+        self.statusBar().showMessage("Solder joints ready")
+
+    def _solder_finished(self):
+        task = self.sender()
+        if task is self._solder_worker:
+            self._solder_worker = None
+            task.deleteLater()
+            if task.snapshot is not self.snapshot or task.isInterruptionRequested():
+                self._ensure_solder()
 
     def _refresh_extra_scene(self, scene):
         from .finishes import apply_surface_finish
@@ -892,6 +944,7 @@ class MainWindow(QMainWindow):
             self.viewport.set_part(part.key, visible=enabled, render=False)
         self.viewport.refresh()
         self._ensure_components()
+        self._ensure_solder()
         self._ensure_via_details()
 
     def filter_layers(self, text):
@@ -922,8 +975,8 @@ class MainWindow(QMainWindow):
         use_editor = self.all_colors.isChecked()
         for kind, box in self.kind_boxes.items():
             box.blockSignals(True)
-            # Paste and the capped-via contrast stay as the user set them.
-            if kind not in ("paste", "via_patch"):
+            # Paste, joints and the capped-via contrast stay as the user set them.
+            if kind not in ("paste", "solder", "via_patch"):
                 box.setChecked(mode not in ("copper", "vias") or kind in ("barrel", "fill"))
             box.blockSignals(False)
         for key, (visible, color, opacity) in self.rows.items():
@@ -1051,7 +1104,7 @@ class MainWindow(QMainWindow):
         export = self.render_dialog.worker if self.render_dialog is not None else None
         # Cancel every task on the first close request. Waiting for one worker
         # first otherwise lets the others keep polling, meshing or exporting.
-        for task in (self.worker, self._component_worker, self._detail_worker, export):
+        for task in (self.worker, self._component_worker, self._detail_worker, self._solder_worker, export):
             if task is not None and task.isRunning():
                 task.requestInterruption()
                 waiting = True

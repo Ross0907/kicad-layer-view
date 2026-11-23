@@ -50,3 +50,13 @@ class ViaDetailTask(SceneTask):
         from .geometry import build_scene, scene_keys
         return build_scene(self.snapshot, progress=self, previous_scene=self.scene,
                            requested_keys=scene_keys(self.snapshot, via_details=True))
+
+
+class SolderTask(SceneTask):
+    def __init__(self, snapshot, slot_count, parent=None):
+        super().__init__(snapshot, parent)
+        self.slot_count = slot_count
+
+    def build(self):
+        from .solder import build_solder_parts
+        return build_solder_parts(self.snapshot, self.slot_count, progress=self)

@@ -224,6 +224,17 @@ def _material(mesh, *, coated=False, capped=False):
         opaque = {"type": "principled", "base_color": rgb,
                   "metallic": mesh.metallic if getattr(mesh, "metallic", None) is not None else 1.,
                   "roughness": mesh.roughness if getattr(mesh, "roughness", None) is not None else .38}
+    elif mesh.kind == "solder":
+        # Reflowed joints. Realistic: a satin principled metal with measured
+        # tin-alloy reflectance; KiCad style (no metal values): plain grey.
+        metallic = getattr(mesh, "metallic", None)
+        if metallic is not None and metallic >= .5:
+            from .finishes import SOLDER_JOINT_F0
+            opaque = {"type": "principled", "metallic": 1.,
+                      "base_color": {"type": "rgb", "value": list(SOLDER_JOINT_F0)},
+                      "roughness": mesh.roughness if getattr(mesh, "roughness", None) is not None else .25}
+        else:
+            opaque = {"type": "principled", "base_color": rgb, "metallic": 0., "roughness": .45}
     elif mesh.kind == "mask":
         # Solder resist is dielectric; sharp restrained highlights distinguish
         # it from the underlying conductor without an oily clearcoat lobe.
@@ -563,8 +574,11 @@ class ProgressiveRayTracer:
             if any(mesh.emission):
                 props["emitter"] = mi.load_dict({"type": "area", "radiance": {
                     "type": "rgb", "value": list(mesh.emission)}})
+            # Curved joints need smooth shading; every other part is faceted
+            # (flat slabs, or models whose facets the denoiser hides).
+            smooth = mesh.kind == "solder"
             shape = mi.Mesh(f"part_{index}", len(points), len(triangles), props,
-                            has_vertex_normals=False, has_vertex_texcoords=False)
+                            has_vertex_normals=smooth, has_vertex_texcoords=False)
             if weights is not None:
                 # Per-face lookup keeps aperture edges exact, with no texture
                 # sampling, duplicate copper surfaces or extra draw objects.
@@ -574,6 +588,10 @@ class ProgressiveRayTracer:
             params = mi.traverse(shape)
             params["vertex_positions"] = ((points - self.center) * self.scale).astype(np.float32).ravel()
             params["faces"] = np.asarray(triangles, dtype=np.uint32).ravel()
+            if smooth:
+                from .solder import vertex_normals
+                params["vertex_normals"] = vertex_normals(np.asarray(points, dtype=np.float64),
+                                                          np.asarray(triangles)).ravel()
             params.update()
             scene_dict[f"part_{index}"] = shape
             self.triangle_count += len(triangles)
