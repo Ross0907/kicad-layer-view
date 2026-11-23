@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.3
 
 - New optional "Solder joints" view (off by default, next to "Solder paste"):
   reflowed joints built from the pad geometry. SMD pads get a concave fillet
