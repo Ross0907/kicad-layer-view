@@ -268,6 +268,10 @@ def _material(mesh, *, coated=False, capped=False):
                                                     "value": _linear(resist_cap_color(mesh.color)).tolist()},
                                      "roughness": roughness * .7}}
     elif mesh.kind == "component":
+        if mesh.metallic is not None and mesh.metallic >= .5:
+            # Plated gold parts trace measured gold F0, not their display swatch.
+            from .finishes import component_metal_color
+            rgb = {"type": "rgb", "value": _linear(component_metal_color(mesh.color)).tolist()}
         opaque = {"type": "principled", "base_color": rgb,
                   "metallic": mesh.metallic if mesh.metallic is not None else 0.,
                   "roughness": mesh.roughness if mesh.roughness is not None else .48,
