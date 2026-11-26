@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.5
 
 - More realistic SMD solder joints, matched to photos of reflowed joints and
   the IPC-A-610 fillet criteria:
