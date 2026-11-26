@@ -22,7 +22,8 @@ log = logging.getLogger(__name__)
 # Fraction of the window resolution traced while the view moves. It adapts
 # between the limits to hold roughly MOTION_FRAME_S per frame on any GPU/board.
 # One size is held for a whole drag (every new size records new kernels);
-# between drags it moves at most one step, judged on the median steady frame.
+# between drags it moves to the step the median steady frame asks for, and a
+# drag uses a new size only once the worker has prepared it.
 MOTION_SCALE = .5
 MOTION_SCALE_STEPS = (.25, .35, .5, .625, .75)
 MOTION_FRAME_S = 1 / 30
@@ -44,6 +45,10 @@ STILL_DELAY_MS = 140
 # reached within REFINE_MILESTONE_GAP_S of the last display is skipped, so a
 # fast board goes straight to its finished image.
 REFINE_MILESTONES = (1, 4, 16)
+# Right after ray tracing is enabled no motion size is prepared yet, so the
+# first one is prepared as soon as the still view shows this many samples
+# (not only once it has finished), before the user is likely to drag.
+FIRST_PREWARM_SAMPLES = 4
 REFINE_MILESTONE_GAP_S = .1
 REFINE_DISPLAY_S = .25
 
@@ -65,6 +70,11 @@ class LiveRayWorker(QThread):
     frame = Signal(int, object, object)
     status = Signal(str)
     failed = Signal(str)
+    # (scene revision, motion size): a size whose kernels are recorded and
+    # compiled (prepared at rest or traced during a drag), so dragging at it
+    # never stalls. The revision is that of the submit whose new scene built
+    # the tracer, so a late signal from a replaced tracer can be ignored.
+    motion_ready = Signal(int, object)
 
     def __init__(self, parent=None, backend_factory=None):
         super().__init__(parent)
@@ -89,6 +99,10 @@ class LiveRayWorker(QThread):
                              denoise_strength, bloom_strength, bloom_radius, motion)
             self._paused = False
             self._condition.notify_all()
+
+    def _work_waiting(self):
+        """True once a camera, setting or stop request is waiting for the worker."""
+        return self._pending is not None or self._paused or self.isInterruptionRequested()
 
     def pause(self):
         with self._condition:
@@ -149,6 +163,26 @@ class LiveRayWorker(QThread):
                 if self._pending is None and not self._paused:
                     self._condition.wait(rest)
 
+    def _note_drag_frame(self, tracer, size, redisplay, warmed, drag_frames, epoch):
+        """Report a motion size as ready once a drag has recorded it.
+
+        A frozen render records on its first two traced calls, after which
+        the size is never prepared again. The tracer's own slot says when
+        (it counts traced samples only); a backend without slots counts the
+        traced frames here, never a redisplay, which records nothing.
+        """
+        slot = getattr(tracer, "_active_slot", None)
+        if isinstance(slot, dict):
+            ready = bool(slot.get("prepared"))
+        elif redisplay:
+            return
+        else:
+            drag_frames[size] = drag_frames.get(size, 0) + 1
+            ready = drag_frames[size] >= MOTION_WARMUP_FRAMES
+        if ready:
+            warmed.add(size)
+            self.motion_ready.emit(epoch, size)
+
     def run(self):
         tracer = None
         revision, target, denoise, exposure_ev, denoise_strength = 0, 64, True, 0.0, .35
@@ -163,31 +197,60 @@ class LiveRayWorker(QThread):
                 factory = partial(ProgressiveRayTracer, allow_cpu=False)
             else:
                 factory = self._backend_factory
-            warmed = set()
+            # Motion sizes prepared (or traced in a drag) by the current tracer,
+            # the revision that last emptied them (the preparation epoch every
+            # motion_ready carries), and drag frames traced per size. They hold
+            # for one still size (window) and projection: a resize or a
+            # parallel/perspective toggle prepares the motion size again.
+            warmed, epoch, drag_frames = set(), 0, {}
+            still_size, projection = None, None
             while not self.isInterruptionRequested():
+                warm = self._warm_size
+                if (tracer is not None and warm is not None and warm not in warmed
+                        and not hasattr(tracer, "prewarm_motion")):
+                    # A backend that cannot prepare records on the drag, as it
+                    # always did: its sizes are ready at once, so the motion
+                    # scale still adapts.
+                    warmed.add(warm)
+                    self.motion_ready.emit(epoch, warm)
                 with self._condition:
-                    warm = None
+                    warm = self._warm_size
+                    # Never mid-drag: between two motion frames the next one is
+                    # moments away, and a recording would stall the drag itself.
+                    can_warm = (tracer is not None and not motion and warm is not None
+                                and warm not in warmed and hasattr(tracer, "prewarm_motion"))
+                    # The first motion size is prepared early; later ones once
+                    # the still view has finished refining.
+                    ready = min(target, FIRST_PREWARM_SAMPLES) if can_warm and not warmed else target
                     if self._pending is None and (
-                            self._paused or tracer is None or tracer.samples >= target):
-                        warm = self._warm_size
-                        if (self._paused or tracer is None or warm is None or warm in warmed
-                                or not hasattr(tracer, "prewarm_motion")):
+                            self._paused or tracer is None or tracer.samples >= ready):
+                        if self._paused or not can_warm:
                             self._condition.wait(.1)
                             continue
-                        warmed.add(warm)
                     else:
+                        warm = None
                         pending, self._pending = self._pending, None
                 if warm:
-                    # The view rests with a finished image: prepare the next
-                    # drag's motion size now rather than stall its first frame.
+                    # The view rests: prepare the next drag's motion size now
+                    # rather than stall its first frame (refinement resumes
+                    # after). A new camera interrupts it between steps; it is
+                    # resumed at the next rest.
                     try:
-                        tracer.prewarm_motion(*warm, **self._motion_display_settings(
-                            tracer, denoise, exposure_ev, denoise_strength, bloom_strength,
-                            bloom_radius))
+                        done = tracer.prewarm_motion(*warm, stop=self._work_waiting,
+                                                     **self._motion_display_settings(
+                                                         tracer, denoise, exposure_ev, denoise_strength,
+                                                         bloom_strength, bloom_radius))
                     except _Stopped:
                         raise
                     except Exception:  # noqa: BLE001 - only a head start
+                        # Never retried: the drag records it (one slow frame)
+                        # rather than never moving to the adapted size.
                         log.debug("Could not prepare the motion size %s", warm, exc_info=True)
+                    else:
+                        if done is None and self._work_waiting():
+                            continue  # interrupted: resumed at the next rest
+                    warmed.add(warm)
+                    self.motion_ready.emit(epoch, warm)
                     continue
                 self.check_cancel()
                 redisplay = False
@@ -195,12 +258,25 @@ class LiveRayWorker(QThread):
                     (revision, capture, camera, size, target, denoise, exposure_ev,
                      denoise_strength, bloom_strength, bloom_radius, motion) = pending
                     size = tuple(size)
+                    parallel = getattr(camera, "parallel_projection", None)
+                    if capture is None and ((not motion and size != still_size)
+                                            or parallel != projection):
+                        # New window size or projection: earlier motion sizes
+                        # (and sensor kinds) no longer match the next drag.
+                        warmed.clear()
+                        drag_frames.clear()
+                        epoch = revision
+                    projection = parallel
+                    if not motion:
+                        still_size = size
                     if capture is not None:
                         if tracer is not None:
                             tracer.close()
                             tracer = None
                         tracer = factory(capture, *size, progress=self)
                         warmed.clear()
+                        drag_frames.clear()
+                        epoch = revision
                         # The capture's camera can precede a queued camera update.
                         if camera != capture.camera:
                             tracer.update_camera(camera, *size)
@@ -258,6 +334,9 @@ class LiveRayWorker(QThread):
                         tracer, denoise, exposure_ev, denoise_strength, bloom_strength, bloom_radius)
                 pixels = tracer.display_image(**settings)
                 last_display = time.perf_counter()
+                if motion and active_size not in warmed:
+                    self._note_drag_frame(tracer, active_size, redisplay, warmed, drag_frames,
+                                          epoch)
                 self.check_cancel()
                 with self._condition:
                     if self._paused or (self._pending is not None and not motion):
@@ -334,6 +413,11 @@ class LiveRayController(QObject):
         # Steady motion-frame times at the current scale (seconds).
         self._motion_times = []
         self._motion_warmup = MOTION_WARMUP_FRAMES
+        # Motion sizes the worker has prepared since it last emptied its own
+        # set, at the submit with revision _ready_from (a new scene, window
+        # size or projection). Readiness from an older epoch is stale.
+        self._ready_motion_sizes = set()
+        self._ready_from = 0
         self._scene_dirty = True
         self._camera_signature = None
         self.last_image = None
@@ -525,6 +609,13 @@ class LiveRayController(QObject):
         signature = (tuple(camera.position), tuple(camera.focal_point), tuple(camera.up),
                      camera.GetParallelProjection(), camera.GetParallelScale(), camera.GetViewAngle())
         if signature != self._camera_signature:
+            if self._camera_signature is not None and signature[3] != self._camera_signature[3]:
+                # A projection change traces another sensor kind: the worker
+                # prepares its motion sizes again.
+                # _moved bumps the revision, so the next submit (which makes
+                # the worker start a new epoch) is at least this one.
+                self._ready_motion_sizes = set()
+                self._ready_from = self._revision + 1
             self._camera_signature = signature
             self._moved()
 
@@ -551,6 +642,11 @@ class LiveRayController(QObject):
 
     def eventFilter(self, watched, event):
         if self.enabled and event.type() == QEvent.Resize:
+            # Every motion size changes with the window: none is prepared.
+            # _invalidate bumps the revision: readiness queued from before the
+            # resize carries an older epoch and is dropped.
+            self._ready_motion_sizes = set()
+            self._ready_from = self._revision + 1
             self._invalidate()
         return False
 
@@ -572,15 +668,20 @@ class LiveRayController(QObject):
                 self.worker.frame.connect(self._frame)
                 self.worker.status.connect(self.status)
                 self.worker.failed.connect(self._failed)
+                self.worker.motion_ready.connect(self._motion_ready)
                 self.worker.finished.connect(self._finished)
                 self._scene_dirty = True
                 self.worker.start()
             capture = capture_from_viewport(self.viewport) if self._scene_dirty else None
+            if capture is not None:
+                # A new tracer prepares its sizes again.
+                self._ready_motion_sizes = set()
+                self._ready_from = self._revision
             camera = capture_camera_from_viewport(self.viewport)
             if not motion:
                 # The drag has ended: only now may the motion size change.
                 self._adapt_motion_scale()
-            size = self._motion_size() if motion else self._trace_size()
+            size = self._drag_size() if motion else self._trace_size()
             self.worker.submit(self._revision, capture, camera, size,
                                MOTION_SAMPLES if motion else self.samples, self.denoise,
                                self.exposure_ev, self.denoise_strength,
@@ -666,6 +767,29 @@ class LiveRayController(QObject):
         scale = self.motion_scale if scale is None else scale
         return tuple(max(16, int(round(v * scale))) for v in size)
 
+    def _motion_ready(self, epoch, size):
+        # The worker tags readiness with the revision of the submit that last
+        # emptied its prepared sizes. One queued from before a resize,
+        # projection change or new scene is older than _ready_from.
+        if epoch >= self._ready_from:
+            self._ready_motion_sizes.add(tuple(size))
+
+    def _drag_size(self):
+        """Motion size for a drag frame: the adapted size once it is prepared.
+
+        A newly adapted size records and compiles its kernels (0.1-2 s, the
+        recording holding the GIL) on its first frame. Until the worker has
+        prepared it, drags keep the nearest size that is already prepared.
+        """
+        wanted = self._motion_size()
+        if wanted in self._ready_motion_sizes:
+            return wanted
+        ready = [scale for scale in MOTION_SCALE_STEPS
+                 if self._motion_size(scale) in self._ready_motion_sizes]
+        if not ready:
+            return wanted  # nothing prepared yet: the first drag records it
+        return self._motion_size(min(ready, key=lambda scale: abs(scale - self.motion_scale)))
+
     def _record_motion_frame(self, width, seconds):
         """Collect a motion frame's time if it was traced at the current scale."""
         if width != self._motion_size()[0] or seconds <= 0:
@@ -678,11 +802,13 @@ class LiveRayController(QObject):
         del self._motion_times[:-MOTION_HISTORY]
 
     def _adapt_motion_scale(self):
-        """Between drags, move the motion scale at most one step.
+        """Between drags, move the motion scale to the step the frame time asks for.
 
-        Pixel count scales with scale², so the frame time does too. Every new
-        size records new kernels, so the size never changes during a drag, and
-        only on the median of several steady frames.
+        Pixel count scales with scale², so the frame time does too (a little
+        less, with fixed per-frame costs). Every new size records and compiles
+        new kernels, so the size never changes during a drag, only on the
+        median of several steady frames, and it goes straight to the wanted
+        step instead of visiting (and compiling) every step on the way.
         """
         if len(self._motion_times) < MOTION_MIN_STEADY:
             return
@@ -691,9 +817,9 @@ class LiveRayController(QObject):
         steps = MOTION_SCALE_STEPS
         index = min(range(len(steps)), key=lambda k: abs(steps[k] - self.motion_scale))
         if wanted > steps[index] * 1.2 and index + 1 < len(steps):
-            index += 1
+            index = max([index + 1] + [k for k, step in enumerate(steps) if step <= wanted])
         elif wanted < steps[index] / 1.2 and index > 0:
-            index -= 1
+            index = min([index - 1] + [k for k, step in enumerate(steps) if step >= wanted])
         if steps[index] != self.motion_scale:
             self.motion_scale = steps[index]
             self._motion_times = []

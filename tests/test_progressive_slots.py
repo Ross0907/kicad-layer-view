@@ -46,6 +46,11 @@ def _camera(x=0.):
     return CapturedCamera((x, 0., 10.), (0., 0., 0.), (0., 1., 0.), True, 5., 30.)
 
 
+def _motion_name(width, height, kind=("standin", None)):
+    """A motion slot's name: its size and sensor kind (_camera() is a parallel stand-in)."""
+    return ("motion", width, height, kind)
+
+
 def test_motion_and_refinement_sizes_keep_their_sensors_and_guided_denoiser():
     tracer, loaded, denoisers = _tracer()
     tracer._update_camera(_camera(), 100, 80)
@@ -92,7 +97,7 @@ def test_motion_slots_are_bounded_and_keep_their_fast_denoisers():
     motion = [name for name in tracer._slots if name != "full"]
     assert "full" in tracer._slots and len(motion) == progressive_raytrace.MAX_MOTION_SLOTS
     # The least recently used motion size was dropped.
-    assert ("motion",) + sizes[0] not in tracer._slots and ("motion",) + sizes[1] in tracer._slots
+    assert _motion_name(*sizes[0]) not in tracer._slots and _motion_name(*sizes[1]) in tracer._slots
 
 
 def test_parallel_views_use_a_perspective_stand_in_with_stable_clipping():
@@ -259,14 +264,13 @@ def test_prewarm_prepares_a_motion_size_and_keeps_the_refinement(monkeypatch):
     accumulated, guides = object(), object()
     tracer._sum, tracer.samples, tracer._guides = accumulated, 64, guides
     full_sensor, full_slot = tracer.sensor, tracer._active_slot
-    traced = []
-    tracer.render_batch = lambda samples, display=True: traced.append(
-        (tracer.width, tracer.height, tracer.sensor is full_sensor, display))
-    tracer.display_image = lambda **settings: traced.append(settings)
+    traced = _fake_tracing(tracer, full_sensor)
     assert tracer.prewarm_motion(50, 40, packed=True, denoise_strength=.85)
-    # One sample was traced and shown fast at the motion size, on its own sensor...
-    assert traced == [(50, 40, False, False), {"packed": True, "denoise_strength": .85, "fast": True}]
-    assert ("motion", 50, 40) in tracer._slots and loaded == [(100, 80), (50, 40)]
+    # Two samples (the frozen render records twice) were traced and one frame
+    # shown fast at the motion size, on its own sensor...
+    assert traced == [(50, 40, False, False)] * 2 + [
+        {"packed": True, "denoise_strength": .85, "fast": True}]
+    assert _motion_name(50, 40) in tracer._slots and loaded == [(100, 80), (50, 40)]
     # ...and the finished refinement is exactly as it was.
     assert (tracer.width, tracer.height, tracer.samples) == (100, 80, 64)
     assert tracer._sum is accumulated and tracer._guides is guides
@@ -275,7 +279,97 @@ def test_prewarm_prepares_a_motion_size_and_keeps_the_refinement(monkeypatch):
     assert not tracer.prewarm_motion(50, 40)
     assert not tracer.prewarm_motion(100, 80)
     monkeypatch.setattr(progressive_raytrace, "FREEZE_RENDER", False)
-    assert not tracer.prewarm_motion(60, 48) and len(traced) == 2
+    assert not tracer.prewarm_motion(60, 48) and len(traced) == 3
+
+
+def _fake_tracing(tracer, full_sensor=None):
+    """Replace tracing with a log; samples count on the active slot as render_batch does."""
+    traced = []
+
+    def render_batch(samples, display=True):
+        traced.append((tracer.width, tracer.height, tracer.sensor is full_sensor, display))
+        tracer._active_slot["recorded"] = tracer._active_slot.get("recorded", 0) + samples
+    tracer.render_batch = render_batch
+    tracer.display_image = lambda **settings: traced.append(settings)
+    return traced
+
+
+def _resting_tracer(monkeypatch):
+    monkeypatch.setattr(progressive_raytrace, "FREEZE_RENDER", True)
+    tracer, _, _ = _tracer()
+    tracer.mi.set_variant = lambda _: None
+    tracer.scene = "scene"
+    tracer._update_camera(_camera(), 100, 80)
+    tracer._sum, tracer.samples, tracer._guides = "sum", 64, "guides"
+    return tracer
+
+
+def test_interrupted_prewarm_restores_the_refinement_and_resumes_where_it_stopped(monkeypatch):
+    tracer = _resting_tracer(monkeypatch)
+    full_slot = tracer._active_slot
+    traced = _fake_tracing(tracer)
+    asked = []
+
+    def stop_after_one_sample():
+        asked.append(len(traced))
+        return len(traced) >= 1
+    # The view moves after the first sample: no second sample, no display.
+    assert tracer.prewarm_motion(50, 40, stop=stop_after_one_sample) is None
+    assert len(traced) == 1 and asked == [0, 1]
+    assert (tracer.width, tracer.height, tracer.samples, tracer._sum) == (100, 80, 64, "sum")
+    assert tracer._active_slot is full_slot and tracer._guides == "guides"
+    slot = tracer._slots[_motion_name(50, 40)]
+    assert slot["recorded"] == 1 and not slot.get("prepared")
+    # Stopped before it starts: nothing traced at all.
+    assert tracer.prewarm_motion(50, 40, stop=lambda: True) is None and len(traced) == 1
+    # Resumed: only the missing sample, then the frame.
+    assert tracer.prewarm_motion(50, 40, stop=lambda: False) is True
+    assert len(traced) == 3 and isinstance(traced[-1], dict) and slot["prepared"]
+    assert not tracer.prewarm_motion(50, 40)
+    assert (tracer.width, tracer.height, tracer.samples) == (100, 80, 64)
+
+
+def test_a_motion_size_a_drag_traced_once_is_finished_by_prewarm(monkeypatch):
+    tracer = _resting_tracer(monkeypatch)
+    traced = _fake_tracing(tracer)
+    # A drag traced one frame at the size: its second recording is still due.
+    tracer._update_camera(_camera(1.), 50, 40, motion=True)
+    tracer.render_batch(1, display=False)
+    tracer._update_camera(_camera(), 100, 80)
+    del traced[:]
+    assert tracer.prewarm_motion(50, 40)
+    assert len(traced) == 2 and isinstance(traced[-1], dict)
+
+
+def test_drag_frames_that_record_twice_and_show_mark_the_size_prepared(monkeypatch):
+    calls = []
+
+    def freeze(function, limit=None):
+        return lambda scene, sensor, seed, key: calls.append(seed) or np.ones((2, 2, 4))
+    monkeypatch.setattr(progressive_raytrace, "FREEZE_RENDER", True)
+    tracer, _ = _render_fixture(monkeypatch, freeze)
+    slot = tracer._active_slot = {}
+    tracer._display_image = lambda *a, **kw: "pixels"
+    tracer.render_batch(1, display=False)
+    assert tracer.display_image(fast=True) == "pixels" and not slot.get("prepared")
+    tracer.render_batch(1, display=False)
+    tracer.display_image()  # a refinement display never marks a motion size
+    assert slot["recorded"] == 2 and not slot.get("prepared")
+    tracer.display_image(fast=True)
+    assert slot["prepared"]
+    tracer.render_batch(4, display=False)  # multi-sample batches record nothing
+    assert slot["recorded"] == 2
+
+
+def test_an_evicted_motion_size_is_prepared_again(monkeypatch):
+    tracer = _resting_tracer(monkeypatch)
+    _fake_tracing(tracer)
+    assert tracer.prewarm_motion(50, 40)
+    for k in range(progressive_raytrace.MAX_MOTION_SLOTS):
+        tracer._update_camera(_camera(1.), 20 + 2 * k, 16 + 2 * k, motion=True)
+    assert _motion_name(50, 40) not in tracer._slots
+    tracer._update_camera(_camera(), 100, 80)
+    assert tracer.prewarm_motion(50, 40) and tracer._slots[_motion_name(50, 40)]["prepared"]
 
 
 def test_prewarm_restores_the_refinement_even_if_it_fails(monkeypatch):
@@ -316,3 +410,23 @@ def test_parallel_standin_parallax_stays_under_a_pixel_or_uses_the_exact_camera(
     depth = float(np.dot(extent, np.abs(direction)))
     distance = float(np.linalg.norm(np.asarray(traced.position, float) * scale))
     assert height / 2 * depth / (distance - depth) <= 1.0 + 1e-6
+
+
+def test_a_size_prepared_in_perspective_is_prepared_again_for_a_parallel_view(monkeypatch):
+    from dataclasses import replace
+    tracer = _resting_tracer(monkeypatch)
+    traced = _fake_tracing(tracer)
+    perspective = replace(_camera(), parallel_projection=False)
+    tracer._update_camera(perspective, 100, 80)
+    assert tracer.prewarm_motion(50, 40) and len(traced) == 3
+    # The parallel view traces a stand-in sensor: not prepared yet.
+    tracer._update_camera(_camera(), 100, 80)
+    assert tracer.prewarm_motion(50, 40) and len(traced) == 6
+    # Both kinds keep their own slot (neither evicts the other)...
+    motion = [name for name in tracer._slots if name != "full"]
+    assert len(motion) == 2 and _motion_name(50, 40) in motion
+    assert all(tracer._slots[name]["prepared"] for name in motion)
+    # ...so switching back needs nothing new.
+    tracer._update_camera(perspective, 100, 80)
+    assert tracer.prewarm_motion(50, 40) is False and len(traced) == 6
+    assert (tracer.width, tracer.height) == (100, 80)

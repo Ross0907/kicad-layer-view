@@ -430,11 +430,11 @@ def test_motion_size_is_held_for_a_drag_and_adapts_between_drags_on_steady_frame
         assert controller.motion_scale == .5
         width, height = controller._motion_size()
         frame = np.zeros((height, width), np.uint32)
-        # Very fast frames never change the size during the drag...
+        # Fast frames never change the size during the drag...
         for _ in range(8):
-            controller._frame(controller._revision, frame, _motion_info(.002))
+            controller._frame(controller._revision, frame, _motion_info(.02))
         assert controller.motion_scale == .5
-        # ...only between drags, by one step.
+        # ...only between drags (wants .5 * sqrt(1/30 / .02) = .645: one step).
         controller._adapt_motion_scale()
         assert controller.motion_scale == .625
         assert controller._motion_times == []
@@ -456,7 +456,7 @@ def test_motion_size_is_held_for_a_drag_and_adapts_between_drags_on_steady_frame
         controller._motion_times = [.5, .5]
         controller._adapt_motion_scale()
         assert controller.motion_scale == .625
-        controller._motion_times = [.5, .5, .5]
+        controller._motion_times = [.07, .07, .07]  # wants .43: one step down
         controller._adapt_motion_scale()
         assert controller.motion_scale == .5
     finally:
@@ -574,6 +574,7 @@ def test_worker_displays_only_the_refinement_frames_it_shows():
 
 
 def test_worker_prepares_the_motion_size_once_refinement_has_finished():
+    from layer_viewer import live_raytrace
     app = QApplication.instance() or QApplication([])
     frames, warmed = [], []
 
@@ -608,19 +609,26 @@ def test_worker_prepares_the_motion_size_once_refinement_has_finished():
 
     worker = LiveRayWorker(backend_factory=Backend)
     worker.frame.connect(lambda revision, pixels, info: frames.append(info["samples"]))
+    ready = []
+    worker.motion_ready.connect(lambda revision, size: ready.append((revision, size)))
     worker.submit(1, SimpleNamespace(camera="start"), "start", (40, 30), 8, True, warm_size=(20, 15))
     worker.start()
     try:
-        assert wait(lambda: warmed and frames)
-        assert warmed == [(20, 15, 8, .85)] and frames[-1] == 8
+        # The first motion size is prepared early, once the still view shows
+        # FIRST_PREWARM_SAMPLES samples; refinement then finishes.
+        assert wait(lambda: warmed and frames and frames[-1] == 8)
+        assert warmed == [(20, 15, live_raytrace.FIRST_PREWARM_SAMPLES, .85)]
+        assert wait(lambda: ready == [(1, (20, 15))])
         # Moving the view refines again, but the size is prepared only once.
         worker.submit(2, None, "moved", (40, 30), 8, True, warm_size=(20, 15))
         assert wait(lambda: len(frames) > 1 and frames[-1] == 8 and frames.count(8) == 2)
         time.sleep(.3)
         assert len(warmed) == 1
         # A new motion size is prepared after the next refinement.
+        # Later sizes (after a motion-scale change) once refinement has finished.
         worker.submit(3, None, "again", (40, 30), 8, True, warm_size=(28, 21))
         assert wait(lambda: len(warmed) == 2) and warmed[-1][:3] == (28, 21, 8)
+        assert wait(lambda: ready[-1] == (1, (28, 21)))
     finally:
         worker.stop()
         assert worker.wait(3000)
@@ -645,3 +653,433 @@ def test_refinement_leaves_part_of_the_gpu_free_and_wakes_for_a_new_camera():
     worker._share_gpu(tracer, 10.)  # would rest the 100 ms cap
     timer.join()
     assert time.perf_counter() - start < .08
+
+
+def _wait(app, condition, seconds=3):
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(.005)
+    return condition()
+
+
+class _WarmBackend:
+    """Refines one sample per batch; prewarm_motion takes two interruptible steps."""
+    supports_motion_camera = True
+    step_seconds = 0.
+    log = None
+
+    def __init__(self, capture, width, height, progress):
+        self.size, self.samples, self.done = (width, height), 0, {}
+        self.backend, self.last_batch_seconds, self.denoiser_available = "test", .01, True
+
+    def update_camera(self, camera, width, height, *, motion=False):
+        self.size, self.samples = (width, height), 0
+
+    def render_batch(self, samples, denoise, exposure_ev=0.0, denoise_strength=.35,
+                     bloom_strength=.18, bloom_radius=1., display=True):
+        self.samples += samples
+
+    def display_image(self, **settings):
+        return np.zeros((self.size[1], self.size[0], 3), dtype=np.uint8)
+
+    def prewarm_motion(self, width, height, stop=None, **settings):
+        self.log.append(("prewarm", (width, height), self.samples))
+        for _ in range(self.done.get((width, height), 0), 2):
+            if stop():
+                return None
+            self.log.append(("step", (width, height)))
+            time.sleep(self.step_seconds)
+            self.done[(width, height)] = self.done.get((width, height), 0) + 1
+        return True
+
+    def close(self):
+        pass
+
+
+def test_an_interrupted_prewarm_yields_to_the_new_view_and_resumes_at_the_next_rest():
+    from layer_viewer import live_raytrace
+    app = QApplication.instance() or QApplication([])
+    log, ready, frames = [], [], []
+    Backend = type("Backend", (_WarmBackend,), {"log": log, "step_seconds": .25})
+    worker = LiveRayWorker(backend_factory=Backend)
+    worker.frame.connect(lambda revision, pixels, info: frames.append((revision, info["samples"])))
+    worker.motion_ready.connect(lambda revision, size: ready.append((revision, size)))
+    worker.submit(1, SimpleNamespace(camera="start"), "start", (40, 30), 16, True, warm_size=(20, 15))
+    worker.start()
+    try:
+        assert _wait(app, lambda: ("step", (20, 15)) in log)
+        assert log[0] == ("prewarm", (20, 15), live_raytrace.FIRST_PREWARM_SAMPLES)
+        # The view moves during the first step: the second step never starts,
+        # and the moved view refines before the preparation resumes.
+        worker.submit(2, None, "moved", (40, 30), 16, True, warm_size=(20, 15))
+        assert _wait(app, lambda: (2, 16) in frames and ready)
+        assert ready == [(1, (20, 15))]
+        prewarms = [entry for entry in log if entry[0] == "prewarm"]
+        # Resumed once the moved view had its first samples; each step ran once.
+        assert len(prewarms) == 2 and prewarms[1][2] == live_raytrace.FIRST_PREWARM_SAMPLES
+        assert log.count(("step", (20, 15))) == 2
+        assert (2, 1) in frames
+        time.sleep(.2)
+        assert len(log) == 4 and len(ready) == 1  # never prepared again
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()
+
+
+def test_stopping_the_worker_interrupts_a_prewarm_promptly():
+    app = QApplication.instance() or QApplication([])
+    log = []
+    Backend = type("Backend", (_WarmBackend,), {"log": log, "step_seconds": .3})
+    worker = LiveRayWorker(backend_factory=Backend)
+    worker.submit(1, SimpleNamespace(camera="start"), "start", (40, 30), 8, True, warm_size=(20, 15))
+    worker.start()
+    try:
+        assert _wait(app, lambda: ("step", (20, 15)) in log)
+        started = time.monotonic()
+        worker.stop()
+        assert worker.wait(3000)
+        # At most the one step that was running.
+        assert time.monotonic() - started < .6 and log.count(("step", (20, 15))) == 1
+    finally:
+        worker.stop()
+        worker.wait(3000)
+        app.processEvents()
+
+
+def test_no_prewarm_mid_drag_and_drag_traced_sizes_count_as_prepared_per_scene():
+    app = QApplication.instance() or QApplication([])
+    log, ready, frames = [], [], []
+    Backend = type("Backend", (_WarmBackend,), {"log": log})
+    worker = LiveRayWorker(backend_factory=Backend)
+    worker.frame.connect(lambda revision, pixels, info: frames.append(revision))
+    worker.motion_ready.connect(lambda revision, size: ready.append((revision, size)))
+    # A new scene arrives mid-drag: its motion frame is traced...
+    worker.submit(1, SimpleNamespace(camera="drag-1"), "drag-1", (20, 15), 1, True,
+                  motion=True, warm_size=(28, 21))
+    worker.start()
+    try:
+        assert _wait(app, lambda: 1 in frames)
+        # ...but nothing is prepared between drag frames.
+        time.sleep(.3)
+        assert log == [] and ready == []
+        # A second drag frame at that size: it is recorded, so it is ready.
+        worker.submit(2, None, "drag-2", (20, 15), 1, True, motion=True, warm_size=(28, 21))
+        assert _wait(app, lambda: ready == [(1, (20, 15))])
+        # At rest the adapted size is prepared (once the still view has samples).
+        # The first still size starts a new preparation epoch.
+        worker.submit(3, None, "rest", (40, 30), 4, True, warm_size=(28, 21))
+        assert _wait(app, lambda: ready == [(1, (20, 15)), (3, (28, 21))])
+        assert [entry[1] for entry in log if entry[0] == "prewarm"] == [(28, 21)]
+        # A new scene builds a new tracer: its sizes are prepared again and
+        # reported with the revision that carried the scene.
+        worker.submit(4, SimpleNamespace(camera="rest"), "rest", (40, 30), 4, True, warm_size=(28, 21))
+        assert _wait(app, lambda: ready[-1] == (4, (28, 21)))
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()
+
+
+def test_a_backend_that_returns_none_without_being_stopped_is_not_prewarmed_again():
+    app = QApplication.instance() or QApplication([])
+    calls, ready = [], []
+
+    class Backend(_WarmBackend):
+        def prewarm_motion(self, width, height, stop=None, **settings):
+            calls.append((width, height))
+    worker = LiveRayWorker(backend_factory=Backend)
+    worker.motion_ready.connect(lambda revision, size: ready.append(size))
+    worker.submit(1, SimpleNamespace(camera="start"), "start", (40, 30), 8, True, warm_size=(20, 15))
+    worker.start()
+    try:
+        assert _wait(app, lambda: ready == [(20, 15)])
+        time.sleep(.2)
+        assert calls == [(20, 15)]
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()
+
+
+def test_motion_scale_goes_straight_to_the_wanted_step():
+    app = QApplication.instance() or QApplication([])
+    controller, viewport = _controller()
+    try:
+        controller._motion_times = [.002] * 3  # wants 2.0: the largest step
+        controller._adapt_motion_scale()
+        assert controller.motion_scale == .75
+        controller._motion_times = [.5] * 3  # wants .19: the smallest step
+        controller._adapt_motion_scale()
+        assert controller.motion_scale == .25
+        controller._motion_times = [.004] * 3  # wants .72: .625, never past it
+        controller._adapt_motion_scale()
+        assert controller.motion_scale == .625
+    finally:
+        controller.shutdown()
+        viewport.deleteLater()
+        app.processEvents()
+
+
+def test_drags_use_only_prepared_motion_sizes():
+    import layer_viewer.raytrace as raytrace
+    app = QApplication.instance() or QApplication([])
+    controller, viewport = _controller()
+    submitted = []
+    controller.worker.submit = lambda *args, **kw: submitted.append((args, kw))
+    original = (raytrace.available, raytrace.capture_camera_from_viewport, raytrace.capture_from_viewport)
+    raytrace.available = lambda: True
+    raytrace.capture_camera_from_viewport = lambda _: "camera"
+    raytrace.capture_from_viewport = lambda _: "scene"
+    try:
+        size = controller._motion_size
+        controller._scene_dirty = True
+        controller._dispatch()  # the scene: nothing prepared yet
+        args, kw = submitted[-1]
+        assert args[1] == "scene" and kw["warm_size"] == size() == (100, 50)
+        scene_revision = args[0]
+        # Before anything is prepared the first drag records the wanted size.
+        controller._dispatch(motion=True)
+        assert submitted[-1][0][3] == (100, 50)
+        controller._motion_ready(scene_revision, (100, 50))
+        # The scale adapts: drags keep the prepared size until the new one is ready...
+        controller.motion_scale = .75
+        controller._dispatch(motion=True)
+        assert submitted[-1][0][3] == (100, 50) and submitted[-1][1]["warm_size"] == size(.75)
+        controller._motion_ready(scene_revision, size(.25))
+        controller._dispatch(motion=True)
+        assert submitted[-1][0][3] == (100, 50)  # the nearest prepared step
+        # ...and use it once it is.
+        controller._motion_ready(scene_revision, size(.75))
+        controller._dispatch(motion=True)
+        assert submitted[-1][0][3] == size(.75)
+        # A new scene forgets the prepared sizes; a late report from the old
+        # tracer is ignored.
+        controller._revision += 1
+        controller._scene_dirty = True
+        controller._dispatch()
+        controller._motion_ready(scene_revision, size(.75))
+        controller._dispatch(motion=True)
+        assert controller._ready_motion_sizes == set() and submitted[-1][0][3] == size(.75)
+        controller._motion_ready(controller._ready_from, size(.5))
+        assert controller._ready_motion_sizes == {size(.5)}
+    finally:
+        raytrace.available, raytrace.capture_camera_from_viewport, raytrace.capture_from_viewport = original
+        controller.shutdown()
+        viewport.deleteLater()
+        app.processEvents()
+
+
+def test_a_resize_prepares_the_new_motion_size_early():
+    from layer_viewer import live_raytrace
+    app = QApplication.instance() or QApplication([])
+    log, ready = [], []
+    Backend = type("Backend", (_WarmBackend,), {"log": log})
+    worker = LiveRayWorker(backend_factory=Backend)
+    epochs = []
+    worker.motion_ready.connect(lambda epoch, size: (ready.append(size), epochs.append(epoch)))
+    worker.submit(1, SimpleNamespace(camera="start"), "start", (40, 30), 64, True, warm_size=(20, 15))
+    worker.start()
+    try:
+        assert _wait(app, lambda: ready == [(20, 15)])
+        # The window grows: its motion size is prepared as soon as the still
+        # view shows its first samples, not only once it has refined fully.
+        worker.submit(2, None, "start", (80, 60), 64, True, warm_size=(40, 30))
+        assert _wait(app, lambda: ready == [(20, 15), (40, 30)])
+        assert epochs == [1, 2]
+        prewarms = [entry[1:] for entry in log if entry[0] == "prewarm"]
+        assert prewarms[-1] == ((40, 30), live_raytrace.FIRST_PREWARM_SAMPLES)
+        # Back at the first size its slot is asked again (it may be evicted).
+        worker.submit(3, None, "start", (40, 30), 64, True, warm_size=(20, 15))
+        assert _wait(app, lambda: len(ready) == 3 and ready[-1] == (20, 15))
+        prewarms = [entry[1:] for entry in log if entry[0] == "prewarm"]
+        assert prewarms[-1] == ((20, 15), live_raytrace.FIRST_PREWARM_SAMPLES)
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()
+
+
+def test_a_projection_change_prepares_the_motion_size_again():
+    from layer_viewer import live_raytrace
+    app = QApplication.instance() or QApplication([])
+    log, ready = [], []
+    Backend = type("Backend", (_WarmBackend,), {"log": log})
+    worker = LiveRayWorker(backend_factory=Backend)
+    epochs = []
+    worker.motion_ready.connect(lambda epoch, size: (ready.append(size), epochs.append(epoch)))
+    perspective = SimpleNamespace(parallel_projection=False)
+    parallel = SimpleNamespace(parallel_projection=True)
+    worker.submit(1, SimpleNamespace(camera=perspective), perspective, (40, 30), 64, True,
+                  warm_size=(20, 15))
+    worker.start()
+    try:
+        assert _wait(app, lambda: ready == [(20, 15)])
+        worker.submit(2, None, parallel, (40, 30), 64, True, warm_size=(20, 15))
+        assert _wait(app, lambda: ready == [(20, 15)] * 2)
+        # Tagged with the epoch the projection change started, not the scene's.
+        assert epochs == [1, 2]
+        prewarms = [entry[1:] for entry in log if entry[0] == "prewarm"]
+        assert prewarms == [((20, 15), live_raytrace.FIRST_PREWARM_SAMPLES)] * 2
+        # The same projection again (the view only moved): nothing to prepare.
+        worker.submit(3, None, SimpleNamespace(parallel_projection=True, moved=True), (40, 30), 4,
+                      True, warm_size=(20, 15))
+        time.sleep(.3)
+        assert len(ready) == 2
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()
+
+
+class _PlainBackend(_WarmBackend):
+    """A backend that cannot prepare motion sizes (no prewarm_motion)."""
+
+    def __getattribute__(self, name):
+        if name == "prewarm_motion":
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+
+def test_a_backend_without_prewarm_reports_its_sizes_ready_at_once():
+    app = QApplication.instance() or QApplication([])
+    ready = []
+    assert not hasattr(_PlainBackend(None, 1, 1, None), "prewarm_motion")
+    worker = LiveRayWorker(backend_factory=_PlainBackend)
+    worker.motion_ready.connect(lambda revision, size: ready.append(size))
+    worker.submit(1, SimpleNamespace(camera="start"), "start", (40, 30), 64, True, warm_size=(20, 15))
+    worker.start()
+    try:
+        assert _wait(app, lambda: ready == [(20, 15)])
+        # After a motion-scale change the new size is ready too, so the next
+        # drag uses it (it records on that drag, as it always did).
+        worker.submit(2, None, "moved", (40, 30), 64, True, warm_size=(28, 21))
+        assert _wait(app, lambda: ready == [(20, 15), (28, 21)])
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()
+
+
+def test_only_traced_drag_frames_make_a_size_ready():
+    app = QApplication.instance() or QApplication([])
+    ready, frames = [], []
+    worker = LiveRayWorker(backend_factory=_PlainBackend)
+    worker.frame.connect(lambda revision, pixels, info: frames.append(revision))
+    worker.motion_ready.connect(lambda revision, size: ready.append(size))
+    worker.submit(1, SimpleNamespace(camera="a"), "a", (20, 15), 1, True, motion=True)
+    worker.start()
+    try:
+        assert _wait(app, lambda: 1 in frames)
+        # The same camera and size again only redisplays: nothing recorded.
+        worker.submit(2, None, "a", (20, 15), 1, True, motion=True)
+        assert _wait(app, lambda: 2 in frames)
+        time.sleep(.1)
+        assert ready == []
+        worker.submit(3, None, "b", (20, 15), 1, True, motion=True)
+        assert _wait(app, lambda: ready == [(20, 15)])
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()
+
+
+def test_a_tracer_slot_decides_when_a_drag_traced_size_is_ready():
+    app = QApplication.instance() or QApplication([])
+    ready, frames = [], []
+
+    class Backend(_PlainBackend):
+        def __init__(self, *args, **kw):
+            super().__init__(*args, **kw)
+            self._active_slot = {}
+
+        def display_image(self, **settings):
+            # Here the slot is prepared only on the third traced frame.
+            if len(frames) >= 2:
+                self._active_slot["prepared"] = True
+            return super().display_image(**settings)
+    worker = LiveRayWorker(backend_factory=Backend)
+    worker.frame.connect(lambda revision, pixels, info: frames.append(revision))
+    worker.motion_ready.connect(lambda revision, size: ready.append(size))
+    worker.submit(1, SimpleNamespace(camera="a"), "a", (20, 15), 1, True, motion=True)
+    worker.start()
+    try:
+        assert _wait(app, lambda: 1 in frames)
+        worker.submit(2, None, "b", (20, 15), 1, True, motion=True)
+        assert _wait(app, lambda: 2 in frames)
+        time.sleep(.1)
+        assert ready == []  # two traced frames, but the slot is not prepared yet
+        worker.submit(3, None, "c", (20, 15), 1, True, motion=True)
+        assert _wait(app, lambda: ready == [(20, 15)])
+    finally:
+        worker.stop()
+        assert worker.wait(3000)
+        app.processEvents()
+
+
+def test_resize_and_projection_change_forget_the_prepared_motion_sizes():
+    from qtpy.QtCore import QSize
+    from qtpy.QtGui import QResizeEvent
+    app = QApplication.instance() or QApplication([])
+    controller, viewport = _controller()
+    try:
+        controller._ready_motion_sizes = {(100, 50)}
+        controller.eventFilter(viewport.plotter.interactor, QResizeEvent(QSize(300, 200), QSize(200, 100)))
+        assert controller._ready_motion_sizes == set()
+
+        def camera(parallel, x=0.):
+            return SimpleNamespace(position=(x, 0, 1), focal_point=(0, 0, 0), up=(0, 1, 0),
+                                   GetParallelProjection=lambda: parallel,
+                                   GetParallelScale=lambda: 1., GetViewAngle=lambda: 30.)
+        viewport.plotter.camera = camera(False)
+        controller.camera_changed()
+        controller._ready_motion_sizes = {(100, 50)}
+        viewport.plotter.camera = camera(False, 1.)  # orbiting keeps them
+        controller.camera_changed()
+        assert controller._ready_motion_sizes == {(100, 50)}
+        viewport.plotter.camera = camera(True, 1.)
+        controller.camera_changed()
+        assert controller._ready_motion_sizes == set()
+    finally:
+        controller.shutdown()
+        viewport.deleteLater()
+        app.processEvents()
+
+
+def test_readiness_queued_before_a_resize_or_projection_change_is_dropped():
+    from qtpy.QtCore import QSize
+    from qtpy.QtGui import QResizeEvent
+    app = QApplication.instance() or QApplication([])
+    controller, viewport = _controller()
+    try:
+        def camera(parallel):
+            return SimpleNamespace(position=(0, 0, 1), focal_point=(0, 0, 0), up=(0, 1, 0),
+                                   GetParallelProjection=lambda: parallel,
+                                   GetParallelScale=lambda: 1., GetViewAngle=lambda: 30.)
+        viewport.plotter.camera = camera(False)
+        controller.camera_changed()
+        old = controller._revision
+        controller._ready_from = old
+        controller._motion_ready(old, (100, 50))
+        assert controller._ready_motion_sizes == {(100, 50)}
+
+        # A prewarm for the old projection finishes after the toggle.
+        viewport.plotter.camera = camera(True)
+        controller.camera_changed()
+        controller._motion_ready(old, (100, 50))
+        assert controller._ready_motion_sizes == set()
+        # The worker's new epoch is the next submit's revision.
+        controller._motion_ready(controller._revision, (100, 50))
+        assert controller._ready_motion_sizes == {(100, 50)}
+
+        old = controller._revision
+        controller.eventFilter(viewport.plotter.interactor, QResizeEvent(QSize(300, 200), QSize(200, 100)))
+        controller._motion_ready(old, (100, 50))
+        assert controller._ready_motion_sizes == set()
+        controller._motion_ready(controller._revision, (100, 50))
+        assert controller._ready_motion_sizes == {(100, 50)}
+    finally:
+        controller.shutdown()
+        viewport.deleteLater()
+        app.processEvents()
