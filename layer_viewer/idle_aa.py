@@ -9,6 +9,8 @@ memory, unlike supersampling. Any interaction cancels the refinement at once.
 """
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 from qtpy.QtCore import QAbstractAnimation, QEvent, QObject, QRect, Qt, QTimer
 from qtpy.QtGui import QImage, QPixmap, QRegion
@@ -120,8 +122,13 @@ class IdleAntialiaser(QObject):
         """
         from vtkmodules.util.numpy_support import vtk_to_numpy
         from vtkmodules.vtkRenderingCore import vtkWindowToImageFilter
-        window = self.viewport.plotter.render_window
-        window.Render()
+        plotter = self.viewport.plotter
+        window = plotter.render_window
+        # A jittered sample is never presented: the screen keeps the last
+        # frame and only the averaged overlay is shown.
+        hold = getattr(plotter, "hold_present", None)
+        with hold() if hold is not None else contextlib.nullcontext():
+            window.Render()
         grabber = vtkWindowToImageFilter()
         grabber.SetInput(window)
         grabber.SetInputBufferTypeToRGB()

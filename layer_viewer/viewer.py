@@ -1,6 +1,8 @@
 """Qt/VTK viewport. Explosion moves rigid layers without stretching copper."""
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 from qtpy.QtCore import Signal, QTimer, QVariantAnimation, QEasingCurve
 from qtpy.QtGui import QQuaternion, QVector3D
@@ -51,6 +53,107 @@ BACKGROUNDS = {
     "kicad": ((.40, .40, .50), (.80, .80, .90)),
     "dark": ((.063, .106, .161), (.141, .224, .290)),
 }
+
+
+class ViewportInteractor(QtInteractor):
+    """A ``QtInteractor`` that draws the board once per displayed frame.
+
+    pyvistaqt re-renders the whole scene in every paint, including the paint
+    that only shows a frame VTK has just finished (as C++
+    ``QVTKOpenGLNativeWidget`` avoids), so each requested frame was rendered
+    twice. Here the first paint after a finished render only copies it to the
+    screen; any other paint (expose, resize, a new GL context) still renders.
+
+    Renders that VTK's interactor style and widgets would run synchronously on
+    every mouse or wheel event are redirected to ``on_render_request`` (the
+    viewport's coalesced redraw) instead. ``plotter.render()`` and direct
+    render-window renders are unaffected: they draw at once, as before.
+    """
+
+    on_render_request = None
+    # The render window holds a finished frame no paint has shown yet.
+    _frame_current = False
+    # Frames rendered only to be read back (idle refinement samples).
+    _hold_present = False
+
+    def setup_render_redirect(self, callback):
+        self.on_render_request = callback
+        interactor = self._Iren
+        interactor.EnableRenderOff()
+        tag = interactor.AddObserver("RenderEvent", self._interactor_render)
+        # pyvistaqt removes these at teardown; VTK would otherwise pin us.
+        self._vtk_observers.append((interactor, tag))
+
+    def mark_frame_stale(self):
+        """The render window no longer holds the view: the next paint renders."""
+        self._frame_current = False
+
+    @contextlib.contextmanager
+    def hold_present(self):
+        """Render frames for read-back only, without presenting them."""
+        self._hold_present = True
+        try:
+            yield
+        finally:
+            self._hold_present = False
+
+    def _interactor_render(self, *_):
+        # vtkRenderWindowInteractor::Render fires RenderEvent even with
+        # rendering disabled. The paint's own render (with _in_paint set) is
+        # not a request; a render nested inside it was dropped by VTK's
+        # InRender guard before this change as well.
+        if self._in_paint or getattr(self, "_closed", False):
+            return
+        if self.on_render_request is not None:
+            self.on_render_request()
+
+    def _cb_frame(self, obj, evt):
+        rw = self._RenderWindow
+        if rw is None or self._in_paint:
+            super()._cb_frame(obj, evt)
+            return
+        if rw.GetDoubleBuffer() and not rw.GetSwapBuffers():
+            return  # back buffer only: not a displayable frame
+        if self._hold_present:
+            # Not the view: keep showing the last presented frame, and make
+            # any paint before the next render draw the real view itself.
+            self._frame_current = False
+            return
+        self._frame_current = True
+        super()._cb_frame(obj, evt)  # schedules the paint
+
+    def initializeGL(self):
+        self._frame_current = False  # a new context has no frame to show
+        super().initializeGL()
+
+    def resizeGL(self, w, h):
+        self._frame_current = False  # the frame has the old size
+        super().resizeGL(w, h)
+
+    def paintGL(self):
+        if self._frame_current:
+            # The finished frame is already in VTK's framebuffer: show it.
+            self._frame_current = False
+            self._in_paint = True  # pyvistaqt then only blits
+            try:
+                super().paintGL()
+            finally:
+                self._in_paint = False
+            return
+        rw = self._RenderWindow
+        interactor = rw.GetInteractor() if rw is not None else None
+        if interactor is None:
+            super().paintGL()
+            return
+        # pyvistaqt renders through the interactor, which the redirect has
+        # switched off: switch it on for the paint's own render.
+        enabled = interactor.GetEnableRender()
+        interactor.EnableRenderOn()
+        try:
+            super().paintGL()
+        finally:
+            interactor.SetEnableRender(enabled)
+
 
 
 def _mapf(x, in_min, in_max, out_min, out_max):
@@ -310,7 +413,7 @@ class BoardViewport(QWidget):
         # peeling (and OIT) drop translucent layers drawn over opaque copper,
         # which made the solder resist vanish. FXAA covers motion; the idle
         # refiner accumulates jittered frames for still views.
-        self.plotter = QtInteractor(self, auto_update=False, multi_samples=0)
+        self.plotter = ViewportInteractor(self, auto_update=False, multi_samples=0)
         layout.addWidget(self.plotter.interactor)
         self.background = "dark"  # matches the ray tracer and the dark UI
         self.set_background(self.background, render=False)
@@ -339,6 +442,11 @@ class BoardViewport(QWidget):
         # 16 ms before every expensive frame. The timer remains one-shot/idle.
         self.render_timer.setInterval(0)
         self.render_timer.timeout.connect(self.plotter.render)
+        # Style and widget renders (pan, dolly, wheel, spin, button release,
+        # axis-widget hover) become one coalesced frame instead of a full
+        # render per event. They do not restart the still-view refinement by
+        # themselves: camera changes and the measurement widget already do.
+        self.plotter.setup_render_redirect(self._schedule_render)
         self.camera_animation = QVariantAnimation(self)
         self.camera_animation.setDuration(320)
         self.camera_animation.setStartValue(0.)
@@ -683,6 +791,9 @@ class BoardViewport(QWidget):
         refiner = getattr(self, "idle_aa", None)
         if refiner is not None:
             refiner.invalidate()
+        self._schedule_render()
+
+    def _schedule_render(self):
         if not self.render_timer.isActive():
             live_ray = getattr(self, "live_ray", None)
             # Under the ray-traced overlay only the axis widget's corner is
@@ -855,7 +966,13 @@ class BoardViewport(QWidget):
                 raise OSError(f"Could not save {path}")
             return
         self.plotter.render()
-        self.plotter.screenshot(str(path), scale=scale)
+        try:
+            self.plotter.screenshot(str(path), scale=scale)
+        finally:
+            # A scaled capture leaves a magnified tile in the render window:
+            # the next paint must draw the view again rather than show it.
+            self.plotter.mark_frame_stale()
+            self.plotter.update()
 
     def closeEvent(self, event):
         self.idle_aa.shutdown()

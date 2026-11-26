@@ -578,7 +578,8 @@ def test_live_ray_overlay_stops_board_drawing_and_restores_it_at_once(window):
         live.set_enabled(False)
     # Turning ray tracing off draws the board again on the next event-loop pass.
     assert not live.covering and renderer.GetDraw()
-    assert interactor.GetEnableRender()
+    # Style renders stay redirected to the coalesced redraw either way.
+    assert not interactor.GetEnableRender()
     assert viewport.render_timer.isActive() and viewport.render_timer.interval() == 0
 
 
