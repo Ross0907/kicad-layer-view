@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Solder joints are sized from each part's placed 3D model (IPC-7351 /
+  J-STD-001 shapes): SMD parts get a concave toe fillet only over the exposed
+  land, rising to about half the terminal height at the end face, with small
+  side fillets and nothing under the body, so an 0402 gets a tiny joint and
+  a 1210 a large one. Gull-wing leads also get a heel fillet. QFN/DFN/SON get
+  a short, low toe fillet and a thin layer under the exposed pad (vendor
+  names such as Panasonic or Johnson no longer count as no-lead packages).
+  BGAs get one collapsed solder ball per land, capped at the package
+  underside; none is drawn where the model has its own balls or the package
+  rests on the board. Through-hole pins get a concave meniscus on the solder
+  side that starts at the land's edge (oval and square lands too) and wets up
+  the pin, following a square pin's flats and corners with no step, plus a
+  rounded pin stub when the model's own pin does not already protrude. Pads
+  without a model keep the small dome.
+  The joints wait for the 3D models to load and refresh once they have.
+
 ## 0.8.3
 
 - New optional "Solder joints" view (off by default, next to "Solder paste"):

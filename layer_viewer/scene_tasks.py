@@ -56,6 +56,7 @@ class SolderTask(SceneTask):
     def __init__(self, snapshot, slot_count, parent=None):
         super().__init__(snapshot, parent)
         self.slot_count = slot_count
+        self.models = None  # the component signature whose models were loaded
 
     def build(self):
         from .solder import build_solder_parts
