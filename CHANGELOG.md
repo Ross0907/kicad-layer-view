@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- More realistic SMD solder joints, matched to photos of reflowed joints and
+  the IPC-A-610 fillet criteria:
+  - Chip parts get one smooth concave meniscus. It leaves the land at a low
+    angle, climbs about 60 % of the end cap and wraps round the cap's corners
+    into side fillets. The paste volume on the land limits its height.
+  - Gull-wing and SOT leads get a low toe ramp, side fillets along the foot
+    and a heel fillet filling the bend.
+  - QFN and DFN pads are flat tinned strips with a small wedge at the flank.
+  - Lands are thinly tinned and feather out at their edges, and joints vary a
+    little in height.
+  - Smoother shading, and a glossier solder material in both the viewer and
+    the ray tracer.
+
 ## 0.8.4
 
 - Solder joints are sized from each part's placed 3D model (IPC-7351 /

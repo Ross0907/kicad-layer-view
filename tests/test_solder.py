@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from layer_viewer import solder
+from layer_viewer.geometry import CONTACT_INSET_MM
 from layer_viewer.model import Footprint, Model3D, Pad, Poly, demo_snapshot
 
 MODEL = [Model3D("part.step")]
@@ -108,6 +109,15 @@ def test_without_models_smd_pads_keep_a_small_dome_and_tht_is_solder_side_only()
         assert spec["pin"] < spec["ring"] and spec["ring"] == pytest.approx(.84, abs=.01)
 
 
+def _expected_fillet(term_h, spec, fraction=None):
+    fraction = solder.FILLET_FRACTION if fraction is None else fraction
+    jitter = float(solder._jitter(spec["center"])[0])
+    exposed = spec["length"] / 2 - spec["toe"]
+    paste = solder.paste_limit(spec["length"], spec["width"], spec["radius"], exposed, spec["terminal"])
+    return min(fraction * term_h * jitter, solder.FILLET_MAX_MM, max(paste, solder.FILLET_MIN_MM),
+               solder.FILLET_TOP * term_h)
+
+
 def test_chip_fillet_covers_only_the_exposed_toe_and_rises_up_the_end_face():
     board = _board()
     geometry = {"fr1": _chip(board, 11., 10., 2., 1.25, .5, .4)}
@@ -119,20 +129,105 @@ def test_chip_fillet_covers_only_the_exposed_toe_and_rises_up_the_end_face():
     # Land 9.5..10.5, end face at x = 10: the toe is the pad's outer half.
     assert left["toe"] == pytest.approx(0., abs=.01)
     terminal = .5 + .04
-    assert left["height"] == pytest.approx(solder.FILLET_FRACTION * terminal, abs=.01)
-    assert left["terminal"] == pytest.approx(.8 * .65, abs=.02)  # 0.625 terminal, capped to leave side fillets
-    # Nothing under the body: the joint stops part-way under the terminal.
+    # About 60 % of the termination, limited by the paste (1 mm land, 0.5 mm toe).
+    assert left["height"] == pytest.approx(_expected_fillet(terminal, left), abs=.005)
+    assert .25 <= left["height"] <= .4
+    # The paste check: a 1 x 1.3 mm land printed 0.13 mm thick feeds about this much.
+    assert solder.paste_limit(1., 1.3, 0., .5, .625) == pytest.approx(.27, abs=.01)
+    assert left["terminal"] == pytest.approx(.625, abs=.02)  # the part's own width
+    # The fillet runs along the end cap band only: never under the body.
     assert -.5 < left["under"] < left["toe"]
     points, triangles, _ = solder.build_side_mesh(board, True, [left], [])
-    assert _closed(points, triangles)
+    assert _closed(points, triangles) and solder._signed_volume(points, triangles) > 0
     base = board.stackup.copper[0].z_top_mm
-    x, z = points[:, 0], points[:, 2] - base
-    assert x.min() == pytest.approx(9.5, abs=1e-6)
-    assert x.max() <= 10. - left["under"] + 1e-6 <= 10.4  # never past the end cap
-    # The meniscus is lowest at the land edge and highest at the end face.
-    outer, face = z[np.isclose(x, 9.5) & (z > 0)], z[np.isclose(x, 10.) & (z > 0)]
-    assert outer.max() == pytest.approx(solder.EDGE_MM, abs=.002)  # plus the contact inset
-    assert face.max() == pytest.approx(left["height"], abs=.002)
+    x, y, z = points[:, 0], -points[:, 1], points[:, 2] - base
+    assert x.min() == pytest.approx(9.5, abs=1e-6) and x.max() == pytest.approx(10.5, abs=1e-6)
+    # Feathered out to nothing at the land's outer edge: no rim.
+    assert z[np.isclose(x, 9.5)].max() == pytest.approx(solder.EDGE_MM, abs=.002)  # plus the contact inset
+    # The wetting line on the end face: the full height mid-face, never above it.
+    at_face = np.isclose(x, 10.)
+    face = z[at_face]
+    middle = face[np.isclose(y[at_face], 10., atol=.05)]
+    assert middle.max() - solder.EDGE_MM == pytest.approx(left["height"], rel=.03)
+    assert z.max() <= left["height"] * (1. + solder.SKEW) + solder.EDGE_MM + .003
+    # Near full height only at the end face and under the cap band.
+    high = x[z > .9 * left["height"] + solder.EDGE_MM]
+    assert np.all((high >= 10. - .03) & (high < 10. - left["under"] + 1e-6))
+    # Past the cap band (under the body) only the thin tinning remains.
+    assert z[x > 10. - left["under"] + 1e-6].max() <= solder.EDGE_MM + solder.TIN_MM + .003
+    # One concave meniscus along the pad: below the chord, its slope growing
+    # all the way from the land edge (about CONTACT_DEG) to the end face.
+    centre = np.isclose(y, 10.) & (x <= 10. + 1e-9) & (z > CONTACT_INSET_MM + 1e-4)
+    order = np.argsort(x[centre])
+    xs, zs = x[centre][order], z[centre][order]
+    assert len(xs) >= 16
+    chord = solder.EDGE_MM + (left["height"] - solder.EDGE_MM) * (xs - 9.5) / .5
+    inner = (xs > 9.55) & (xs < 9.95)
+    assert np.all(zs[inner] < chord[inner])
+    slopes = np.diff(zs) / np.diff(xs)
+    assert np.all(slopes > 0) and slopes[-1] > 1.5           # steep against the end face
+    ramp = xs[1:] < 10. - .03                                 # (it eases onto the face over a hairline)
+    assert np.all(np.diff(slopes[ramp]) > -1e-6)
+    assert 12. < math.degrees(math.atan(slopes[0])) < 30.
+    # The end fillet wraps round the cap's corners into side fillets that
+    # climb the cap's flanks along its band (land 1.3 wide, part 1.25): low,
+    # as they reach only 0.025 mm past the flank.
+    expected = min(solder.SIDE_FRACTION * left["height"], max(solder.SIDE_REACH * .025, .25 * left["height"]))
+    assert left["side"] == pytest.approx(expected, abs=.005)
+    flank = (x > 10.05) & (x < 10.2) & (np.abs(np.abs(y - 10.) - .6) < .03)
+    assert flank.any() and z[flank].max() > .8 * left["side"]
+    # ...and taper to nothing at the land's side edges.
+    assert z[np.isclose(np.abs(y - 10.), .65, atol=1e-6)].max() <= solder.EDGE_MM + .003
+    # Shading has no bright rim: the top surface's normals at the land edge
+    # are not tilted by the hairline wall that closes the solid.
+    normals = solder.vertex_normals(points, triangles)
+    rim = (z > CONTACT_INSET_MM + solder.EDGE_MM / 2) & np.isclose(x, 9.5) & (np.abs(y - 10.) < .6)
+    assert rim.any() and normals[rim, 2].min() > .85
+
+
+def test_corner_squares_never_collapse_and_quads_follow_the_surface():
+    a, b = np.meshgrid(np.linspace(-1., 1., 41), np.linspace(-.5, .5, 21), indexing="ij")
+    ma, mb = solder._rounded(a, b, 1., .5, .4)
+    # The mapped grid keeps every cell open: they narrow only right at the
+    # land's corner, never along the corner square's diagonal.
+    cell = ((ma[1:, :-1] - ma[:-1, :-1]) * (mb[:-1, 1:] - mb[:-1, :-1])
+            - (mb[1:, :-1] - mb[:-1, :-1]) * (ma[:-1, 1:] - ma[:-1, :-1]))
+    assert cell.min() > 0. and cell[2:-2, 2:-2].min() > .2 * cell.max()
+    # Quads are split along the diagonal that folds them least (a fixed split
+    # zigzags across a saddle).
+    u, v = np.meshgrid(np.linspace(-1., 1., 5), np.linspace(-1., 1., 5), indexing="ij")
+    top = np.stack([u, v, .4 * u * v + .2 * u * u], axis=-1).reshape(1, 25, 3)
+    triangles = solder._top_triangles(top, 5, 5)[0]
+
+    def fold(tris):
+        p = top[0][tris]
+        n = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+        n /= np.linalg.norm(n, axis=1, keepdims=True)
+        half = len(tris) // 2
+        return np.einsum("ij,ij->i", n[:half], n[half:])
+
+    quads = solder._grid_quads(5, 5)
+    ac = fold(np.concatenate([quads[:, [0, 3, 2]], quads[:, [0, 2, 1]]]))
+    bd = fold(np.concatenate([quads[:, [1, 0, 3]], quads[:, [1, 3, 2]]]))
+    assert np.allclose(fold(triangles), np.maximum(ac, bd)) and np.any(ac != bd)
+
+
+def test_lands_vary_a_little_and_the_mesh_is_dense():
+    board = _board()
+    geometry = {"fr1": _chip(board, 11., 10., 2., 1.25, .3, .4)}  # well below the paste limit
+    fillets = _fillets(solder.smd_joint_specs(board, geometry)[True])
+    heights = [spec["height"] for spec in fillets]
+    assert heights[0] != heights[1]
+    for spec in fillets:
+        assert abs(spec["height"] / (solder.FILLET_FRACTION * .34) - 1.) <= solder.JITTER + 1e-9
+    factors = solder._jitter(np.random.default_rng(1).uniform(0., 300., (500, 2)))
+    assert factors.min() >= 1. - solder.JITTER and factors.max() <= 1. + solder.JITTER and factors.std() > .02
+    # Dense enough along and across the joint for an unbroken highlight.
+    points, triangles, _ = solder.build_side_mesh(board, True, fillets[:1], [])
+    normals = np.cross(points[triangles[:, 1]] - points[triangles[:, 0]],
+                       points[triangles[:, 2]] - points[triangles[:, 0]])
+    area = np.linalg.norm(normals, axis=1)
+    assert ((normals[:, 2] / np.maximum(area, 1e-15)) > .2).sum() > 400
 
 
 def test_fillets_scale_with_the_part():
@@ -143,13 +238,17 @@ def test_fillets_scale_with_the_part():
     geometry = {"fc1": _chip(board, 10., 10., 1., .5, .5, .25),
                 "fc2": _chip(board, 20., 10., 3.2, 2.5, 1.25, .5)}
     specs = _fillets(solder.smd_joint_specs(board, geometry)[True])
-    small_h = {spec["height"] for spec in specs if spec["center"][0] < 15}
-    big_h = {spec["height"] for spec in specs if spec["center"][0] > 15}
-    assert len(small_h) == len(big_h) == 1
-    small_h, big_h = small_h.pop(), big_h.pop()
-    assert small_h == pytest.approx(.5 * .54, abs=.01)    # 0402: a quarter millimetre
-    assert big_h == pytest.approx(.5 * 1.29, abs=.01)     # 1210: well over half a millimetre
-    assert big_h > 2 * small_h
+    small = [spec["height"] for spec in specs if spec["center"][0] < 15]
+    big = [spec["height"] for spec in specs if spec["center"][0] > 15]
+    assert len(small) == len(big) == 2
+    for spec in specs:
+        # Both are capped by the paste a stencil can print on their lands.
+        term_h = .54 if spec["center"][0] < 15 else 1.29
+        assert spec["height"] == pytest.approx(_expected_fillet(term_h, spec), abs=.005)
+    # 0402: about 0.3 mm; 1210: a quarter to half a millimetre, far below 60 % of its cap.
+    assert .25 <= min(small) and max(small) <= .36
+    assert .25 <= min(big) <= max(big) <= .5
+    assert max(big) < .5 * 1.29
 
 
 def test_gull_wing_lead_gets_toe_and_heel_fillets():
@@ -164,12 +263,33 @@ def test_gull_wing_lead_gets_toe_and_heel_fillets():
                               _box(10.4, 10.55, 9.88, 10.12, z0 + .15, z0 + .9),
                               _box(11., 14., 8., 12., z0 + .1, z0 + 1.4))}
     specs = solder.smd_joint_specs(board, geometry)[True]
-    assert len(specs) == 2 and all(spec["kind"] == "fillet" for spec in specs)
-    toe, heel = sorted(specs, key=lambda spec: spec["axis"][0])
-    assert toe["axis"] == pytest.approx([-1., 0.]) and toe["toe"] == pytest.approx(.4, abs=.01)
-    assert toe["height"] == pytest.approx(.5 * .19, abs=.01)
-    assert heel["axis"] == pytest.approx([1., 0.]) and heel["toe"] == pytest.approx(.4, abs=.01)
-    assert heel["height"] == pytest.approx(.19, abs=.01)  # about one lead thickness
+    assert len(specs) == 1 and specs[0]["kind"] == "lead"  # one joint, toe to heel
+    lead = specs[0]
+    assert lead["axis"] == pytest.approx([-1., 0.]) and lead["toe"] == pytest.approx(.4, abs=.01)
+    jitter = 1. + (float(solder._jitter(lead["center"])[0]) - 1.) / 2.
+    assert lead["height"] == pytest.approx(solder.LEAD_TOE_FRACTION * .19 * jitter, abs=.005)  # small toe
+    assert lead["heel_height"] == pytest.approx(solder.HEEL_FRACTION * .19 * jitter, abs=.005)
+    assert lead["heel_height"] > 2 * lead["height"]
+    # The heel fillet climbs the shank: its wall is where the lead's underside
+    # (0.19 mm up over x 10.4..10.55) stays below the fillet height.
+    assert lead["foot"] == pytest.approx(-.4, abs=.01) and lead["heel"] == pytest.approx(-.55, abs=.02)
+    points, triangles, _ = solder.build_side_mesh(board, True, specs, [])
+    assert _closed(points, triangles) and solder._signed_volume(points, triangles) > 0
+    x, y, z = points[:, 0], -points[:, 1], points[:, 2] - board.stackup.copper[0].z_top_mm
+    assert x.min() == pytest.approx(9.25, abs=1e-6) and x.max() == pytest.approx(10.75, abs=1e-6)
+    # Over the foot (top at 0.19) no solder pokes through the lead.
+    over_foot = (x > 9.62) & (x < 10.38) & (np.abs(y - 10.) < .1)
+    assert z[over_foot].max() < .19
+    # Highest under the bend, feathered out at both ends of the land.
+    assert x[np.argmax(z)] > 10.38
+    assert z[np.isclose(x, 9.25) | np.isclose(x, 10.75)].max() <= solder.EDGE_MM + .003
+    # Side fillets climb the foot's flanks along its whole length.
+    beside = (x > 9.65) & (x < 10.35) & (np.abs(np.abs(y - 10.) - .12) < .01)
+    assert beside.any() and z[beside].min() > .5 * lead["side"]
+    # The toe is a low ramp over the whole toe land, rising toward the foot.
+    toe = np.isclose(y, 10.) & (x < 9.6) & (z > CONTACT_INSET_MM + 1e-4)
+    order = np.argsort(x[toe])
+    assert np.all(np.diff(z[toe][order]) > 0) and z[toe].max() <= lead["height"] * 1.1 + solder.EDGE_MM
 
 
 def _qfn(base, name="QFN-8-1EP_3x3mm"):
@@ -201,6 +321,15 @@ def test_qfn_gets_low_toe_fillets_and_a_thin_exposed_pad_layer():
     for spec in fillets:
         assert spec["toe"] == pytest.approx(.1, abs=.01)  # the package edge
         assert solder.NOLEAD_MIN_MM <= spec["height"] <= solder.NOLEAD_MAX_MM
+        assert spec["side"] == 0.                         # sawn flanks: no side fillets
+    # A flat tinned strip with a low wedge at the flank, no dome.
+    points, triangles, _ = solder.build_side_mesh(board, True, fillets[:1], [])
+    x, y, z = points[:, 0], -points[:, 1], points[:, 2] - board.stackup.copper[0].z_top_mm
+    lo, hi = sorted((fillets[0]["center"][0] + fillets[0]["axis"][0] * fillets[0]["toe"],
+                     fillets[0]["center"][0] + fillets[0]["axis"][0] * .4))
+    strip = (x > lo + .02) & (x < hi - .02) & np.isclose(y, -fillets[0]["center"][1], atol=.02)
+    assert strip.any() and z.max() <= .08 + solder.EDGE_MM
+    assert np.ptp(z[strip & (np.abs(x - (lo + hi) / 2) < .03)]) < .01
     # The same package without a telling name is recognised by its tall flank.
     pads, fp = _qfn(base, name="IC")
     board = replace(base, pads=pads, footprints=[fp], solder_paste=None)
@@ -328,14 +457,16 @@ def test_every_joint_kind_is_watertight_outward_and_sits_on_the_copper():
         assert (points[:, 2] - base_z).__abs__().min() == pytest.approx(0., abs=.002)
 
 
-def test_meniscus_and_side_profiles_are_concave():
+def test_meniscus_is_concave_and_meets_both_faces_almost_tangent():
     s = np.linspace(0., 1., 11)
     toe = solder.meniscus(s)
     assert toe[0] == 0. and toe[-1] == pytest.approx(1.)
     assert np.all(np.diff(toe, 2) > 0)               # slope grows toward the terminal
-    side = solder.side_profile(s)
-    assert side[0] == pytest.approx(1.) and side[-1] == 0.
-    assert np.all(np.diff(side, 2) > 0)
+    # A small contact angle on the land (a fillet as tall as its reach: 15-30
+    # degrees) and nearly vertical against the end face.
+    start = math.degrees(math.atan((solder.meniscus(1e-4) - solder.meniscus(0.)) / 1e-4))
+    assert 12. < start < 30.
+    assert (solder.meniscus(1.) - solder.meniscus(1. - 1e-4)) / 1e-4 > 10.
 
 
 def test_signature_follows_models_and_parts_are_cached(monkeypatch):
@@ -355,8 +486,8 @@ def test_materials_realistic_metal_and_plain_grey_kicad():
     from layer_viewer.progressive_raytrace import _material
     from types import SimpleNamespace
     rgb, metallic, roughness = finishes.solder_appearance("realistic")
-    assert metallic == 1. and .2 <= roughness <= .3
-    assert np.allclose(np.asarray(rgb) * 255, (200, 200, 198), atol=40)  # linear swatch of sRGB 200
+    assert metallic == 1. and .12 <= roughness <= .18  # glossy SAC305
+    assert np.allclose(rgb, (.82, .82, .85), atol=.03)
     grey, kicad_metal, _ = finishes.solder_appearance("kicad")
     assert kicad_metal is None and grey[0] == grey[1] == grey[2]
     mesh = SimpleNamespace(kind="solder", color=rgb, metallic=metallic, roughness=roughness, opacity=1.,

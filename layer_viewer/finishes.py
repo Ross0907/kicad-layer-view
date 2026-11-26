@@ -126,11 +126,13 @@ SOLDER_COLOR = _rgb(0xaa, 0xaa, 0xa6)       # pcb2blender solder
 # Unreflowed solder paste: grey metal powder in flux, rough and nearly matte.
 PASTE_COLOR = _rgb(0x8c, 0x8c, 0x88)
 PASTE_METALLIC, PASTE_ROUGHNESS = .2, .8
-# Reflowed solder joints (SAC305 / tin-lead): a satin bright metal. The ray
-# tracer uses SOLDER_JOINT_F0 (linear reflectance) rather than the swatch.
-SOLDER_JOINT_COLOR = _rgb(200, 200, 198)
-SOLDER_JOINT_ROUGHNESS = .25
-SOLDER_JOINT_F0 = (.80, .80, .82)
+# Reflowed solder joints (SAC305): a bright, glossy, faintly cool silver
+# (good joints are roughness 0.1-0.2; tin-lead is shinier still), the hue of
+# the tinned end caps and leads it wets. The ray tracer uses SOLDER_JOINT_F0
+# (linear reflectance) rather than the swatch.
+SOLDER_JOINT_COLOR = _rgb(209, 209, 217)
+SOLDER_JOINT_ROUGHNESS = .15
+SOLDER_JOINT_F0 = (.82, .82, .85)
 # KiCad style: a plain light grey, like KiCad's own paste/solder grey.
 KICAD_SOLDER_COLOR = (.75, .75, .75)
 # Copper seen through solder resist: the warm, partly diffuse color that tints

@@ -7,14 +7,26 @@ against the footprint's own 3D model placed exactly like KiCad places it:
 
 * Leaded SMD parts (chips, gull wings, D-PAK tabs, molded bodies): the model
   is sectioned along the pad to find the terminal's end face (the toe) and
-  its height there. Only the exposed toe of the land is wetted visibly: a
-  concave meniscus from the land's outer edge up to about half the terminal
-  height at the end face, with small concave side fillets. Under the part
-  the joint stops a short way in (hidden by the terminal); nothing is drawn
-  under the body. A 0402 gets a tiny fillet, a 1210 or D-PAK tab a big one.
-* Bottom-terminated parts (QFN, DFN, SON, LGA, crystals): a short, low toe
-  fillet on the exposed land end; thermal / exposed pads under the body get
-  a thin flat layer.
+  its height there. One smooth height field per land: a single concave
+  meniscus runs from the land's outer edge (leaving it at about 20 degrees,
+  zero thickness, no rim) up to about 60 % of the terminal height at the
+  end face, which it meets almost tangent. Its wetting line is level across
+  the face and dips round the terminal's corners, where the end meniscus
+  turns into concave side fillets (about 0.85 of its height) along the cap
+  band (or foot) on round contours, with no spike or crease. The rest of
+  the land is thinly tinned, feathering out at its edges; no fillet is
+  drawn under the body. The land's paste volume caps the fillet (a long
+  land gets a lower, longer ramp; 0.25-0.5 mm on real parts), and joints
+  vary a little in height and tilt (whole-joint, never per vertex).
+* Gull-wing / J leads: one joint per land: a low concave toe ramp (about 0.6
+  lead thicknesses at the toe) fading out to the land's edge, side fillets
+  along the foot and the heel fillet (about 1.25 lead thicknesses) filling
+  the bend, which meets the lead where the model's shank has risen to its
+  height and runs back along the land up to HEEL_REACH_MM.
+* Bottom-terminated parts (QFN, DFN, SON, LGA, crystals): a flat tinned strip
+  on the exposed land end with a low concave wedge at the (barely wetting)
+  flank and no side fillets; thermal / exposed pads under the body get a
+  thin flat layer.
 * BGA: one collapsed solder ball (truncated sphere) per land, its diameter
   from the land size and its height about 3/4 of the ball diameter, capped
   at the package underside. The model is sectioned at each land: where it
@@ -44,21 +56,68 @@ import threading
 
 import numpy as np
 
-# Wetted rim at the land edge (keeps every joint a proper solid).
-EDGE_MM = .012
+# The solder feathers out to nothing at the land edge (this hairline wall,
+# far too thin to see, keeps every joint a proper solid).
+EDGE_MM = .001
 # Solder under a seated part: the 0.04 mm paste deposit the models sit on.
 UNDER_TERMINAL_MM = .04
-# Toe fillet height as a fraction of the terminal height at its end face
-# (J-STD-001: at least solder thickness + 25 %, up to the terminal top).
-FILLET_FRACTION = .5
-FILLET_MIN_MM, FILLET_MAX_MM = .04, .9
-# Heel fillet behind a gull-wing / J-lead foot: about one lead thickness.
-HEEL_FRACTION, HEEL_MAX_MM, HEEL_MIN_MM = 1., .4, .08
+# Toe fillet height as a fraction of the terminal height at its end face.
+# Real reflowed chip joints climb 50-75 % of the termination (J-STD-001:
+# at least solder thickness + 25 %, at most the terminal top); a gull-wing
+# toe (a sheared lead end, no fillet required) a small meniscus of about
+# 0.3-0.7 lead thicknesses.
+FILLET_FRACTION, LEAD_TOE_FRACTION = .6, .6
+FILLET_MIN_MM, FILLET_MAX_MM = .04, .5
+# A fillet never reaches quite to the terminal top.
+FILLET_TOP = .92
+# Paste volume: a STENCIL_MM print, half of it metal, feeds the joint; most
+# of that (TOE_SHARE) ends up in the toe fillet, whose cross-section is
+# MENISCUS_AREA of its reach x height. Big parts stay at 0.25-0.5 mm.
+STENCIL_MM, METAL_FRACTION, TOE_SHARE = .13, .5, .6
+MENISCUS_AREA = .3
+# Side fillets along a chip's cap band: about 0.85 of the end fillet, the
+# band's whole length, ending at its inner edge; along a gull-wing foot about
+# 0.7 lead thicknesses.
+SIDE_FRACTION, LEAD_SIDE_FRACTION = .85, .7
+SIDE_REACH = 5.              # at most this many times its reach past the flank
+# Heel fillet behind a gull-wing / J-lead foot: about one lead thickness
+# (G + T; real joints reach 1-1.5 T), climbing the lead's shank and running
+# back along the land at most HEEL_REACH_MM (IPC-7351 heel goal 0.25-0.45).
+HEEL_FRACTION, HEEL_MAX_MM, HEEL_MIN_MM = 1.25, .4, .08
 HEEL_LEAD_MAX_MM = .3          # thicker terminals are end faces, not lead feet
-# Bottom-terminated parts: only the plated flank wets, so the toe fillet is low.
-NOLEAD_FRACTION, NOLEAD_MIN_MM, NOLEAD_MAX_MM = .22, .05, .16
+HEEL_STEPS, HEEL_STEP_MM = 10, .05
+HEEL_REACH_MM = .45
+HEEL_SAG = .3                  # the heel crescent is this much lower beside the lead
+# Bottom-terminated parts: plain sawn flanks hardly wet, so the exposed land
+# is a flat tinned strip (NOLEAD_TIN_MM) with a low concave wedge at the
+# flank, reaching NOLEAD_REACH_MM over the land; no side fillets.
+NOLEAD_FRACTION, NOLEAD_MIN_MM, NOLEAD_MAX_MM = .2, .03, .06
+NOLEAD_SIDE = 0.
+NOLEAD_TIN_MM, NOLEAD_REACH_MM = .03, .25
 NOLEAD_HEIGHT_MM = .35        # a terminal this tall at the end face is a package flank
 NOLEAD_MAX_PITCH_MM = 1.3
+# Fillet shape: the solder keeps its wetting-line height this far into the
+# model (a clean cut against the end face, no lip or seam); side fillets fall
+# to the land edge over at least SIDE_EDGE_MM. The meniscus leaves the land at
+# about CONTACT_DEG and meets the terminal's faces within about 20 degrees of
+# them (FACE_SOFT: the normalised width over which it eases off the face).
+# Its wetting line is level across the end face and dips round the corners
+# to the side fillets' height. Away from the faces the end and side menisci
+# blend through a rounded corner: over CORNER_RUN of the toe the side contact
+# line eases in by about the fillet height and the easing widens to
+# CORNER_SOFT, so no crease runs out from the terminal's corners.
+OVERLAP_MM = .015
+SIDE_EDGE_MM = .025
+CONTACT_DEG = 20.
+FACE_SOFT, CORNER_SOFT = .005, 1.
+CORNER_RUN = .5
+# Tinned land around the fillets: a flat layer feathering out at the edge
+# over TIN_LIP_MM, pulled back from sharp land corners by PULLBACK_MM.
+TIN_MM, TIN_LIP_MM = .02, .1
+PULLBACK_MM = .07
+# Joint-to-joint variation (deterministic per land): height and a slight
+# side-to-side tilt.
+JITTER, SKEW = .1, .05
 # Thin domed coating for pads without a usable model.
 DOME_MIN_MM, DOME_MAX_MM = .03, .07
 # Exposed toe shorter than this: the land is covered, give it a thin flat layer.
@@ -91,7 +150,7 @@ THT_PROFILE_STEPS = 11
 THT_CONE_MIX = .12
 BALL_SEGMENTS = 14
 _CACHE_SIZE = 4
-_VERSION = 3
+_VERSION = 7
 
 # Package family tokens must stand alone (an optional one- or two-letter
 # variant prefix such as W/V/HV/T, then a separator, digit or the end), so
@@ -108,77 +167,176 @@ def _quarter(count):
     return np.sin(np.linspace(0., math.pi / 2, count))
 
 
-# Fillet grid. Along the pad (u): the exposed toe from the land's outer edge
-# (s = 0) to the terminal end face (s = 1), denser where the meniscus steepens,
-# then a short stretch under the terminal tapering back down (hidden).
-_TOE_S = _quarter(7)
-_UNDER_X = np.array([1 / 3, 2 / 3, 1.])
-# Across: the terminal's width (flat), then concave side fillets to the land edge.
-_SIDE_Q = np.array([.15, .5, 1.])
-_INNER_T = np.array([-1., -.5, 0., .5, 1.])
+# Fillet grid. Along the pad: the exposed toe from the terminal wall (0) to
+# the land's outer edge (1): dense at the wall over the climbing meniscus,
+# then out to the edge (dense again at its feathered lip); then the band
+# under the terminal (fraction of the way to where the joint stops).
+_TOE_NEAR = 1. - np.cos(np.linspace(0., math.pi / 2, 11))
+_TOE_FAR = np.sin(np.linspace(0., math.pi / 2, 9))[1:]
+_BAND_T = (1. - np.cos(np.linspace(0., math.pi, 8)[1:])) / 2.
+# Past the band only the land's tinning runs on to its inner edge (thin,
+# under the part).
+_INNER_X = np.array([.4, .85, 1.])
+# A lead: along the foot (toe wall to heel), up the shank (heel to the heel
+# wall), then the heel meniscus from its wall (0) to the land's inner edge (1).
+_FOOT_T = np.linspace(0., 1., 9)[1:]
+_SHANK_T = np.linspace(0., 1., 6)[1:-1]
+_HEEL_X = (1. - np.cos(np.linspace(0., math.pi, 15))) / 2.
+# Across: side fillets (fraction of the side reach, edge to core) and the
+# core (dense toward its edges, where the end fillet turns the corners).
+_SIDE_E = (1. + np.cos(np.linspace(0., math.pi, 9))) / 2.
+_CORE_T = np.sin(np.linspace(-math.pi / 2, math.pi / 2, 23))[1:-1]
 # Dome / flat grids (u from the outer edge to the inner edge, v across).
-_DOME_U = (1. - np.cos(np.linspace(0., math.pi, 7))) / 2.
-_GRID_V = np.sin(np.linspace(-math.pi / 2, math.pi / 2, 7))
+_DOME_U = (1. - np.cos(np.linspace(0., math.pi, 9))) / 2.
+_GRID_V = np.sin(np.linspace(-math.pi / 2, math.pi / 2, 9))
 
 
-def _roll(t, start):
-    """1 inside ``start``, then a convex quarter-ellipse down to 0 at |t| = 1."""
-    x = np.clip((np.abs(t) - start) / (1. - start), 0., 1.)
-    return np.sqrt(1. - x * x)
+def _smoothstep(t):
+    t = np.clip(t, 0., 1.)
+    return t * t * (3. - 2. * t)
 
 
-def meniscus(s):
+def _smootherstep(t):
+    """0 to 1 with no jump in slope or curvature at either end (C2)."""
+    t = np.clip(t, 0., 1.)
+    return t * t * t * (t * (6. * t - 15.) + 10.)
+
+
+def _soft_max(fillet, tin):
+    """The fillet over the tinned layer, merged without a crease or a bump (an 8-norm)."""
+    return (fillet ** 8 + tin ** 8) ** .125
+
+
+def _soft_ramp(t, r):
+    """0 for t <= 0, then t - r beyond 2r, eased in between.
+
+    A narrow ease (at a terminal face) is quadratic, so the meniscus meets
+    the face steeply; a wide one (round a corner) blends into a quartic with
+    no jump in curvature either (C2), so a metal highlight runs over it
+    unbroken.
+    """
+    t = np.maximum(t, 0.)
+    wide = np.clip((r - FACE_SOFT) / (CORNER_SOFT - FACE_SOFT), 0., 1.)
+    ease = (1. - wide) * t * t / (4. * r) + wide * (t ** 3 / (4. * r * r) - t ** 4 / (16. * r ** 3))
+    return np.where(t < 2. * r, ease, t - r)
+
+
+def _extent(t, half_t, half_o, radius):
+    """A rounded land's half extent along one axis at offset ``t`` along the other."""
+    over = np.maximum(np.abs(t) - (half_o - radius), 0.)
+    return half_t - radius + np.sqrt(np.maximum(radius * radius - over * over, 0.))
+
+
+def _feather(t, start):
+    """1 inside ``start``, easing out to 0 at |t| = 1 with a concave lip (no rim)."""
+    return _smoothstep((1. - np.abs(t)) / (1. - start))
+
+
+def meniscus(s, slope=.3):
     """Concave toe profile: 0 at the land edge (s = 0), 1 at the end face (s = 1).
 
     A circular meniscus centred above the land edge, blended with the straight
-    wetting line so the solder meets the land at a small, non-zero angle.
+    wetting line: it leaves the land with ``slope`` (normalised; about 15-30
+    degrees for a fillet as tall as its reach) and runs up the end face almost
+    tangent. Never convex: the slope only grows toward the terminal.
     """
     s = np.clip(np.asarray(s, dtype=float), 0., 1.)
-    return .6 * (1. - np.sqrt(1. - s * s)) + .4 * s
+    return slope * s + (1. - slope) * (1. - np.sqrt(1. - s * s))
 
 
-def side_profile(q):
-    """Concave side fillet: 1 against the terminal (q = 0), 0 at the land edge."""
-    q = np.clip(np.asarray(q, dtype=float), 0., 1.)
-    return 1. - np.sqrt(1. - (1. - q) ** 2)
+def _hash(centers, seed):
+    centers = np.asarray(centers, dtype=float).reshape(-1, 2)
+    noise = np.sin(centers[:, 0] * 12.9898 + centers[:, 1] * 78.233 + seed) * 43758.5453
+    return 2. * (noise - np.floor(noise)) - 1.
+
+
+def _jitter(centers):
+    """Deterministic per-land factor in 1 +- JITTER (real joints differ a little)."""
+    return 1. + JITTER * _hash(centers, 0.)
 
 
 def _dome_height(u, v, height):
     u = np.asarray(u)[None, :, None]
     v = np.asarray(v)[None, None, :]
     height = np.asarray(height)[:, None, None]
-    return EDGE_MM + (height - EDGE_MM) * _roll(2. * u - 1., .45) * _roll(v, .45)
+    return EDGE_MM + (height - EDGE_MM) * np.sqrt(_feather(2. * u - 1., .2) * _feather(v, .2))
 
 
 def _flat_height(u, v, height):
     u = np.asarray(u)[None, :, None]
     v = np.asarray(v)[None, None, :]
     height = np.asarray(height)[:, None, None]
-    return EDGE_MM + (height - EDGE_MM) * _roll(2. * u - 1., .7) * _roll(v, .7)
+    return EDGE_MM + (height - EDGE_MM) * _feather(2. * u - 1., .7) * _feather(v, .7)
 
 
-def _grid_topology(nu, nv):
-    """Top/bottom grid triangles and the boundary walls of one closed tile.
-
-    Vertices: top grid (nu*nv), then bottom grid (nu*nv). Along u the pad
-    coordinate decreases, along v it increases; ``_place`` fixes the overall
-    orientation from the signed volume.
-    """
+def _boundary_loop(nu, nv):
+    """Grid indices around the edge of an nu x nv grid, counter-clockwise in (a, b)."""
     index = np.arange(nu * nv).reshape(nu, nv)
-    a, b, c, d = index[:-1, :-1], index[1:, :-1], index[1:, 1:], index[:-1, 1:]
-    quads = np.stack([a, b, c, d], axis=-1).reshape(-1, 4)
-    top = np.concatenate([quads[:, [0, 3, 2]], quads[:, [0, 2, 1]]])
-    bottom = top[:, ::-1] + nu * nv
     loop = np.concatenate([index[0, :], index[1:, -1], index[-1, -2::-1], index[-2:0:-1, 0]])
     coords = np.stack([.5 - np.repeat(np.arange(nu), nv) / (nu - 1),
                        np.tile(np.arange(nv), nu) / (nv - 1)], axis=1)
     ring = coords[loop]
     if np.sum(ring[:, 0] * np.roll(ring[:, 1], -1) - np.roll(ring[:, 0], -1) * ring[:, 1]) < 0:
         loop = loop[::-1]
+    return loop
+
+
+def _grid_quads(nu, nv):
+    index = np.arange(nu * nv).reshape(nu, nv)
+    a, b, c, d = index[:-1, :-1], index[1:, :-1], index[1:, 1:], index[:-1, 1:]
+    return np.stack([a, b, c, d], axis=-1).reshape(-1, 4)
+
+
+def _top_triangles(top, nu, nv):
+    """Per tile, each grid quad split along the diagonal that folds it least.
+
+    A fixed split runs against the curvature of a saddle (where an end
+    meniscus turns into a side fillet), leaving a zigzag crease in the shading.
+    """
+    quads = _grid_quads(nu, nv)
+    p = top[:, quads]                                       # (P, Q, 4, 3)
+
+    def fold(i, j, k, m):
+        n1 = np.cross(p[:, :, j] - p[:, :, i], p[:, :, k] - p[:, :, i])
+        n2 = np.cross(p[:, :, k] - p[:, :, i], p[:, :, m] - p[:, :, i])
+        n1 /= np.maximum(np.linalg.norm(n1, axis=-1, keepdims=True), 1e-30)
+        n2 /= np.maximum(np.linalg.norm(n2, axis=-1, keepdims=True), 1e-30)
+        return np.einsum("pqk,pqk->pq", n1, n2)
+
+    along_ac = fold(0, 3, 2, 1) >= fold(1, 0, 3, 2)          # flatter split along a-c
+    ac = np.concatenate([quads[:, [0, 3, 2]], quads[:, [0, 2, 1]]])
+    bd = np.concatenate([quads[:, [1, 0, 3]], quads[:, [1, 3, 2]]])
+    pick = np.concatenate([along_ac, along_ac], axis=1)[:, :, None]
+    return np.where(pick, ac[None], bd[None])
+
+
+def _grid_topology(nu, nv, top=None):
+    """Top grid triangles, boundary walls and bottom fan of one closed tile.
+
+    Vertices: top grid (nu*nv), then the boundary loop again on the copper,
+    then the bottom centre (the footprint is convex, so a fan closes it).
+    Along u the pad coordinate decreases, along v it increases; ``_place``
+    fixes the overall orientation from the signed volume. With ``top`` (the
+    tiles' top points, (P, nu*nv, 3)) each tile gets its own quad splits and
+    the result is (P, T, 3).
+    """
+    if top is None:
+        quads = _grid_quads(nu, nv)
+        grid = np.concatenate([quads[:, [0, 3, 2]], quads[:, [0, 2, 1]]])
+    else:
+        grid = _top_triangles(top, nu, nv)
+    loop = _boundary_loop(nu, nv)
+    n = len(loop)
     p, q = loop, np.roll(loop, -1)
-    bp, bq = p + nu * nv, q + nu * nv
+    bp = nu * nv + np.arange(n)
+    bq = np.roll(bp, -1)
     walls = np.concatenate([np.stack([bp, bq, q], axis=1), np.stack([bp, q, p], axis=1)])
-    return np.concatenate([top, bottom, walls])
+    centre = np.full(n, nu * nv + n)
+    bottom = np.stack([centre, bq, bp], axis=1)
+    rest = np.concatenate([walls, bottom])
+    if grid.ndim == 2:
+        return np.concatenate([grid, rest])
+    return np.concatenate([grid, np.broadcast_to(rest, (len(grid),) + rest.shape)], axis=1)
 
 
 def _rounded(a, b, half_a, half_b, radius):
@@ -186,7 +344,8 @@ def _rounded(a, b, half_a, half_b, radius):
 
     Points in a corner square (both coordinates beyond the straight edges)
     take the elliptical square-to-disc map, so the rectangle's corner lands on
-    the arc and no triangle folds over (circles: the whole square).
+    the arc and no triangle folds over; cells only narrow right at the land's
+    corner (circles: the whole square).
     """
     radius = np.maximum(radius, 1e-9)
     inner_a, inner_b = half_a - radius, half_b - radius
@@ -218,9 +377,10 @@ def _tile_solids(pads, a, b, heights):
     x = pads["center"][:, 0, None, None] + a * axis[:, 0, None, None] + b * side[:, 0, None, None]
     y = pads["center"][:, 1, None, None] + a * axis[:, 1, None, None] + b * side[:, 1, None, None]
     top = np.stack([x, y, heights], axis=-1).reshape(count, nu * nv, 3)
-    bottom = top.copy()
+    bottom = top[:, _boundary_loop(nu, nv)]
     bottom[..., 2] = 0.
-    return np.concatenate([top, bottom], axis=1), _grid_topology(nu, nv)
+    centre = bottom.mean(axis=1, keepdims=True)
+    return np.concatenate([top, bottom, centre], axis=1), _grid_topology(nu, nv, top)
 
 
 def _revolution_solids(centers, radii, heights, segments=THT_SEGMENTS):
@@ -261,27 +421,60 @@ def _signed_volume(points, triangles):
 
 
 def _place(points, triangles, z_base, front):
-    """Stack per-pad local solids at ``z_base``; flip the bottom side outward."""
+    """Stack per-pad local solids at ``z_base``; flip the bottom side outward.
+
+    ``triangles`` is shared (T, 3) or per pad (P, T, 3).
+    """
     count, per_pad = points.shape[:2]
     points = points.copy()
     points[..., 2] = z_base + points[..., 2] if front else z_base - points[..., 2]
     flat = points.reshape(-1, 3)
+    if triangles.ndim == 2:
+        triangles = np.broadcast_to(triangles, (count,) + triangles.shape)
+    first = triangles[0] if count else triangles
     offsets = (np.arange(count) * per_pad)[:, None, None]
-    triangles = (triangles[None, :, :] + offsets).reshape(-1, 3)
-    if count and _signed_volume(points[0], triangles[:len(triangles) // count]) < 0:
+    triangles = (triangles + offsets).reshape(-1, 3)
+    if count and _signed_volume(points[0], first) < 0:
         triangles = triangles[:, ::-1]
     return flat, triangles
 
 
-def vertex_normals(points, triangles):
-    """Area-weighted smooth vertex normals (shading only)."""
+def vertex_normals(points, triangles, crease_deg=50., smooth=1):
+    """Area-weighted smooth vertex normals (shading only), split at creases.
+
+    A second pass drops the faces more than ``crease_deg`` off a vertex's
+    average, so the hairline wall closing a joint at the land edge (and its
+    flat bottom) never tilts the top surface's shading into a bright rim.
+    ``smooth`` passes then average the normals over the faces each vertex
+    keeps, so the shading follows the smooth surface, not the grid's facets.
+    """
+    triangles = np.asarray(triangles)
+    count = len(points)
+    corners = np.concatenate([triangles[:, 0], triangles[:, 1], triangles[:, 2]])
     v0, v1, v2 = points[triangles[:, 0]], points[triangles[:, 1]], points[triangles[:, 2]]
     face = np.cross(v1 - v0, v2 - v0)
-    normals = np.zeros_like(points)
-    for corner in range(3):
-        np.add.at(normals, triangles[:, corner], face)
-    length = np.linalg.norm(normals, axis=1, keepdims=True)
-    return (normals / np.maximum(length, 1e-12)).astype(np.float32)
+    area = np.linalg.norm(face, axis=1)
+    unit = face / np.maximum(area, 1e-30)[:, None]
+
+    def gather(values, weight=None):
+        """Per vertex, the normalised sum of per-face ``values`` (T, 3) over its corners."""
+        values = np.tile(values, (3, 1)) if weight is None else np.tile(values, (3, 1)) * weight[:, None]
+        summed = np.stack([np.bincount(corners, values[:, k], minlength=count) for k in range(3)], axis=1)
+        return summed / np.maximum(np.linalg.norm(summed, axis=1, keepdims=True), 1e-12)
+
+    first = gather(face)
+    kept = (np.einsum("ij,ij->i", np.tile(unit, (3, 1)), first[corners])
+            > math.cos(math.radians(crease_deg))).astype(float)
+    normals = gather(face, kept)
+    lost = np.linalg.norm(normals, axis=1) < .5
+    normals[lost] = first[lost]
+    for _ in range(smooth):
+        mean = (normals[triangles[:, 0]] + normals[triangles[:, 1]] + normals[triangles[:, 2]]) * area[:, None]
+        smoothed = gather(mean, kept)
+        lost = np.linalg.norm(smoothed, axis=1) < .5
+        smoothed[lost] = normals[lost]
+        normals = smoothed
+    return normals.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +630,7 @@ _LINES = np.array([0., -.45, .45, -.85, .85])
 
 
 def terminal_section(corners, center, axis, half_len, half_w):
-    """Section the model along the pad: ``(toe, height, heel, half_width)``.
+    """Section the model along the pad: ``(toe, height, heel, half_width, under)``.
 
     Lines run along ``axis`` at the lateral offsets ``_LINES * half_w``. Per
     line, the toe is the outermost model point over the land (pad
@@ -445,20 +638,23 @@ def terminal_section(corners, center, axis, half_len, half_w):
     model's top within ``TOE_WINDOW_MM`` behind it and the heel the innermost
     point resting on the seating plane (where a gull-wing foot starts). NaN
     where a line misses the model. ``half_width`` is the terminal's half width
-    (model extent across the pad) just behind the outermost toe.
+    (model extent across the pad) just behind the outermost toe. ``under``
+    (lines, HEEL_STEPS) is the lowest model surface at ``HEEL_STEP_MM`` steps
+    in from the heel (a lead's shank rising toward the body), inf where none.
     """
     lines = _LINES * half_w
     toe = np.full(len(lines), np.nan)
     height, heel = toe.copy(), toe.copy()
+    under = np.full((len(lines), HEEL_STEPS), np.inf)
     if not len(corners):
-        return toe, height, heel, 0.
+        return toe, height, heel, 0., under
     side = np.array([-axis[1], axis[0]])
     rel = corners[..., :2] - center
     a, b, z = rel @ axis, rel @ side, corners[..., 2]
     keep = ((a.min(axis=1) <= half_len) & (a.max(axis=1) >= -half_len)
             & (b.min(axis=1) <= half_w) & (b.max(axis=1) >= -half_w))
     if not keep.any():
-        return toe, height, heel, 0.
+        return toe, height, heel, 0., under
     a, b, z = a[keep], b[keep], z[keep]
     d = b[:, :, None] - lines[None, None, :]                  # (T, 3, L)
     pa, pz = [], []
@@ -486,13 +682,23 @@ def terminal_section(corners, center, axis, half_len, half_w):
 
     c1, cz1, c2, cz2, ok = clip(-half_len, half_len)
     if not ok.any():
-        return toe, height, heel, 0.
+        return toe, height, heel, 0., under
     found = ok.any(axis=0)
     toe = np.where(found, np.max(np.where(ok, c2, -np.inf), axis=0), np.nan)
     seat = np.min(np.where(ok, np.minimum(cz1, cz2), np.inf), axis=0)
     resting = ok[None] & (np.stack([cz1, cz2]) <= seat + .03)
     heel = np.min(np.where(resting, np.stack([c1, c2]), np.inf), axis=(0, 1))
     heel = np.where(found & np.isfinite(heel), heel, np.nan)
+    # The model's underside at steps in from the heel (shank of a lead).
+    steps = np.where(np.isfinite(heel), heel, 0.)[:, None] - HEEL_STEP_MM * np.arange(1, HEEL_STEPS + 1)
+    lo, hi = np.minimum(c1, c2), np.maximum(c1, c2)
+    span = np.where(c2 - c1 > 1e-12, c2 - c1, 1.)
+    for k in range(HEEL_STEPS):
+        at = steps[:, k][None, :]
+        cover = ok & (lo <= at) & (hi >= at)
+        zk = cz1 + np.clip((at - c1) / span, 0., 1.) * (cz2 - cz1)
+        under[:, k] = np.min(np.where(cover, zk, np.inf), axis=0)
+    under[~np.isfinite(heel)] = np.inf
     window_lo = np.where(found, toe - TOE_WINDOW_MM, 0.)
     window_hi = np.where(found, toe, 0.)
     c1, cz1, c2, cz2, ok = clip(window_lo[None, :], window_hi[None, :])
@@ -502,7 +708,7 @@ def terminal_section(corners, center, axis, half_len, half_w):
     outer = float(np.nanmax(toe)) if found.any() else 0.
     near = (a >= outer - TOE_WINDOW_MM) & (a <= outer + 1e-3) & (np.abs(b) <= half_w * 1.5)
     width = float(np.clip(np.abs(b[near]).max(), 0., half_w)) if near.any() else 0.
-    return toe, height, heel, width
+    return toe, height, heel, width, under
 
 
 def _package_kind(footprint, frames):
@@ -596,12 +802,14 @@ def _ball_standoff(corners, frames, pitch):
 def smd_joint_specs(snapshot, geometry=None):
     """Per side, the SMD lands that get a joint: ``{True: [...], False: [...]}``.
 
-    Each entry is a dict with ``kind`` (``"fillet"``, ``"dome"``, ``"flat"`` or
-    ``"ball"``), ``center``/``axis`` (mesh XY; the axis points from the part
-    out over the land), ``length`` (along the axis), ``width``, ``radius``,
-    ``height`` and for fillets ``toe`` (end face, pad coordinate along the
-    axis), ``under`` (where the joint stops under the terminal) and
-    ``terminal`` (terminal half width). A land needs copper on an outer
+    Each entry is a dict with ``kind`` (``"fillet"``, ``"lead"``, ``"dome"``,
+    ``"flat"`` or ``"ball"``), ``center``/``axis`` (mesh XY; the axis points
+    from the part out over the land), ``length`` (along the axis), ``width``,
+    ``radius``, ``height`` and for fillets and leads ``toe`` (end face, pad
+    coordinate along the axis) and ``terminal`` (terminal half width). A
+    fillet has ``under`` (where it stops under the terminal), a lead ``foot``
+    (where the foot leaves the land), ``heel`` (where its heel fillet meets
+    the shank) and ``heel_height``. A land needs copper on an outer
     layer, a mask opening there, and paste over it or a placed (modelled)
     part; a snapshot without paste artwork needs only the opening.
 
@@ -648,6 +856,18 @@ def smd_joint_specs(snapshot, geometry=None):
     for (front, footprint_id), (footprint, frames) in groups.items():
         specs[front].extend(_footprint_specs(footprint, frames, geometry.get(footprint_id), front, copper))
     return specs
+
+
+def paste_limit(length, width, radius, exposed, terminal):
+    """Tallest toe fillet the land's paste can feed (mm).
+
+    The print (land area x STENCIL_MM, METAL_FRACTION of it metal) gives
+    TOE_SHARE to the toe fillet, a meniscus of MENISCUS_AREA x reach x height
+    across the part's width (2 x ``terminal``).
+    """
+    area = length * width - (4. - math.pi) * radius ** 2
+    metal = area * STENCIL_MM * METAL_FRACTION * TOE_SHARE
+    return metal / max(MENISCUS_AREA * exposed * 2. * terminal, 1e-9)
 
 
 def _footprint_specs(footprint, frames, geometry, front, copper):
@@ -705,7 +925,7 @@ def _footprint_specs(footprint, frames, geometry, front, copper):
             entries.append(dome)
             continue
         half_len, half_w = length / 2, width / 2
-        toe, height, heel, terminal = terminal_section(corners, mesh_center, axis, half_len, half_w)
+        toe, height, heel, terminal, shank = terminal_section(corners, mesh_center, axis, half_len, half_w)
         if not np.isfinite(toe[0]):
             hits = np.flatnonzero(np.isfinite(toe))
             if not len(hits):
@@ -724,29 +944,58 @@ def _footprint_specs(footprint, frames, geometry, front, copper):
             continue
         nolead = kind == "nolead" or (len(frames) >= 3 and term_h >= NOLEAD_HEIGHT_MM
                                       and pitch[index] <= NOLEAD_MAX_PITCH_MM and half_len - toe_c < .8)
-        if nolead:
-            fillet = float(np.clip(NOLEAD_FRACTION * term_h, NOLEAD_MIN_MM, NOLEAD_MAX_MM))
-        else:
-            fillet = float(np.clip(FILLET_FRACTION * term_h, FILLET_MIN_MM, FILLET_MAX_MM))
-        fillet = max(min(fillet, max(term_h, FILLET_MIN_MM)), EDGE_MM * 3)
-        # Side fillets start at the terminal's flanks (always leave some).
-        terminal = float(np.clip(terminal, .35 * half_w, .8 * half_w))
         covered = toe_c + half_len
         heel_c = float(heel[centre_line])
         foot = toe_c - heel_c if np.isfinite(heel_c) else covered
         heel_gap = heel_c + half_len if np.isfinite(heel_c) else 0.
-        # Under the terminal the joint reaches a third to half of the covered
-        # land (hidden by the terminal); nothing is drawn under the body.
+        lead = (not nolead and heel_gap >= HEEL_MIN_MM and foot >= .1 and term_h <= HEEL_LEAD_MAX_MM)
+        exposed = half_len - toe_c
+        # Leads of one part look alike; chips vary more.
+        jitter = float(_jitter(mesh_center)[0])
+        jitter = 1. + (jitter - 1.) / 2. if lead or nolead else jitter
+        # The side fillets start at the terminal's flanks: about the part's width.
+        terminal = float(np.clip(terminal, .35 * half_w, half_w))
+        if nolead:
+            fillet = float(np.clip(NOLEAD_FRACTION * term_h, NOLEAD_MIN_MM, NOLEAD_MAX_MM))
+        else:
+            fillet = float(np.clip((LEAD_TOE_FRACTION if lead else FILLET_FRACTION) * term_h * jitter,
+                                   FILLET_MIN_MM, FILLET_MAX_MM))
+        if not (nolead or lead):
+            # The paste a stencil prints on the land limits big parts' fillets.
+            fillet = min(fillet, max(paste_limit(length, width, radius, exposed, terminal), FILLET_MIN_MM))
+        fillet = max(min(fillet, FILLET_TOP * max(term_h, FILLET_MIN_MM)), EDGE_MM * 3)
+        # Under the terminal the joint runs along the cap band / foot (side
+        # fillets beside it, hidden under it); past it only the land's thin
+        # tinning (clear below the body).
         reach = min(.6 * covered, max(.35 * covered, .1))
-        entries.append({**base, "kind": "fillet", "height": fillet, "toe": toe_c,
-                        "under": max(toe_c - reach, -half_len), "terminal": terminal, "nolead": bool(nolead)})
-        if not nolead and heel_gap >= HEEL_MIN_MM and foot >= .1 and term_h <= HEEL_LEAD_MAX_MM:
-            # Gull wing / J lead: the land runs on behind the foot, under the
-            # bend; J-STD-001 asks for a heel fillet of about the lead
-            # thickness there.
-            heel_h = float(np.clip(HEEL_FRACTION * term_h, FILLET_MIN_MM, HEEL_MAX_MM))
-            entries.append({**base, "kind": "fillet", "axis": -axis, "height": heel_h, "toe": -heel_c,
-                            "under": -heel_c - min(.5 * foot, .3), "terminal": terminal, "nolead": False})
+        if np.isfinite(heel_c):
+            reach = min(reach, max(foot, .08))
+        if not lead:
+            side = fillet * (NOLEAD_SIDE if nolead else SIDE_FRACTION)
+            # A side fillet that reaches only a little past the flank stays low.
+            side = min(side, max(SIDE_REACH * (half_w - terminal), .25 * fillet))
+            entries.append({**base, "kind": "fillet", "height": fillet, "toe": toe_c,
+                            "under": max(toe_c - reach, -half_len), "terminal": terminal, "nolead": bool(nolead),
+                            "side": side})
+            continue
+        # Gull wing / J lead: the land runs on behind the foot, under the
+        # bend; J-STD-001 asks for a heel fillet of about the lead thickness
+        # there. It climbs the shank: its top meets the lead where the lead's
+        # underside has risen to the fillet height. One joint runs from the
+        # toe along the foot (side fillets) to the heel.
+        heel_h = float(np.clip(HEEL_FRACTION * term_h * jitter, FILLET_MIN_MM, HEEL_MAX_MM))
+        side = float(np.clip(LEAD_SIDE_FRACTION * term_h * jitter, fillet, heel_h))
+        rise = shank[centre_line]
+        wall, below = heel_c, UNDER_TERMINAL_MM
+        for k in range(HEEL_STEPS):
+            if not rise[k] <= heel_h:
+                if np.isfinite(rise[k]):
+                    wall -= HEEL_STEP_MM * float(np.clip((heel_h - below) / max(rise[k] - below, 1e-6), 0., 1.))
+                break
+            wall, below = heel_c - HEEL_STEP_MM * (k + 1), float(rise[k])
+        wall = max(wall, heel_c - .6 * heel_gap)
+        entries.append({**base, "kind": "lead", "height": fillet, "toe": toe_c, "foot": heel_c, "heel": wall,
+                        "heel_height": heel_h, "terminal": terminal, "side": side})
     return entries
 
 
@@ -956,20 +1205,129 @@ def _ball_profiles(land, height, ball):
     return np.concatenate([zeros, r, zeros], axis=1), np.concatenate([zeros, z, height], axis=1)
 
 
-def _fillet_grid(pads):
-    """(a, b, heights) of the toe-fillet tiles for a batch of fillet lands."""
+def _fillet_grid(pads, lead=False):
+    """(a, b, heights) of the fillet tiles for a batch of fillet (or lead) lands.
+
+    Along the pad: the exposed toe from the land's outer edge to the terminal
+    wall (the end face), then the band under the terminal: to ``under`` for
+    a fillet, or along the foot to the heel wall and the heel meniscus back
+    along the land for a lead. Across: a core of the terminal's width and
+    side reaches out to the land edges.
+
+    One continuous height field per land, evaluated where the tile puts each
+    grid point. ``s`` runs from 0 on the land's edge (its rounded corners
+    included) to 1 on the terminal's faces: the product of a ramp in front
+    of the end face (behind the heel for a lead) and one beside the flanks,
+    each eased off the face without a kink, so the end meniscus turns the
+    terminal's corners smoothly. The wetting line's height ``top`` is level
+    across the end face and dips round the corners to the side fillets'
+    height, which runs the cap band (or foot, climbing the shank to the heel
+    crescent) and tapers off at its inner end. The profile is one concave
+    meniscus from the land edge (about CONTACT_DEG) to the face. A flat
+    tinned layer covers the rest of the land, feathering out at its edges.
+    """
     half_len, half_w = pads["length"] / 2, pads["width"] / 2
-    toe, under, height, terminal = pads["toe"], pads["under"], pads["height"], pads["terminal"]
-    a_toe = half_len[:, None] - _TOE_S[None, :] * (half_len - toe)[:, None]
-    a_under = toe[:, None] - _UNDER_X[None, :] * (toe - under)[:, None]
-    a = np.concatenate([a_toe, a_under], axis=1)
-    z_toe = EDGE_MM + (height[:, None] - EDGE_MM) * meniscus(_TOE_S)[None, :]
-    z_under = EDGE_MM + (height[:, None] - EDGE_MM) * np.sqrt(1. - _UNDER_X ** 2)[None, :]
-    centre = np.concatenate([z_toe, z_under], axis=1)
-    sides = terminal[:, None] + _SIDE_Q[None, :] * (half_w - terminal)[:, None]
-    b = np.concatenate([-sides[:, ::-1], _INNER_T[None, :] * terminal[:, None], sides], axis=1)
-    g = np.concatenate([side_profile(_SIDE_Q)[::-1], np.ones(len(_INNER_T)), side_profile(_SIDE_Q)])
-    heights = EDGE_MM + (centre[:, :, None] - EDGE_MM) * g[None, None, :]
+    toe, height, terminal, side_h = pads["toe"], pads["height"], pads["terminal"], pads["side"]
+    count = len(toe)
+    nolead = pads["nolead"] > .5 if "nolead" in pads else np.zeros(count, dtype=bool)
+    side_wall = np.maximum(terminal, .3 * half_w)
+    core = np.clip(np.minimum(side_wall, half_w - SIDE_EDGE_MM), .2 * half_w, .95 * half_w)
+    reach_a = np.maximum(half_len - toe, 1e-6)
+    reach_b = np.maximum(half_w - core, 1e-6)
+    toe_f = np.concatenate([.55 * _TOE_NEAR, .55 + .45 * _TOE_FAR])
+    parts = [toe[:, None] + toe_f[None, ::-1] * reach_a[:, None]]
+    if lead:
+        heel_wall = pads["heel"]
+        foot = np.clip(pads["foot"], heel_wall, toe)
+        parts.append(toe[:, None] - _FOOT_T[None, :] * (toe - foot)[:, None])
+        parts.append(foot[:, None] - _SHANK_T[None, :] * (foot - heel_wall)[:, None])
+        parts.append(heel_wall[:, None] - _HEEL_X[None, :] * (heel_wall + half_len)[:, None])
+    else:
+        # A bottom-terminated stub stops right inside the package edge.
+        under = np.where(nolead, np.maximum(pads["under"], toe - 2. * OVERLAP_MM), pads["under"])
+        parts.append(toe[:, None] - _BAND_T[None, :] * (toe - under)[:, None])
+        parts.append(under[:, None] - _INNER_X[None, :] * (under + half_len)[:, None])
+    a = np.concatenate(parts, axis=1)
+    sides = core[:, None] + _SIDE_E[None, :] * reach_b[:, None]
+    b = np.concatenate([-sides, _CORE_T[None, :] * core[:, None], sides[:, ::-1]], axis=1)
+
+    def per(value):
+        return np.asarray(value, dtype=float)[:, None, None]
+
+    shape = (count, a.shape[1], b.shape[1])
+    A, signed = _rounded(np.broadcast_to(a[:, :, None], shape), np.broadcast_to(b[:, None, :], shape),
+                         per(half_len), per(half_w), per(pads["radius"]))
+    B = np.abs(signed)
+    soft = FACE_SOFT
+    # The land's outer end and side edge through this point (rounded corners).
+    end_edge = _extent(B, per(half_len), per(half_w), per(pads["radius"]))
+    side_edge = _extent(A, per(half_w), per(half_len), per(pads["radius"]))
+    reach = np.maximum(end_edge - per(toe), 1e-6)
+    reach = np.where(per(nolead), np.minimum(reach, NOLEAD_REACH_MM), reach)
+    side_reach = np.maximum(side_edge - per(core), 1e-6)
+    x, y = A - per(toe), B - per(core)
+
+    # How far round the corner a point is: 0 at the terminal's face (a corner
+    # radius inside its flank), easing up (C2) to 1 over CORNER_RUN of the toe.
+    radius_c = per(np.minimum(np.maximum(height, side_h), .5 * core))
+
+    def away(d, run, start=0.):
+        return _smootherstep((d + start) / (run + start))
+
+    out = away(x, CORNER_RUN * reach, .25 * radius_c)
+    if lead:
+        heel_wall_ = per(heel_wall)
+        heel_reach = np.clip(heel_wall_ + end_edge, 1e-6, HEEL_REACH_MM)
+        out = np.maximum(out, away(heel_wall_ - A, CORNER_RUN * heel_reach))
+    soft_a = soft + (CORNER_SOFT - soft) * away(y, side_reach)
+    soft_b = soft + (CORNER_SOFT - soft) * out
+    pull = radius_c * out
+    # Normalised distance out from the faces: along the pad (in front of the
+    # end face, or behind the heel) and across it, joined as a 2-norm so the
+    # menisci turn the corners on round contours (no dent, no crease).
+    along = _soft_ramp(x / reach * (1. + soft_a), soft_a)
+    if lead:
+        along = along + _soft_ramp((heel_wall_ - A) / heel_reach * (1. + soft_a), soft_a)
+    beside = _soft_ramp((y + pull) / (side_reach + pull) * (1. + soft_b), soft_b)
+    s = 1. - np.sqrt(along * along + beside * beside)
+    slope = math.tan(math.radians(CONTACT_DEG)) / (1. + soft)
+    toe_reach = np.where(nolead, np.minimum(reach_a, NOLEAD_REACH_MM), reach_a)
+    c_toe = per(np.clip(slope * toe_reach / np.maximum(height, 1e-6), .1, .85))
+    # Wetting line across the end face: level, dipping round the corners
+    # (about the fillet height wide) to the side fillets.
+    across = np.clip(B / per(core), 0., 1.)
+    ratio = per(np.minimum(side_h / np.maximum(height, 1e-9), 1.))
+    turn = per(np.maximum(np.minimum(height, .5 * core), 1e-6))
+    rounding = _smootherstep((B - per(core) + turn) / turn)
+    face = 1. + (ratio - 1.) * rounding
+    if lead:
+        # Along the foot the side fillets rise from the toe's height to their
+        # own, then climb the shank to the heel crescent (lower beside the
+        # lead than under its bend).
+        t = np.clip((per(toe) - A) / np.maximum(per(toe - foot), 1e-9), 0., 1.)
+        rise = np.clip((per(foot) - A) / np.maximum(per(foot - heel_wall), 1e-9), 0., 1.)
+        heel = per(pads["heel_height"]) * (1. - HEEL_SAG * _smootherstep(across))
+        level = per(height) * face + per(np.maximum(side_h - height, 0.)) * rounding * _smootherstep(t / .5)
+        top = level + (heel - level) * rise * rise
+        heel_c = np.clip(heel_wall + half_len, 1e-6, HEEL_REACH_MM)
+        c_heel = per(np.clip(slope * heel_c / np.maximum(pads["heel_height"], 1e-6), .1, .85))
+        mix = _smootherstep((per(toe) - A) / np.maximum(per(toe - heel_wall), 1e-9))
+        c = c_toe + (c_heel - c_toe) * mix
+    else:
+        # Along the cap band the side fillets keep their height for most of
+        # its length, then taper off toward its inner end.
+        t = np.clip((per(toe) - A) / np.maximum(per(toe - under), 1e-9), 0., 1.)
+        top = per(height) * face * (1. - _smootherstep((t - .6) / .4))
+        c = c_toe
+    skew = 1. + SKEW * per(_hash(pads["center"], 7.)) * signed / per(half_w)
+    fillet = top * skew * meniscus(np.clip(s, 0., 1.), c)
+    # Tinned land: distance in from the land's edge, its corners rounded.
+    corner = per(np.maximum(pads["radius"], np.minimum(PULLBACK_MM, .4 * np.minimum(half_len, half_w))))
+    qa, qb = np.abs(A) - (per(half_len) - corner), B - (per(half_w) - corner)
+    edge = corner - np.hypot(np.maximum(qa, 0.), np.maximum(qb, 0.)) - np.minimum(np.maximum(qa, qb), 0.)
+    lip = per(np.minimum(TIN_LIP_MM, .45 * np.minimum(half_len, half_w)))
+    tin = per(np.where(nolead, NOLEAD_TIN_MM, TIN_MM)) * _smootherstep(edge / lip)
+    heights = EDGE_MM + _soft_max(fillet, tin)
     return a, b, heights
 
 
@@ -984,15 +1342,16 @@ def build_side_mesh(snapshot, front, smd=None, tht=None):
     smd = smd_joint_specs(snapshot)[front] if smd is None else smd
     tht = tht_joint_specs(snapshot)[front] if tht is None else tht
     pieces, area = [], 0.
-    for kind in ("fillet", "dome", "flat"):
+    for kind in ("fillet", "lead", "dome", "flat"):
         group = [spec for spec in smd if spec["kind"] == kind]
         if not group:
             continue
         keys = ["center", "axis", "length", "width", "radius", "height"]
-        keys += ["toe", "under", "terminal"] if kind == "fillet" else []
+        keys += {"fillet": ["toe", "under", "terminal", "side", "nolead"],
+                 "lead": ["toe", "foot", "heel", "heel_height", "terminal", "side"]}.get(kind, [])
         pads = {key: np.array([spec[key] for spec in group], dtype=float) for key in keys}
-        if kind == "fillet":
-            a, b, heights = _fillet_grid(pads)
+        if kind in ("fillet", "lead"):
+            a, b, heights = _fillet_grid(pads, lead=kind == "lead")
         else:
             a = (.5 - _DOME_U)[None, :] * pads["length"][:, None]
             b = _GRID_V[None, :] * (pads["width"][:, None] / 2)

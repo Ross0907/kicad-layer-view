@@ -235,7 +235,7 @@ def _material(mesh, *, coated=False, capped=False):
             from .finishes import SOLDER_JOINT_F0
             opaque = {"type": "principled", "metallic": 1.,
                       "base_color": {"type": "rgb", "value": list(SOLDER_JOINT_F0)},
-                      "roughness": mesh.roughness if getattr(mesh, "roughness", None) is not None else .25}
+                      "roughness": mesh.roughness if getattr(mesh, "roughness", None) is not None else .15}
         else:
             opaque = {"type": "principled", "base_color": rgb, "metallic": 0., "roughness": .45}
     elif mesh.kind == "mask":
