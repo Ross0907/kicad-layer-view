@@ -22,7 +22,7 @@ def test_metal_colors_are_shown_like_pcb2blender_library_pins():
     silver = np.round(np.array(metal_display_color((.824, .820, .781))) * 255)
     gold = np.round(np.array(metal_display_color((.859, .738, .496))) * 255)
     np.testing.assert_allclose(silver, (0xea, 0xea, 0xe5), atol=1)
-    np.testing.assert_allclose(gold, (0xd9, 0xae, 0x55), atol=1)
+    np.testing.assert_allclose(gold, (0xe2, 0xc0, 0x60), atol=1)
 
 
 def _snapshot(models, mounting="smd", dnp=False, pos=False, side="top"):
@@ -141,3 +141,67 @@ def test_copper_windings_show_copper_not_the_gold_of_plated_pins():
     assert metal_display_color((.859, .738, .496)) == pytest.approx(GOLD_PART_COLOR)  # KiCad PIN-02
     r, g, b = COPPER_PART_COLOR
     assert g / r < .7 and r > g > b  # reddish copper, clearly redder than gold
+
+
+def _decode(rgb):
+    return np.array([v / 12.92 if v <= .04045 else ((v + .055) / 1.055) ** 2.4 for v in rgb])
+
+
+def test_plated_gold_parts_are_yellow_gold_not_copper_in_both_renderers():
+    # SMA bodies (KiCad PIN-02 gold) traced as copper: the old swatch decoded to
+    # an F0 with green at 0.61 of red, redder than measured copper's 0.67.
+    from layer_viewer.finishes import (COPPER_F0, COPPER_PART_COLOR, GOLD_PART_COLOR, GOLD_PART_F0,
+                                       component_metal_color)
+    r, g, b = GOLD_PART_COLOR
+    assert .8 <= g / r <= .9 and b / r < .5  # viewport: yellow gold, neither orange nor cream
+    f0 = _decode(component_metal_color(GOLD_PART_COLOR))
+    np.testing.assert_allclose(f0, GOLD_PART_F0, atol=1e-6)
+    assert f0[1] / f0[0] > COPPER_F0[1] / COPPER_F0[0] + .05  # yellower than copper
+    assert f0[1] / f0[0] >= .72 and f0[2] / f0[0] >= .28  # near measured gold (.77, .34)
+    copper = _decode(component_metal_color(COPPER_PART_COLOR))
+    assert copper[1] / copper[0] < f0[1] / f0[0] - .3  # windings stay distinctly copper
+
+
+def test_other_metal_parts_trace_their_own_display_color():
+    from layer_viewer.finishes import COPPER_PART_COLOR, component_metal_color
+    for raw in ((.824, .820, .781), (.508, .508, .508), (.78, .53, .42)):  # tin, nickel shell, winding
+        shown = metal_display_color(raw)
+        assert component_metal_color(shown) == pytest.approx(shown)
+    assert component_metal_color(COPPER_PART_COLOR) == pytest.approx(COPPER_PART_COLOR)
+
+
+def test_ray_tracer_component_material_uses_gold_f0_only_for_plated_gold():
+    from dataclasses import replace
+    from layer_viewer.finishes import COPPER_PART_COLOR, GOLD_PART_COLOR, GOLD_PART_F0
+    from layer_viewer.progressive_raytrace import _material
+    from layer_viewer.raytrace import CapturedMesh
+    eye = tuple(map(tuple, np.eye(4)))
+    gold = CapturedMesh("sma", "component", np.zeros((3, 3)), np.array([[0, 1, 2]]), eye,
+                        GOLD_PART_COLOR, 1., (), 1., .26)
+
+    def base(mesh):
+        return np.array(_material(mesh)["bsdf"]["base_color"]["value"])
+    np.testing.assert_allclose(base(gold), GOLD_PART_F0, atol=1e-5)
+    np.testing.assert_allclose(base(replace(gold, color=COPPER_PART_COLOR)), _decode(COPPER_PART_COLOR),
+                               atol=1e-5)
+    # A grey plastic body (and a dielectric with a gold-like color) keeps its color.
+    np.testing.assert_allclose(base(replace(gold, color=(.27, .27, .27), metallic=0.)),
+                               _decode((.27, .27, .27)), atol=1e-5)
+    np.testing.assert_allclose(base(replace(gold, metallic=0.)), _decode(GOLD_PART_COLOR), atol=1e-5)
+
+
+_SMA_STEP = components.Path(r"C:\Program Files\KiCad\10.0\share\kicad\3dmodels\Connector_Coaxial.3dshapes"
+                            r"\SMA_Samtec_SMA-J-P-H-ST-EM1_EdgeMount.step")
+
+
+@pytest.mark.skipif(not _SMA_STEP.is_file(), reason="KiCad 10 3D model library not installed")
+def test_samtec_sma_edge_mount_loads_as_plated_gold(tmp_path):
+    pytest.importorskip("OCP")
+    from layer_viewer.finishes import GOLD_PART_COLOR
+    meshes = components.load_model(_SMA_STEP, cache_dir=tmp_path)
+    # One PIN-02 gold appearance for the whole body, threads and legs.
+    assert len(meshes) == 1
+    mesh = meshes[0]
+    assert mesh.color == pytest.approx((.859, .738, .496), abs=1e-3)
+    assert mesh.metallic == 1. and components._is_gold(mesh.color) and not components._is_copper(mesh.color)
+    assert metal_display_color(mesh.color) == pytest.approx(GOLD_PART_COLOR)

@@ -107,9 +107,16 @@ BARE_COPPER_COLOR = _rgb(0xe1, 0xbb, 0xac)  # pcb2blender NONE (bare copper / OS
 HASL_COLOR = _rgb(0xda, 0xda, 0xd7)
 # pcb2blender's ENIG #efdfbb reads as pale cream under image-based lighting;
 # immersion gold is a saturated warm yellow: REAL_ENIG_COLOR above.
-# Gold/brass model parts (SMA bodies, gold pins): a deeper gold, since a
-# lighter swatch washes out to beige as an environment-lit metal.
-GOLD_PART_COLOR = _rgb(0xd9, 0xae, 0x55)
+# Gold-plated model parts (SMA bodies, gold pins): the viewport swatch, a
+# clear yellow gold (green ~0.85 of red, like photographed hard-gold plating).
+# The previous #d9ae55, decoded to linear for the ray tracer, had green at
+# 0.61 of red: redder than measured copper (0.67), so plated SMA bodies traced
+# as copper and their flat legs showed salmon under the viewport's specular.
+GOLD_PART_COLOR = _rgb(0xe2, 0xc0, 0x60)
+# Ray-traced F0 of those parts: measured gold reflectance (1.0, .766, .336),
+# a little deeper so interreflections in the threads stay gold instead of
+# saturating to orange or washing out to beige.
+GOLD_PART_F0 = (.92, .70, .30)
 # Copper model parts (inductor windings, bare copper wire): enamelled magnet
 # wire reads as a reddish copper, not as the yellow of plated gold.
 COPPER_PART_COLOR = _rgb(0xd2, 0x7e, 0x55)
@@ -418,6 +425,19 @@ def covered_copper_color(rgb):
     """
     if is_realistic_metal(rgb) or _same(rgb, COVERED_COPPER_COLOR):
         return COVERED_COPPER_COLOR
+    return tuple(float(v) for v in rgb[:3])
+
+
+def component_metal_color(rgb):
+    """Ray-traced reflectance (sRGB-encoded F0) for a metal model part's color.
+
+    Model parts carry viewport display swatches (``metal_display_color``).
+    Plated gold traces measured gold F0 rather than its decoded swatch; every
+    other metal (tin, nickel and silver shells, copper windings) its own color.
+    """
+    key = tuple(round(float(v), 6) for v in rgb[:3])
+    if key == tuple(round(v, 6) for v in GOLD_PART_COLOR):
+        return _srgb_reflectance(GOLD_PART_F0)
     return tuple(float(v) for v in rgb[:3])
 
 
