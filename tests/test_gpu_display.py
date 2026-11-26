@@ -192,3 +192,35 @@ def test_motion_frames_reuse_the_full_size_sensor_and_guided_denoiser():
         assert tracer.display_image(denoise=True).shape == (64, 96, 3)
     finally:
         tracer.close()
+
+
+def test_prewarm_prepares_a_motion_size_and_leaves_the_refinement_untouched():
+    from dataclasses import replace
+    from layer_viewer import progressive_raytrace
+    if not progressive_raytrace.FREEZE_RENDER:
+        pytest.skip("LAYER_VIEW_RT_FREEZE disabled")
+    tracer, camera = _tracer()
+    try:
+        for _ in range(3):
+            tracer.render_batch(samples=1, denoise=False, display=False)
+        before = tracer.display_image(denoise=False, bloom_strength=0.)
+        # Interrupted after the first sample: resumed by the next call.
+        stops = iter([False, True])
+        assert tracer.prewarm_motion(48, 32, stop=lambda: next(stops)) is None
+        slot = next(cached for name, cached in tracer._slots.items() if name[:3] == ("motion", 48, 32))
+        assert slot["recorded"] == 1 and not slot.get("prepared")
+        assert tracer.samples == 3
+        np.testing.assert_array_equal(tracer.display_image(denoise=False, bloom_strength=0.), before)
+        assert tracer.prewarm_motion(48, 32, denoise_strength=.85, packed=True) is True
+        assert slot["recorded"] == 2 and slot["prepared"] and not tracer.prewarm_motion(48, 32)
+        assert (tracer.width, tracer.height, tracer.samples) == (96, 64, 3)
+        np.testing.assert_array_equal(tracer.display_image(denoise=False, bloom_strength=0.), before)
+        tracer.render_batch(samples=1, denoise=False, display=False)
+        assert tracer.samples == 4
+        # A drag at the prepared size reuses its sensor (and recordings).
+        tracer.update_camera(replace(camera, position=(6, -20, 20)), 48, 32, motion=True)
+        assert tracer._active_slot is slot
+        tracer.render_batch(samples=1, denoise=True, display=False)
+        assert tracer.display_image(denoise=True, fast=True, packed=True).shape == (32, 48)
+    finally:
+        tracer.close()

@@ -53,6 +53,9 @@ STANDIN_FOV = .25
 _STANDIN_SLACK = 4.
 # Normalized geometry lies within the [-1, 1] cube.
 _SCENE_RADIUS = 3 ** .5 * 1.02
+# Samples traced when a motion size is prepared: the frozen render records on
+# its first two calls, after which it only replays.
+PREWARM_SAMPLES = 2
 # Reduced motion sizes keep their own sensor and fast denoiser.
 MAX_MOTION_SLOTS = 5
 # Everything a camera update replaces; prewarm_motion restores it afterwards.
@@ -622,29 +625,50 @@ class ProgressiveRayTracer:
             self.mi.set_variant(self.variant)
             self._update_camera(camera, width or self.width, height or self.height, motion=motion)
 
-    def prewarm_motion(self, width, height, **display_settings):
+    def prewarm_motion(self, width, height, stop=None, **display_settings):
         """Prepare a motion size while the view rests, keeping the refinement.
 
         The first frame at a new motion size records its frozen kernels, and
         compiles them when Dr.Jit's kernel cache misses (0.1-4 s on large
         boards), which would otherwise stall the start of the first drag.
-        One sample is traced and displayed (fast denoiser) at that size, then
-        the refinement sensor, samples and buffers are restored untouched.
-        Returns True when the size was prepared, False when there was nothing
-        to do.
+        Two samples are traced: a frozen function records again on its second
+        call (the inputs' layout settles after the first render), so a single
+        sample left a second ~150 ms recording, which holds the GIL and
+        freezes the window, for the first frame of the drag. The frame is
+        displayed (fast denoiser) at that size, then the refinement sensor,
+        samples and buffers are restored untouched.
+
+        ``stop()`` is asked between the steps: when it turns true (the view
+        moves again) the preparation ends early, so real work never waits
+        for more than one step, and None is returned; the next call resumes
+        it where it stopped (the slot counts its traced samples). A size a
+        drag has traced and shown at least PREWARM_SAMPLES times is prepared
+        too. Returns True when the size was prepared, False when there was
+        nothing to do.
         """
         width, height = int(width), int(height)
-        slots = getattr(self, "_slots", None)
         if (self.scene is None or getattr(self, "camera", None) is None or not FREEZE_RENDER
                 or not str(getattr(self, "variant", "")).startswith("cuda")
-                or not isinstance(slots, dict) or ("motion", width, height) in slots
+                or not isinstance(getattr(self, "_slots", None), dict)
                 or (width, height) == (self.width, self.height)):
             return False
         saved = {name: getattr(self, name, None) for name in _CAMERA_STATE}
         try:
+            # The slot is found by size and sensor kind (the current camera's
+            # projection), so a size prepared in perspective is prepared again
+            # for a parallel view's stand-in.
             self.update_camera(self.camera, width, height, motion=True)
-            self.render_batch(1, display=False)
+            prepared = self._active_slot
+            if prepared.get("prepared"):
+                return False
+            for _ in range(int(prepared.get("recorded", 0)), PREWARM_SAMPLES):
+                if stop is not None and stop():
+                    return None
+                self.render_batch(1, display=False)
+            if stop is not None and stop():
+                return None
             self.display_image(fast=True, **display_settings)
+            prepared["prepared"] = True
         finally:
             # The camera itself is unchanged, so the light already matches.
             for name, value in saved.items():
@@ -726,7 +750,9 @@ class ProgressiveRayTracer:
             # A sensor without parameters is never reused (key None).
             slot = {"key": key if params is not None else None, "sensor": sensor,
                     "params": params, "denoiser": None, "fast_denoiser": None, "clip": clip}
-            name = ("motion", self.width, self.height) if motion else "full"
+            # Motion slots are named by sensor kind too: a parallel view's
+            # stand-in and a perspective sensor at one size never evict each other.
+            name = ("motion", self.width, self.height, kind) if motion else "full"
             slots.pop(name, None)
             slots[name] = slot
             motion_names = [slot_name for slot_name in slots if slot_name != "full"]
@@ -796,6 +822,11 @@ class ProgressiveRayTracer:
             self._sum = weighted if self._sum is None else self._sum + weighted
             dr.eval(self._sum)
             self.samples += int(samples)
+            slot = getattr(self, "_active_slot", None)
+            if isinstance(slot, dict) and int(samples) == 1:
+                # Single samples replay the size's frozen render, which records
+                # on its first PREWARM_SAMPLES calls (see prewarm_motion).
+                slot["recorded"] = slot.get("recorded", 0) + 1
             result = (self._display_image(denoise, exposure_ev, denoise_strength, bloom_strength, bloom_radius)
                       if display else None)
         self._check_cancel()
@@ -843,6 +874,10 @@ class ProgressiveRayTracer:
             self.mi.set_variant(self.variant)
             result = self._display_image(denoise, exposure_ev, denoise_strength, bloom_strength, bloom_radius,
                                          fast=fast, packed=packed)
+            slot = getattr(self, "_active_slot", None)
+            if fast and isinstance(slot, dict) and slot.get("recorded", 0) >= PREWARM_SAMPLES:
+                # A drag has recorded and shown this motion size: prepared.
+                slot["prepared"] = True
         self._check_cancel()
         self.last_batch_seconds = time.perf_counter() - started
         return result
