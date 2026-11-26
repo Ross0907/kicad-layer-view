@@ -17,8 +17,8 @@
   rounded pin stub when the model's own pin does not already protrude. Pads
   without a model keep the small dome.
   The joints wait for the 3D models to load and refresh once they have.
-- Smoother plain (OpenGL) viewport: each displayed frame is rendered once
-  instead of twice, and orbit, pan, wheel and widget events are coalesced
+- Smoother plain (OpenGL) viewport on Windows: each displayed frame is
+  rendered once instead of twice, and orbit, pan, wheel and widget events are coalesced
   into one frame instead of a full render per event. Still-view
   antialiasing samples are no longer redrawn on screen.
 - Live ray tracing: the first drag no longer freezes. The motion size is

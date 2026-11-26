@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import contextlib
+import os
+import sys
 
 import numpy as np
 from qtpy.QtCore import Signal, QTimer, QVariantAnimation, QEasingCurve
@@ -53,6 +55,15 @@ BACKGROUNDS = {
     "kicad": ((.40, .40, .50), (.80, .80, .90)),
     "dark": ((.063, .106, .161), (.141, .224, .290)),
 }
+
+
+# One render per displayed frame (ViewportInteractor) is verified on Windows.
+# Elsewhere (X11/Wayland/macOS GL paths) the stock pyvistaqt interactor stays,
+# which renders each frame twice but is known to refresh correctly.
+# LAYER_VIEW_SINGLE_RENDER=1/0 forces it on or off.
+_single = os.environ.get("LAYER_VIEW_SINGLE_RENDER", "").strip().lower()
+SINGLE_RENDER = (_single in ("1", "on", "true", "yes") if _single
+                 else sys.platform == "win32")
 
 
 class ViewportInteractor(QtInteractor):
@@ -413,7 +424,8 @@ class BoardViewport(QWidget):
         # peeling (and OIT) drop translucent layers drawn over opaque copper,
         # which made the solder resist vanish. FXAA covers motion; the idle
         # refiner accumulates jittered frames for still views.
-        self.plotter = ViewportInteractor(self, auto_update=False, multi_samples=0)
+        interactor_class = ViewportInteractor if SINGLE_RENDER else QtInteractor
+        self.plotter = interactor_class(self, auto_update=False, multi_samples=0)
         layout.addWidget(self.plotter.interactor)
         self.background = "dark"  # matches the ray tracer and the dark UI
         self.set_background(self.background, render=False)
@@ -446,7 +458,8 @@ class BoardViewport(QWidget):
         # axis-widget hover) become one coalesced frame instead of a full
         # render per event. They do not restart the still-view refinement by
         # themselves: camera changes and the measurement widget already do.
-        self.plotter.setup_render_redirect(self._schedule_render)
+        if hasattr(self.plotter, "setup_render_redirect"):
+            self.plotter.setup_render_redirect(self._schedule_render)
         self.camera_animation = QVariantAnimation(self)
         self.camera_animation.setDuration(320)
         self.camera_animation.setStartValue(0.)
@@ -971,7 +984,7 @@ class BoardViewport(QWidget):
         finally:
             # A scaled capture leaves a magnified tile in the render window:
             # the next paint must draw the view again rather than show it.
-            self.plotter.mark_frame_stale()
+            getattr(self.plotter, "mark_frame_stale", lambda: None)()
             self.plotter.update()
 
     def closeEvent(self, event):

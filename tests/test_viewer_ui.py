@@ -568,6 +568,7 @@ def test_live_ray_overlay_stops_board_drawing_and_restores_it_at_once(window):
         # Mouse drags must not render the whole window per move event.
         interactor = getattr(viewport.plotter.iren, "interactor", viewport.plotter.iren)
         assert not interactor.GetEnableRender()
+        from layer_viewer.viewer import SINGLE_RENDER
         # Camera moves still render the axis widget, at a capped rate.
         viewport.render_timer.stop()
         viewport.request_render()
@@ -579,7 +580,7 @@ def test_live_ray_overlay_stops_board_drawing_and_restores_it_at_once(window):
     # Turning ray tracing off draws the board again on the next event-loop pass.
     assert not live.covering and renderer.GetDraw()
     # Style renders stay redirected to the coalesced redraw either way.
-    assert not interactor.GetEnableRender()
+    assert interactor.GetEnableRender() != SINGLE_RENDER
     assert viewport.render_timer.isActive() and viewport.render_timer.interval() == 0
 
 

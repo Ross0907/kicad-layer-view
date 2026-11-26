@@ -16,7 +16,9 @@ from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import QApplication, QVBoxLayout, QWidget
 
 from layer_viewer.app import show_in_background
-from layer_viewer.viewer import BoardViewport, ViewportInteractor
+from layer_viewer.viewer import SINGLE_RENDER, BoardViewport, ViewportInteractor
+
+pytestmark = pytest.mark.skipif(not SINGLE_RENDER, reason="single-render interactor is Windows-only")
 
 
 @pytest.fixture(scope="module")
